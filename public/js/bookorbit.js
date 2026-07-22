@@ -402,7 +402,9 @@ function renderPeekButton(coverWrapEl, book) {
   // lands in the permanent library, auto-cleaned on close or by the background sweep — see
   // server/utils/peekCleanup.js), then we navigate to the same read-only reader URL scheme as an
   // already-owned book's peek link above.
-  const primaryFile = book.files?.[0];
+  const primaryFile = book.files?.find(f => f.role === 'primary') || 
+                      book.files?.find(f => ['epub', 'cbz', 'cbr'].includes(String(f.format || '').toLowerCase().replace(/^\./, ''))) || 
+                      book.files?.[0];
   const btn = document.createElement('button');
   btn.className = 'bookorbit-card-peek-btn';
   btn.innerHTML = `<img src="/images/peek.svg" class="nav-icon nav-icon-peek" alt="">`;
@@ -456,7 +458,9 @@ function renderCardActions(actionsEl, book) {
     return;
   }
 
-  const primaryFile = book.files?.[0];
+  const primaryFile = book.files?.find(f => f.role === 'primary') || 
+                      book.files?.find(f => ['epub', 'cbz', 'cbr'].includes(String(f.format || '').toLowerCase().replace(/^\./, ''))) || 
+                      book.files?.[0];
   const addBtn = document.createElement('button');
   addBtn.className = 'btn-icon';
   addBtn.innerHTML = `<img src="/images/add_to_codexa.svg" class="nav-icon nav-icon-add-to-codexa" alt="">`;

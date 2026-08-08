@@ -45,47 +45,45 @@ jobs:
           path: Android/app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
-      # ── Release APK ─────────────────────────────────────────────────────────
-      # Priority 1: KEYSTORE_FILE secret → Google Play / production key (base64)
-      # Priority 2: DEV_KEYSTORE_* secrets → persistent dev key stored in secrets
-      # Priority 3: No secrets → generate a fresh throwaway keystore on the fly
-      - name: Prepare release keystore
-        id: keystore
+      # ── Release APK (sideload / GitHub Release) ───────────────────────────────
+      # This keystore choice must stay stable forever: existing users update in place by
+      # installing over their current APK, which Android only allows if it's signed with the
+      # exact same certificate as what's already on their device. Deliberately never considers
+      # KEYSTORE_FILE (the Play upload key, prepared separately below for the AAB only) —
+      # mixing the two here used to make this APK silently switch signing identity the moment a
+      # KEYSTORE_FILE secret was added, breaking every existing sideloaded install's next update.
+      # Priority 1: DEV_KEYSTORE_* secrets → persistent dev key stored in secrets
+      # Priority 2: No secret → generate a fresh throwaway keystore on the fly (CI-only, never
+      #   used for a real release — release-android.yml always has DEV_KEYSTORE_* configured)
+      - name: Prepare DEV keystore (for sideload APK)
+        id: dev_keystore
         working-directory: Android
         env:
-          KEYSTORE_FILE_B64:      ${{ secrets.KEYSTORE_FILE }}
           DEV_KEYSTORE_FILE_B64:  ${{ secrets.DEV_KEYSTORE_FILE }}
           DEV_KEYSTORE_PASSWORD:  ${{ secrets.DEV_KEYSTORE_PASSWORD }}
           DEV_KEY_ALIAS:          ${{ secrets.DEV_KEY_ALIAS }}
           DEV_KEY_PASSWORD:       ${{ secrets.DEV_KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_FILE_B64" ]; then
-            echo "Using production keystore from KEYSTORE_FILE secret"
-            echo "$KEYSTORE_FILE_B64" | base64 -d > /tmp/release.jks
-            echo "DEV_KEYSTORE_FILE=/tmp/release.jks"          >> $GITHUB_ENV
-            echo "DEV_KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
-            echo "DEV_KEY_ALIAS=${{ secrets.KEY_ALIAS }}"      >> $GITHUB_ENV
-            echo "DEV_KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
-          elif [ -n "$DEV_KEYSTORE_FILE_B64" ]; then
+          if [ -n "$DEV_KEYSTORE_FILE_B64" ]; then
             echo "Using dev keystore from DEV_KEYSTORE_FILE secret"
-            echo "$DEV_KEYSTORE_FILE_B64" | grep -v '^-' | tr -d '\r\n ' | base64 -d > /tmp/release.jks
-            echo "DEV_KEYSTORE_FILE=/tmp/release.jks"                  >> $GITHUB_ENV
-            echo "DEV_KEYSTORE_PASSWORD=$DEV_KEYSTORE_PASSWORD"        >> $GITHUB_ENV
-            echo "DEV_KEY_ALIAS=$DEV_KEY_ALIAS"                        >> $GITHUB_ENV
-            echo "DEV_KEY_PASSWORD=$DEV_KEY_PASSWORD"                  >> $GITHUB_ENV
+            echo "$DEV_KEYSTORE_FILE_B64" | grep -v '^-' | tr -d '\r\n ' | base64 -d > /tmp/dev-release.jks
+            echo "DEV_KEYSTORE_FILE=/tmp/dev-release.jks"       >> $GITHUB_ENV
+            echo "DEV_KEYSTORE_PASSWORD=$DEV_KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "DEV_KEY_ALIAS=$DEV_KEY_ALIAS"                 >> $GITHUB_ENV
+            echo "DEV_KEY_PASSWORD=$DEV_KEY_PASSWORD"           >> $GITHUB_ENV
           else
-            echo "No keystore secrets found — generating throwaway keystore"
+            echo "No DEV_KEYSTORE_FILE secret found — generating throwaway keystore"
             keytool -genkeypair \
-              -keystore /tmp/release.jks \
+              -keystore /tmp/dev-release.jks \
               -alias codexa-release \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass codexa-ci-store \
               -keypass codexa-ci-key \
               -dname "CN=Codexa CI, OU=Codexa, O=Codexa, L=Unknown, ST=Unknown, C=SI"
-            echo "DEV_KEYSTORE_FILE=/tmp/release.jks"  >> $GITHUB_ENV
-            echo "DEV_KEYSTORE_PASSWORD=codexa-ci-store" >> $GITHUB_ENV
-            echo "DEV_KEY_ALIAS=codexa-release"          >> $GITHUB_ENV
-            echo "DEV_KEY_PASSWORD=codexa-ci-key"        >> $GITHUB_ENV
+            echo "DEV_KEYSTORE_FILE=/tmp/dev-release.jks"   >> $GITHUB_ENV
+            echo "DEV_KEYSTORE_PASSWORD=codexa-ci-store"    >> $GITHUB_ENV
+            echo "DEV_KEY_ALIAS=codexa-release"             >> $GITHUB_ENV
+            echo "DEV_KEY_PASSWORD=codexa-ci-key"           >> $GITHUB_ENV
           fi
 
       - name: Build release APK
@@ -99,10 +97,31 @@ jobs:
           path: Android/app/build/outputs/apk/release/*.apk
           retention-days: 90
 
-      # Google Play requires an .aab (Android App Bundle), not the .apk above — Play itself
-      # slices it into per-device APKs at install time. Uses the same release signingConfig,
-      # so KEYSTORE_FILE (Play upload key, priority 1) / DEV_KEYSTORE_FILE (priority 2 fallback)
-      # from the "Prepare release keystore" step above applies here too.
+      # ── Release AAB (Google Play only) ────────────────────────────────────────
+      # Google Play requires an .aab, not the .apk above — Play itself slices it into
+      # per-device APKs at install time. Sets the bare KEYSTORE_FILE/KEYSTORE_PASSWORD/KEY_ALIAS/
+      # KEY_PASSWORD env vars (no DEV_ prefix) so build.gradle's signingConfigs.release takes its
+      # "Priority 1: Google Play / production keystore" branch instead of the DEV_* one used by
+      # the APK above — each ./gradlew invocation re-reads the environment at build-configuration
+      # time, so this doesn't affect the already-built APK. Falls back to reusing the DEV
+      # keystore prepared above if KEYSTORE_FILE isn't set yet, so this still produces a working
+      # (if not Play-intended) AAB before Play secrets exist.
+      - name: Prepare Play keystore (for AAB)
+        working-directory: Android
+        env:
+          KEYSTORE_FILE_B64: ${{ secrets.KEYSTORE_FILE }}
+        run: |
+          if [ -n "$KEYSTORE_FILE_B64" ]; then
+            echo "Using Play upload keystore from KEYSTORE_FILE secret"
+            echo "$KEYSTORE_FILE_B64" | base64 -d > /tmp/play-release.jks
+            echo "KEYSTORE_FILE=/tmp/play-release.jks"              >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"               >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"         >> $GITHUB_ENV
+          else
+            echo "No KEYSTORE_FILE secret found — AAB will fall back to the DEV keystore prepared above"
+          fi
+
       - name: Build release bundle (AAB)
         working-directory: Android
         run: ./gradlew bundleRelease

@@ -83,6 +83,23 @@ jobs:
         working-directory: Android
         run: ./gradlew assembleRelease
 
+      # Google Play requires an .aab (Android App Bundle), not the .apk above — Play itself
+      # slices it into per-device APKs at install time. Uses the same release signingConfig, so
+      # KEYSTORE_FILE (Play upload key, priority 1) from "Prepare release keystore" above applies
+      # here too. Not attached to the public GitHub Release below (that's for direct-APK
+      # sideloaders) — download it from this run's artifacts and upload it to Play Console
+      # yourself (Internal testing track first).
+      - name: Build release bundle (AAB)
+        working-directory: Android
+        run: ./gradlew bundleRelease
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexa-reader-release-aab
+          path: Android/app/build/outputs/bundle/release/*.aab
+          retention-days: 90
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

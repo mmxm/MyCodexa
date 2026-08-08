@@ -1650,6 +1650,15 @@ document.addEventListener('visibilitychange', () => {
     // untracked until the next checkpoint.
     if (currentBook && isReady && !statsSessionId) startStatsSession(currentBook.id);
     if (navigator.onLine) flushSessionCheckpoints().catch(() => {});
+    // Android can reset its "hidden system bars" state on screen-off, requiring
+    // MainActivity.onWindowFocusChanged to reassert immersive mode once the screen wakes back
+    // up (see Android/.../MainActivity.kt) — while that's settling, the top/bottom safe-area
+    // inset can end up stale or wrong. Re-probe a couple of times to catch the value once the
+    // bars have actually finished re-hiding, same margin as the post-activation probe in init().
+    if (isAndroidApp() && window.__applyInsets) {
+      setTimeout(() => window.__applyInsets(false), 400);
+      setTimeout(() => window.__applyInsets(true), 900);
+    }
   }
   if (document.visibilityState === 'hidden') {
     writeInterruptedSession();
@@ -6481,13 +6490,17 @@ window.addEventListener('resize', debounce(() => {
   // keyboard opened, so there's nothing here that legitimately needs to react to it; skipping
   // avoids both the visible resize/jerk and CXReader drifting to the wrong page in the process.
   if (isTextInputFocused()) return;
-  // When running inside the Android app, system bars are always hidden in reader.
-  // Update layout vars here since this resize fires right after bars hide/show.
+  // When running inside the Android app, system bars are hidden in reader, but that doesn't
+  // mean the top/bottom inset is zero — a camera cutout (or gesture-nav pill) still reserves
+  // real space that env(safe-area-inset-*) reports independently of bar visibility. This used
+  // to hardcode --sat/--sab to 0px here (pre-dating cutout-aware safe-area support), which
+  // silently stomped the correct probed value on every resize — including the spurious resize
+  // some devices fire when the screen turns back on after sleep, permanently zeroing the top
+  // safe area until the book was reopened. Re-probe instead of guessing.
   if (isAndroidApp()) {
     const r = document.documentElement;
-    r.style.setProperty('--sat', '0px');
-    r.style.setProperty('--sab', '0px');
     r.style.setProperty('--layout-h', window.innerHeight + 'px');
+    window.__applyInsets?.(true);
   }
   // CXReader re-evaluates column mode and re-paginates directly.
   if (_cxReader) _cxSyncLayout();
@@ -7620,10 +7633,13 @@ async function init() {
   if (isAndroidApp() && window.AndroidCodexa?.setReaderMode) {
     window.AndroidCodexa.setReaderMode(true);
     setTimeout(() => {
+      // Re-probe (not hardcode) once immersive mode has settled: a camera cutout still
+      // reserves real top-inset space even with the status bar hidden, so pinning --sat/--sab
+      // to 0px here — as this used to do, from before cutout-aware safe-area support existed —
+      // wiped out the correct value reader.html's own probe had already set moments earlier.
       const r = document.documentElement;
-      r.style.setProperty('--sat', '0px');
-      r.style.setProperty('--sab', '0px');
       r.style.setProperty('--layout-h', window.innerHeight + 'px');
+      window.__applyInsets?.(true);
       if (_cxReader) _cxSyncLayout();
     }, 600);
   }

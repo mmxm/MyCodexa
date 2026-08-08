@@ -49,7 +49,7 @@ Codexa is a self-hosted EPUB and comic book reader with multi-user support, full
 - **Bookmarks** — add, label, and jump to bookmarks; badge shows bookmark count
 - **Highlights & annotations** — highlight in four colours (yellow, green, blue, pink) with optional notes; tap any highlight to edit or delete
 - **Search** — full-text search within a book with result navigation and back/accept buttons
-- **Dictionary lookup** — double-tap any word; supports multiple local StarDict dictionaries (`.ifo/.idx/.dict`); defaults to dictionaries matching a book's own language on first open
+- **Dictionary lookup** — double-click a word on desktop, or select text and tap the dictionary icon on mobile; supports multiple local StarDict dictionaries (`.ifo/.idx/.dict`); defaults to dictionaries matching a book's own language on first open
 - **CJK-aware word selection** — proper Chinese/Japanese/Korean word segmentation (not just per-character), including single-character lookups; on mobile, selecting CJK text uses the OS's own native selection handles so a selection can be extended/adjusted normally
 - **Footnote popup** — inline footnote and endnote display without leaving the page
 - **Bionic reading** — emphasises word prefixes to guide the eye for faster reading

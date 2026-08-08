@@ -129,3 +129,18 @@ jobs:
           name: codexa-reader-release
           path: Android/app/build/outputs/apk/release/*.apk
           retention-days: 90
+
+      # Google Play requires an .aab (Android App Bundle), not the .apk above — Play itself
+      # slices it into per-device APKs at install time. Uses the same release signingConfig,
+      # so KEYSTORE_FILE (Play upload key, priority 1) / DEV_KEYSTORE_FILE (priority 2 fallback)
+      # from the "Prepare release keystore" step above applies here too.
+      - name: Build release bundle (AAB)
+        working-directory: Android
+        run: ./gradlew bundleRelease
+
+      - name: Upload release bundle
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: codexa-reader-release-aab
+          path: Android/app/build/outputs/bundle/release/*.aab
+          retention-days: 90

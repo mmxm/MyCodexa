@@ -54,6 +54,8 @@
 <ul class="nav-sub">
 <li><a data-scroll="login-register" data-section="first-login" href="#login-register">Registering</a></li>
 <li><a data-scroll="login-security" data-section="first-login" href="#login-security">Security</a></li>
+<li><a data-scroll="login-email" data-section="first-login" href="#login-email">Setting Your Email</a></li>
+<li><a data-scroll="login-oidc" data-section="first-login" href="#login-oidc">OIDC / Single Sign-On</a></li>
 </ul>
 </li></ul></div><div class="nav-group"><div class="nav-group-title">Library</div><ul><li>
 <a data-section="upload" href="#upload">Uploading Books</a>
@@ -89,6 +91,7 @@
 <li><a data-scroll="details-collections" data-section="book-details" href="#details-collections">Collections Tab</a></li>
 <li><a data-scroll="details-kosync" data-section="book-details" href="#details-kosync">KOSync Tab</a></li>
 <li><a data-scroll="details-reading" data-section="book-details" href="#details-reading">Reading Tab</a></li>
+<li><a data-scroll="details-related" data-section="book-details" href="#details-related">Related Tab</a></li>
 </ul>
 </li><li>
 <a data-section="offline" href="#offline">Offline Reading</a>
@@ -143,6 +146,7 @@
 <a data-section="dictionary" href="#dictionary">Dictionary Lookup</a>
 <ul class="nav-sub">
 <li><a data-scroll="dict-how" data-section="dictionary" href="#dict-how">How It Works</a></li>
+<li><a data-scroll="dict-cjk" data-section="dictionary" href="#dict-cjk">Chinese, Japanese &amp; Korean Text</a></li>
 <li><a data-scroll="dict-install" data-section="dictionary" href="#dict-install">Installing</a></li>
 <li><a data-scroll="dict-enable" data-section="dictionary" href="#dict-enable">Enabling &amp; Reordering</a></li>
 </ul>
@@ -166,6 +170,7 @@
 <li><a data-scroll="bol-shelfsync" data-section="bookorbit-library" href="#bol-shelfsync">Sync to a Shelf</a></li>
 <li><a data-scroll="bol-mobile" data-section="bookorbit-library" href="#bol-mobile">Mobile Drawer</a></li>
 <li><a data-scroll="bol-reachability" data-section="bookorbit-library" href="#bol-reachability">Reachability Warning</a></li>
+<li><a data-scroll="bol-related" data-section="bookorbit-library" href="#bol-related">Related Books</a></li>
 </ul>
 </li><li>
 <a data-section="bookorbit-sync" href="#bookorbit-sync">BookOrbit Sync</a>
@@ -175,6 +180,7 @@
 <li><a data-scroll="bo-status" data-section="bookorbit-sync" href="#bo-status">Status &amp; Rating</a></li>
 <li><a data-scroll="bo-annot" data-section="bookorbit-sync" href="#bo-annot">Highlights</a></li>
 <li><a data-scroll="bo-session" data-section="bookorbit-sync" href="#bo-session">Reading Sessions</a></li>
+<li><a data-scroll="bo-dash" data-section="bookorbit-sync" href="#bo-dash">BookOrbit Dash</a></li>
 <li><a data-scroll="bo-limits" data-section="bookorbit-sync" href="#bo-limits">Limitations</a></li>
 </ul>
 </li></ul></div><div class="nav-group"><div class="nav-group-title">Configuration</div><ul><li>
@@ -194,6 +200,7 @@
 <li><a data-scroll="themes-eink" data-section="themes" href="#themes-eink">E-ink Mode</a></li>
 <li><a data-scroll="themes-app" data-section="themes" href="#themes-app">App Theme</a></li>
 <li><a data-scroll="themes-display" data-section="themes" href="#themes-display">Display Size</a></li>
+<li><a data-scroll="themes-presets" data-section="themes" href="#themes-presets">Presets</a></li>
 </ul>
 </li><li>
 <a data-section="languages" href="#languages">Supported Languages</a>
@@ -303,6 +310,7 @@
 <li><strong>Highlights</strong> — in four colours (yellow, green, blue, pink) with notes</li>
 <li><strong>In-book full-text search</strong> — with result navigation</li>
 <li><strong>StarDict dictionary lookup</strong> — double-click on desktop, long-press on mobile</li>
+<li><strong>CJK-aware word selection</strong> — proper Chinese/Japanese/Korean word segmentation, including single-character lookups; native OS selection handles on mobile</li>
 <li><strong>Footnote and endnote popups</strong> — without leaving the page</li>
 <li><strong>Bionic reading</strong> — bolds word prefixes to guide the eye</li>
 <li><strong>Two-page spread</strong> — for wider screens</li>
@@ -321,6 +329,7 @@
 <li><strong>Extensive text settings</strong> — font, size, line height, letter spacing, indentation, hyphenation</li>
 <li><strong>Configurable status bar</strong> — with up to 6 overlay slots</li>
 <li><strong>Screen edge padding</strong> — for curved screens and notches</li>
+<li><strong>Presets</strong> — save theme/font/layout settings as a named preset, switchable from the Theme tab; presets sync across devices, each device remembers its own current preset</li>
 </ul>
 </div>
 <div class="feature-card">
@@ -330,6 +339,7 @@
 <li><strong>Built-in KOSync-compatible server</strong> — for KOReader devices</li>
 <li><strong>External KOSync server support</strong> — with conflict resolution</li>
 <li><strong>BookOrbit extended sync</strong> — optional two-way sync of highlights, reading sessions, live reading progress, and book status/rating to a self-hosted <a data-section="bookorbit-sync" href="#bookorbit-sync">BookOrbit</a> server</li>
+<li><strong>BookOrbit Dash</strong> — account-wide reading stats panel: streak, editable yearly goal, currently-reading shelf, library overview, and a daily highlight</li>
 <li><strong>Interrupted session recovery banner</strong></li>
 <li><strong>Reading statistics</strong> — time read, pages turned, sessions, books started/finished</li>
 </ul>
@@ -354,6 +364,7 @@
 <li><strong>OPDS-linked shelves</strong> — synced shelves remember their source folder; one click opens it in the OPDS browser or re-triggers a sync</li>
 <li><strong><a data-section="bookorbit-library" href="#bookorbit-library">Native BookOrbit library browser</a></strong> — browse libraries, smart scopes, collections, series, and authors on a self-hosted BookOrbit server; add books to Codexa or peek them without downloading</li>
 <li><strong>BookOrbit collection sync</strong> — link a Codexa shelf to a BookOrbit collection or smart scope, same one-click resync as OPDS-linked shelves</li>
+<li><strong>Related books</strong> — "Similar books," "More by author," and "More in series" recommendations from a connected BookOrbit server, in both the local book info modal and the BookOrbit library's own book detail modal</li>
 <li><strong>Series support</strong> — with series name, number, and one-click filter</li>
 <li><strong>Sort</strong> — by date, title, author, progress, or series</li>
 <li><strong>Real-time library search</strong></li>
@@ -363,8 +374,8 @@
 <h3>🛡 Admin</h3>
 <ul>
 <li><strong>User management</strong> — view all accounts, delete users</li>
-<li><strong>Font management</strong> — upload and delete custom fonts for all users</li>
-<li><strong>Dictionary management</strong> — upload StarDict ZIP archives</li>
+<li><strong>Font management</strong> — upload (with progress indicator) and delete custom fonts for all users</li>
+<li><strong>Dictionary management</strong> — upload StarDict ZIP archives (with progress indicator)</li>
 <li><strong>Registration control</strong> — enable or disable new-user sign-up</li>
 <li><strong>Refresh book metadata</strong> — re-extract genres, descriptions, and covers from all EPUB files</li>
 </ul>
@@ -489,6 +500,12 @@ volumes:
 <td>No</td>
 <td><code>false</code></td>
 <td>Set to <code>true</code> to enable verbose browser console logging. When enabled, all internal messages (<code>[reader]</code>, <code>[api]</code>, <code>[kosync]</code>, <code>[CXReader]</code>, etc.) appear in DevTools. Off by default — only warnings and errors are shown.</td>
+</tr>
+<tr>
+<td><code>OIDC_PROVIDERS</code> and <code>OIDC_&lt;KEY&gt;_*</code></td>
+<td>No</td>
+<td><em>(none)</em></td>
+<td>Enable OIDC login (Google, Apple, self-hosted) as an alternative to local registration. See <a data-scroll="login-oidc" data-section="first-login" href="#login-oidc">OIDC / Single Sign-On</a> for the full variable reference and setup examples.</td>
 </tr>
 </tbody>
 </table>
@@ -741,9 +758,16 @@ data/<br/>
 <ol class="steps">
 <li>Navigate to your Codexa server URL in a browser.</li>
 <li>Click <strong>Register</strong> on the login page.</li>
-<li>Enter a username (3–32 characters, letters, numbers, and underscores only) and a password (minimum 8 characters).</li>
+<li>Enter a username (3–32 characters, letters, numbers, and underscores only), an optional email address, and a password (minimum 8 characters).</li>
 <li>Click <strong>Register</strong>. You will be logged in automatically.</li>
 </ol>
+<p>
+        The email address is optional and can also be added later from
+        <a data-scroll="settings-general" data-section="settings" href="#settings-general">Settings → General → Email</a>.
+        Setting it lets you sign in with either your username or your email, and lets a matching
+        <a data-scroll="login-oidc" data-section="first-login" href="#login-oidc">OIDC login</a>
+        link to this account automatically instead of creating a separate one.
+      </p>
 <div class="callout">
 <strong>⭐ First user is the admin</strong>
         The very first account registered on a fresh Codexa instance is automatically the
@@ -752,8 +776,9 @@ data/<br/>
       </div>
 <h2>Logging In</h2>
 <p>
-        Enter your username and password on the login page. Sessions last <strong>1 year</strong>.
-        If your session expires, you will be redirected to the login page.
+        Enter your username <em>or</em> email address, and your password, on the login page.
+        Sessions last <strong>1 year</strong>. If your session expires, you will be redirected to
+        the login page.
       </p>
 <figure>
 <img alt="Login" data-src="screenshots/login.png" decoding="async" loading="lazy"/>
@@ -770,11 +795,205 @@ data/<br/>
         Go to <strong>Settings → General → Change password</strong>. Enter your new password twice
         (minimum 8 characters) and click Save.
       </p>
+<h2 id="login-email">Setting or Changing Your Email</h2>
+<p>
+        Go to <strong>Settings → General → Email</strong>, enter an address, and click
+        <strong>Save email</strong>. This is entirely optional, but has two effects once set:
+      </p>
+<ul>
+<li>You can log in with either your username or your email address.</li>
+<li>A matching, <em>verified</em> email from an OIDC provider (Google, Apple, self-hosted) will link to this account automatically on first sign-in, instead of creating a new one — see <a data-scroll="login-oidc" data-section="first-login" href="#login-oidc">OIDC / Single Sign-On</a>.</li>
+</ul>
+<p>
+        Each email address can only be used by one account. Clearing the field (saving it empty)
+        removes it — you can then only log in with your username again, and it will no longer
+        match any OIDC identity.
+      </p>
 <h2>Disabling Registration</h2>
 <p>
         After creating all the accounts you need, an admin can disable new-user registration to
         prevent unauthorised sign-ups. See <a data-section="settings" href="#settings">Settings → Admin</a>.
       </p>
+<h2 id="login-oidc">OIDC / Single Sign-On</h2>
+<p>
+        As an alternative to local username/password registration, Codexa can log people in via
+        any standard OIDC provider — Google, Apple, or a self-hosted identity provider you run
+        yourself. It's disabled by default; setting <code>OIDC_PROVIDERS</code> turns it on, and
+        one "Sign in with…" button appears on the login page per configured provider.
+      </p>
+<h3>How Account Matching Works</h3>
+<p>A successful OIDC login is matched against existing Codexa accounts in two steps:</p>
+<ol class="steps">
+<li><strong>By provider + subject ID</strong> — if this exact identity has logged in before, it reuses that account.</li>
+<li><strong>By verified email</strong> — otherwise, if the provider vouches for the email (sends <code>email_verified: true</code>) and it matches the email set on an existing, not-yet-linked local account (Settings → Email, or set at registration), that account is linked instead of creating a new one. This is what lets someone who already registered locally start using OIDC without ending up with a second, empty account — the email just needs to match on both sides.</li>
+</ol>
+<p>
+        If neither matches <em>and</em> new registrations are currently allowed (see
+        <a data-scroll="settings-admin" data-section="settings" href="#settings-admin">Settings → Admin → Registration</a>),
+        a new account is auto-created. If registration is disabled, an unrecognised identity is
+        rejected instead of silently creating an account — you'll see a message on the login page
+        explaining that an admin needs to either re-enable registration or link an existing
+        account's email.
+      </p>
+<div class="callout">
+<strong>🔒 Email linking is verified-only</strong>
+        An email match only ever links to an account that isn't already linked to a different
+        identity, and only when the provider explicitly marks the email as verified. A provider
+        that doesn't assert <code>email_verified</code> (or sends no email at all) always falls
+        through to creating a new account rather than linking by an unverified email — otherwise a
+        misconfigured or malicious provider could take over an unrelated account just by claiming
+        its email address.
+      </div>
+<div class="callout">
+<strong>⚠️ Not included: Facebook</strong>
+        Facebook doesn't implement standard OIDC (no discovery document, no <code>id_token</code>),
+        so it can't use this generic integration. Google, Apple, and any self-hosted provider
+        (Dex, Authelia, Keycloak, Authentik, …) are all real OIDC and work out of the box.
+      </div>
+<div class="callout">
+<strong>ℹ️ OIDC accounts and KOReader Sync</strong>
+        An account created via OIDC has no local password, so it can't be used to log in to
+        <a data-scroll="settings-kosync" data-section="settings" href="#settings-kosync">KOReader Sync</a>
+        (which authenticates with username/password). Go to Settings → General → Change password
+        first if you need that account to also work with KOReader Sync.
+      </div>
+<h3>Example: Google</h3>
+<ol class="steps">
+<li>Create an OAuth 2.0 Client ID in the <a href="https://console.cloud.google.com/apis/credentials" rel="noopener" target="_blank">Google Cloud Console</a> (Web application), with an authorized redirect URI of <code>https://&lt;your-domain&gt;/api/auth/oidc/google/callback</code>.</li>
+<li>Set the environment variables:</li>
+</ol>
+<div class="code-block">
+<button class="copy-btn">Copy</button>
+<pre><code>OIDC_PROVIDERS=google
+OIDC_BASE_URL=https://&lt;your-domain&gt;
+OIDC_GOOGLE_ISSUER=https://accounts.google.com
+OIDC_GOOGLE_CLIENT_ID=&lt;your client id&gt;
+OIDC_GOOGLE_CLIENT_SECRET=&lt;your client secret&gt;
+OIDC_GOOGLE_NAME=Google</code></pre>
+</div>
+<p>
+        Apple (Sign in with Apple) works the same way with
+        <code>OIDC_APPLE_ISSUER=https://appleid.apple.com</code>, except Apple's "client secret" is
+        itself a JWT you generate and sign with an Apple private key, valid for at most 6 months —
+        you'll need to regenerate and redeploy it periodically.
+      </p>
+<h3>Example: Self-Hosted Provider with Predefined Users (Dex)</h3>
+<p>
+        If you'd rather not open the door to a third-party account at all, you can run your own
+        minimal OIDC provider with a fixed list of users you define yourself.
+        <a href="https://dexidp.io/" rel="noopener" target="_blank">Dex</a> is a good fit for this —
+        a single small container, no database, users declared directly in its config file.
+      </p>
+<p><code>dex-config.yaml</code>:</p>
+<div class="code-block">
+<button class="copy-btn">Copy</button>
+<pre><code>issuer: https://auth.example.com/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+staticClients:
+  - id: codexa
+    name: Codexa
+    secret: &lt;a-random-client-secret&gt;
+    redirectURIs:
+      - https://books.example.com/api/auth/oidc/dex/callback
+enablePasswordDB: true
+staticPasswords:
+  - email: "alice@domain.com"
+    # Generate with: htpasswd -bnBC 10 "" '&lt;password&gt;' | tr -d ':\n'
+    hash: "&lt;bcrypt hash&gt;"
+    username: "alice"
+    userID: "1"
+  - email: "bob@doma.com"
+    hash: "&lt;bcrypt hash&gt;"
+    username: "bob"
+    userID: "2"</code></pre>
+</div>
+<p>Add Dex as a second service in your <code>docker-compose.yaml</code>:</p>
+<div class="code-block">
+<button class="copy-btn">Copy</button>
+<pre><code>services:
+  codexa:
+    image: ghcr.io/thehijacker/codexa:latest
+    # ...existing config...
+    environment:
+      JWT_SECRET: "..."
+      OIDC_PROVIDERS: "dex"
+      OIDC_BASE_URL: "https://books.example.com"
+      OIDC_DEX_ISSUER: "https://auth.example.com/dex"
+      OIDC_DEX_CLIENT_ID: "codexa"
+      OIDC_DEX_CLIENT_SECRET: "&lt;the same random client secret as above&gt;"
+      OIDC_DEX_NAME: "Home SSO"
+
+  dex:
+    image: dexidp/dex:latest
+    container_name: dex
+    restart: unless-stopped
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml
+    command: ["dex", "serve", "/etc/dex/config.yaml"]</code></pre>
+</div>
+<p>
+        Put both <code>books.example.com</code> and <code>auth.example.com</code> behind your
+        reverse proxy (see
+        <a data-scroll="inst-proxy" data-section="installation" href="#inst-proxy">Reverse Proxy</a>)
+        with HTTPS — OIDC providers generally require HTTPS redirect URIs. Only the
+        usernames/passwords you add to <code>staticPasswords</code> will ever be able to log in to
+        Codexa this way.
+      </p>
+<h3>Linking an Existing Local Account</h3>
+<p>
+        Already have a local account and want to switch it over to OIDC without losing your books
+        and progress? Go to <strong>Settings → Email</strong> and set the same email address
+        that's configured for you on the OIDC provider (e.g. the same value as Dex's
+        <code>staticPasswords[].email</code>), then sign in with that provider. Since the email
+        matches an existing, unlinked account, Codexa links to it instead of creating a new one.
+      </p>
+<div class="callout">
+<strong>💡 Already created a duplicate account by accident?</strong>
+        If you signed in via OIDC before setting a matching email and ended up with a second,
+        empty account: set the matching email on your <em>original</em> account (Settings →
+        Email), delete the duplicate account (Settings → Admin → User Management), then sign in
+        via OIDC again — this time it will link to the original account.
+      </div>
+<h3>OIDC Environment Variables</h3>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Variable</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><code>OIDC_PROVIDERS</code></td>
+<td>No</td>
+<td>Comma-separated list of provider keys to enable, e.g. <code>google,dex</code>. Leave unset to disable OIDC entirely — no buttons appear and nothing else in this section applies.</td>
+</tr>
+<tr>
+<td><code>OIDC_BASE_URL</code></td>
+<td>Only if <code>OIDC_PROVIDERS</code> is set</td>
+<td>Public base URL Codexa is reachable at, used to build each provider's callback URL.</td>
+</tr>
+<tr>
+<td><code>OIDC_&lt;KEY&gt;_ISSUER</code></td>
+<td>Only for each key in <code>OIDC_PROVIDERS</code></td>
+<td>The provider's OIDC issuer URL (its discovery document lives at <code>&lt;issuer&gt;/.well-known/openid-configuration</code>).</td>
+</tr>
+<tr>
+<td><code>OIDC_&lt;KEY&gt;_CLIENT_ID</code> / <code>_CLIENT_SECRET</code></td>
+<td>Only for each key in <code>OIDC_PROVIDERS</code></td>
+<td>Credentials for the OAuth client you registered with that provider.</td>
+</tr>
+<tr>
+<td><code>OIDC_&lt;KEY&gt;_NAME</code></td>
+<td>No</td>
+<td>Display label for the provider's button on the login page. Defaults to the key itself.</td>
+</tr>
+</tbody>
+</table>
+</div>
 <a class="back-top" href="#about">↑ Top</a>
 </section>
 <!-- ═══════════════════════════════════════════════════════ Settings ══ -->
@@ -824,6 +1043,11 @@ data/<br/>
 <strong>Auto-open last book:</strong> when enabled, Codexa automatically opens the
           most recently accessed book when you visit the library. Stored in your browser's
           local storage.
+        </li>
+<li>
+<strong>Email:</strong> optional. Lets you log in with your email as well as your
+          username, and lets a matching verified OIDC login link to this account automatically.
+          See <a data-scroll="login-email" data-section="first-login" href="#login-email">Setting Your Email</a>.
         </li>
 <li>
 <strong>Change password:</strong> enter a new password (minimum 8 characters) and
@@ -916,7 +1140,10 @@ data/<br/>
 <p>
         Toggle <strong>Allow new registrations</strong> to enable or disable the registration
         link on the login page. Disable this after setting up all accounts to prevent
-        unauthorised sign-ups.
+        unauthorised sign-ups. This also governs
+        <a data-scroll="login-oidc" data-section="first-login" href="#login-oidc">OIDC login</a>:
+        with registration disabled, an OIDC identity that doesn't already match an existing
+        account (by prior login or verified email) is rejected instead of auto-creating a new one.
       </p>
 <h3>User Management</h3>
 <p>
@@ -1000,8 +1227,12 @@ data/<br/>
           selection.
         </li>
 <li>
-<strong>Mobile / touch:</strong> long-press a word to open the bottom toolbar, then tap
-          the dictionary icon.
+<strong>Mobile / touch:</strong> long-press a word to start a selection, using your
+          device's own native selection handles to extend or shrink it if needed, just like
+          selecting text anywhere else. The bottom toolbar appears while anything is selected;
+          tap the dictionary icon on it to look up the selection. Selecting text on its own
+          never triggers a lookup — only the dictionary icon does. Tapping outside the selection
+          clears it and closes the toolbar.
         </li>
 </ul>
 <figure>
@@ -1012,6 +1243,22 @@ data/<br/>
         A bottom sheet slides up showing all definitions found across your enabled dictionaries.
         If multiple dictionaries are enabled, each result is labelled with its dictionary name.
         If no exact match is found, Codexa shows words with similar spelling as suggestions.
+      </p>
+<h2 id="dict-cjk">Chinese, Japanese &amp; Korean Text</h2>
+<p>
+        Codexa uses real word segmentation for Han/Hiragana/Katakana text (via the browser's
+        <code>Intl.Segmenter</code>) instead of treating an entire punctuation-delimited clause as
+        one "word." Double-clicking or long-pressing selects the actual word or character under
+        your cursor/finger, and single-character words (a lone Han character, for example) are
+        looked up correctly instead of being silently skipped.
+      </p>
+<p>
+        On mobile, text selection — Latin or CJK — uses your device's own native selection with
+        draggable handles, the same as selecting text in any other app, so you can extend or
+        shrink a selection freely instead of being limited to whatever Codexa guessed. The one
+        exception is iOS, where the browser doesn't expose native selection handles to web pages;
+        there, long-press selects the tapped word/character directly, and long-pressing elsewhere
+        picks a different one instead of dragging to extend.
       </p>
 <h2 id="dict-install">Installing Dictionaries</h2>
 <p>
@@ -1323,12 +1570,51 @@ data/<br/>
         and the Android app — Codexa automatically picks the right scaling technique for each
         platform, so the control behaves the same wherever you read.
       </div>
+<h2 id="themes-presets">Presets</h2>
+<p>
+        Save your current theme, font, and layout settings as a named preset, and switch between
+        them instantly from <strong>Reader → Settings → Theme</strong>. Handy for keeping, say, a
+        high-contrast setup for an e-ink device and a softer sepia setup for a phone, without
+        reconfiguring every setting each time you switch between them.
+      </p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>Action</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Save as preset</strong></td><td>Creates a new preset from your current settings.</td></tr>
+<tr><td><strong>Update</strong></td><td>Overwrites the selected preset with your current settings.</td></tr>
+<tr><td><strong>Rename</strong></td><td>Renames the selected preset.</td></tr>
+<tr><td><strong>Delete</strong></td><td>Removes the selected preset.</td></tr>
+</tbody>
+</table>
+</div>
+<p>
+        A preset captures every setting across the Theme, Text, Page, Device, and Status Bar
+        tabs — <strong>except dictionary selection</strong>, which is never part of a preset and
+        keeps its own behaviour (matching a book's language automatically, or whatever you've set
+        manually).
+      </p>
+<div class="callout">
+<strong>Synced, but not shared, across devices</strong>
+        Your presets — their names and settings — are available on every device you log in to.
+        Which preset is currently applied, however, is remembered separately per device, so an
+        e-ink reader and a phone can each stay on their own preset instead of one device's choice
+        overwriting every other device's.
+      </div>
+<p>
+        Selecting a preset updates your current settings immediately; it does not touch any
+        per-book overrides already saved for the book you have open — use
+        <strong>Reset for this book</strong> at the top of the Settings panel if you want a
+        preset to fully take over a book with its own overrides.
+      </p>
 <a class="back-top" href="#about">↑ Top</a>
 </section>
 <!-- ══════════════════════════════════════════════ Supported Languages ═ -->
 <section id="languages">
 <h1>Supported Languages</h1>
-<p class="section-subtitle">The Codexa interface is available in 7 languages</p>
+<p class="section-subtitle">The Codexa interface is available in 8 languages</p>
 <div class="table-wrap">
 <table>
 <thead>
@@ -1342,6 +1628,7 @@ data/<br/>
 <tr><td>Spanish</td><td><code>es</code></td><td>Available</td></tr>
 <tr><td>Portuguese</td><td><code>pt</code></td><td>Available</td></tr>
 <tr><td>Slovenian</td><td><code>sl</code></td><td>Available</td></tr>
+<tr><td>Simplified Chinese</td><td><code>zh-CN</code></td><td>Available</td></tr>
 </tbody>
 </table>
 </div>
@@ -1874,6 +2161,17 @@ data/<br/>
 <img alt="Book details dialog with Reading tab" data-src="screenshots/book_reading.png" decoding="async" loading="lazy"/>
 <figcaption>Book details Reading dialog</figcaption>
 </figure>
+<h2 id="details-related">Related Tab</h2>
+<p>
+        Shown when <a data-section="bookorbit-sync" href="#bookorbit-sync">BookOrbit Sync</a> is
+        enabled and the book is linked to a BookOrbit id. Powered by BookOrbit's recommendation
+        engine, with up to three sections: <strong>More in series</strong>,
+        <strong>Also by this author</strong>, and <strong>More like this</strong>. Each result
+        links out to the book's page on BookOrbit. The same recommendation data — plus a "Next in
+        series" pick when you've finished the book — backs the
+        <a data-scroll="bol-related" data-section="bookorbit-library" href="#bol-related">Related
+        tab in the BookOrbit library browser's own book detail dialog</a>.
+      </p>
 <a class="back-top" href="#about">↑ Top</a>
 </section>
 <!-- ══════════════════════════════════════════════════════════ Reader ══ -->
@@ -1955,9 +2253,19 @@ data/<br/>
 <h3>Creating a Highlight</h3>
 <ol class="steps">
 <li>Select text by pressing and holding (mobile) or clicking and dragging (desktop).</li>
-<li>The annotation toolbar appears above or below the selection.</li>
+<li>The annotation toolbar appears above or below the selection. On mobile, drag the native
+          selection handles to adjust what's selected — the toolbar stays open and follows along.</li>
 <li>Tap a colour button (yellow, green, blue, pink) to save the highlight.</li>
 </ol>
+<p>
+        Tapping anywhere outside the selection clears it and closes the toolbar without saving
+        anything.
+      </p>
+<p>
+        For Chinese, Japanese, and Korean text, selection uses real word/character segmentation —
+        see <a data-scroll="dict-cjk" data-section="dictionary" href="#dict-cjk">Chinese, Japanese
+        &amp; Korean Text</a> for details.
+      </p>
 <h3>Adding a Note</h3>
 <p>
         After selecting text, tap the pencil (✎) button in the toolbar. Type your note
@@ -1997,8 +2305,10 @@ data/<br/>
 <p>
 <strong>Desktop:</strong> double-click a word to open the dictionary directly. To look up
         a selection, drag to select it and tap the dictionary icon in the bottom toolbar.<br/>
-<strong>Mobile:</strong> long-press a word to open the bottom toolbar, then tap the
-        dictionary icon. A bottom sheet shows definitions from all enabled dictionaries.
+<strong>Mobile:</strong> long-press to start selecting text (drag the handles to adjust it),
+        then tap the dictionary icon in the bottom toolbar — selecting text on its own never
+        looks anything up automatically. A bottom sheet shows definitions from all enabled
+        dictionaries.
       </p>
 <h2 id="reader-footnotes">Footnotes</h2>
 <figure>
@@ -2091,6 +2401,7 @@ data/<br/>
 <li><strong>Override book styles:</strong> forces the reader's fonts and colours on books with their own CSS.</li>
 <li><strong>E-ink mode:</strong> high-contrast black-and-white for e-ink displays.</li>
 <li><strong>Page border (book spine):</strong> shows a thin shadow along the centre spine in two-page spread mode.</li>
+<li><strong>Presets:</strong> save and switch between named settings profiles — see <a data-scroll="themes-presets" data-section="themes" href="#themes-presets">Presets</a>.</li>
 </ul>
 <h4>Header buttons</h4>
 <p>
@@ -2483,6 +2794,16 @@ data/<br/>
         BookOrbit entry in the sidebar, and in the reader if BookOrbit Sync is enabled. This does
         not affect KOReader/KOSync progress sync, which is entirely independent.
       </p>
+<h2 id="bol-related">Related Books</h2>
+<p>
+        Opening a book card while browsing shows a detail dialog with two tabs:
+        <strong>Details</strong> (description, genres, publisher, and other metadata) and
+        <strong>Related</strong>. The Related tab is powered by BookOrbit's own recommendation
+        engine and shows up to three sections — <strong>More in series</strong>,
+        <strong>Also by this author</strong>, and <strong>Similar books</strong> — with cards that
+        link out to the book's page on BookOrbit. This works for any book in the catalogue,
+        including ones you haven't downloaded into Codexa yet.
+      </p>
 <a class="back-top" href="#about">↑ Top</a>
 </section>
 <!-- ══════════════════════════════════════════════ BookOrbit Sync ═══ -->
@@ -2614,6 +2935,30 @@ data/<br/>
         Sessions are one-way (Codexa → BookOrbit) and are deduplicated: re-opening a book that
         was already synced never creates a duplicate session entry.
       </p>
+<h2 id="bo-dash">BookOrbit Dash</h2>
+<p>
+        Once extended sync is enabled, a <strong>BookOrbit Dash</strong> item appears in the
+        sidebar (same visibility rule as the <a data-section="bookorbit-library" href="#bookorbit-library">BookOrbit Library</a>
+        item — hidden until sync is on, dimmed and unclickable while offline). It's a dedicated
+        panel of account-wide reading stats, pulled live from BookOrbit's own dashboard API rather
+        than anything Codexa stores locally:
+      </p>
+<ul>
+<li><strong>Reading streak</strong> — current and longest streak, plus the last 7 days at a glance.</li>
+<li><strong>Yearly reading goal</strong> — books completed this year against your goal; click the card to set or change the goal directly from Codexa.</li>
+<li><strong>Currently reading</strong> — books BookOrbit considers in progress across your whole account, not just what's open in Codexa. Books already downloaded into Codexa link straight into the reader.</li>
+<li><strong>Library overview</strong> — total books, authors, series, and storage used across your whole BookOrbit library.</li>
+<li><strong>Highlight of the day</strong> — a highlight or note from your synced annotations, picked fresh each day.</li>
+</ul>
+<div class="callout">
+<strong>Why this is different from Codexa's own Reading Statistics</strong>
+        The <a data-scroll="lib-stats" data-section="library" href="#lib-stats">Reading Statistics</a>
+        panel only knows about reading that happened inside Codexa. BookOrbit Dash reflects your
+        whole BookOrbit account — including KOReader, Kobo, or manually logged sessions — because
+        Codexa reports its own reading sessions to BookOrbit as part of extended sync (see
+        <a data-scroll="bo-session" data-section="bookorbit-sync" href="#bo-session">Reading Sessions</a>
+        above).
+      </div>
 <h2 id="bo-limits">Limitations &amp; Notes</h2>
 <ul>
 <li><strong>Book matching</strong> — a book must exist in your BookOrbit library for Codexa to sync it. Books only in Codexa (not imported from the BookOrbit OPDS catalog) are skipped; the server log shows <em>"not in your BookOrbit library (skipping)"</em> for them.</li>

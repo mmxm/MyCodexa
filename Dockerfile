@@ -1,6 +1,16 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
 # Installs all deps (including devDeps for esbuild), transpiles public/ → dist/
 # for Chrome 69 / older Android WebView, then prunes devDeps before handoff.
+#
+# Alpine-based: the intermittent native crash ("Assertion failed: (env) != nullptr" in
+# node::RemoveEnvironmentCleanupHook, thrown from better-sqlite3's Statement destructor) was
+# never actually an Alpine/musl problem — it was better-sqlite3@11.x predating Node 24 support,
+# so npm fell back to compiling it from source against a version never tested on Node 24's ABI,
+# producing a subtly broken binary. That's fixed by bumping better-sqlite3 to ^13.x
+# (package.json), which ships real prebuilt N-API binaries for Node 24 for both glibc and musl
+# — so Alpine is safe again, and preferred: it keeps the pushed image under ~80MB instead of
+# bookworm-slim's ~100MB+, which matters because Codeberg's container registry enforces a
+# per-package storage quota (413 enforcePackagesQuota) that the larger image tripped.
 FROM node:24-alpine AS build
 
 WORKDIR /app
@@ -20,7 +30,8 @@ FROM node:24-alpine
 
 WORKDIR /app
 
-# Non-root user for security
+# Non-root user for security. su-exec execve()s straight into the target command instead of
+# forking, so node still ends up as PID 1 and receives Docker's signals directly.
 RUN addgroup -S codexa && adduser -S codexa -G codexa && \
     apk add --no-cache su-exec
 
@@ -38,6 +49,6 @@ ENV DATA_DIR=/data
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD wget -qO- http://localhost:3000/manifest.json > /dev/null || exit 1
+  CMD node -e "fetch('http://localhost:3000/manifest.json').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

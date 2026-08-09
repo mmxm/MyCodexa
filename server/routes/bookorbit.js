@@ -298,6 +298,18 @@ router.get('/books/:boBookId/detail', async (req, res) => {
   });
 });
 
+// GET /api/bookorbit/books/:boBookId/related — same recommendation engine + series/author
+// lookups as the local book info modal's Related tab (server/routes/books.js's
+// GET /api/books/:id/related), but keyed directly by BookOrbit's own book id since a book
+// browsed here may not be imported into Codexa (no local mapping to resolve).
+router.get('/books/:boBookId/related', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  const data = await bookorbit.getRelatedByBoId(req.user.id, ctx, boBookId);
+  res.json(data);
+});
+
 // PUT/DELETE /api/bookorbit/books/:boBookId/collections/:collectionId — add/remove this book
 // from a collection. This is the feature that removes the need to open BookOrbit at all for
 // collection assignment.
@@ -706,6 +718,81 @@ router.get('/sync-sse', async (req, res) => {
     console.error('[bookorbit] sync-sse error:', err.message);
     done({ type: 'error', message: err.message });
   }
+});
+
+// ── BookOrbit Dash — account-wide reading stats, powered by BookOrbit's own ──
+// /dashboard/widgets/* endpoints (the same ones its web client uses). Distinct from Codexa's own
+// local /api/stats: these numbers cover the whole BookOrbit account (KOReader/Kobo/manual
+// sessions too, plus concepts Codexa has no equivalent of like a yearly reading goal), not just
+// activity that happened inside Codexa.
+
+// GET /api/bookorbit/dashboard — fetches every widget in parallel. Each is independent — one
+// widget failing (or legitimately returning null, e.g. highlight-of-the-day with zero
+// annotations) doesn't blank the rest of the page; only a total connectivity failure 502s.
+const DASHBOARD_WIDGETS = {
+  readingGoal:       '/dashboard/widgets/reading-goal',
+  readingStreak:      '/dashboard/widgets/reading-streak',
+  currentlyReading:   '/dashboard/widgets/currently-reading',
+  libraryOverview:    '/dashboard/widgets/library-overview',
+  highlightOfTheDay:  '/dashboard/widgets/highlight-of-the-day',
+};
+
+router.get('/dashboard', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+
+  const entries = await Promise.all(
+    Object.entries(DASHBOARD_WIDGETS).map(async ([key, p]) => [key, await bookorbit.api(req.user.id, ctx, 'GET', p)])
+  );
+
+  const out = {};
+  let anyOk = false;
+  for (const [key, r] of entries) {
+    out[key] = r.ok ? r.data : null;
+    anyOk = anyOk || r.ok;
+  }
+  if (!anyOk) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+
+  // Annotate currentlyReading books + the highlight-of-the-day book with localBookId, same batch
+  // lookup as GET /books above, so the client can link straight into the reader for anything
+  // already downloaded instead of always falling back to a non-interactive row.
+  const boIds = [
+    ...(out.currentlyReading?.books || []).map(b => b.bookId),
+    out.highlightOfTheDay?.bookId,
+  ].filter(Boolean);
+  if (boIds.length) {
+    const db = getDb();
+    const placeholders = boIds.map(() => '?').join(',');
+    const rows = db.prepare(
+      `SELECT bo_book_id, book_id FROM bookorbit_sync_state WHERE user_id = ? AND bo_book_id IN (${placeholders})`
+    ).all(req.user.id, ...boIds);
+    const localByBoId = new Map(rows.map(r => [r.bo_book_id, r.book_id]));
+    if (out.currentlyReading?.books) {
+      out.currentlyReading.books = out.currentlyReading.books.map(b => ({ ...b, localBookId: localByBoId.get(b.bookId) || null }));
+    }
+    if (out.highlightOfTheDay) {
+      out.highlightOfTheDay.localBookId = localByBoId.get(out.highlightOfTheDay.bookId) || null;
+    }
+  }
+
+  res.json(out);
+});
+
+// PUT /api/bookorbit/dashboard/goal — body: { goalBooks: number|null }. null clears the goal.
+router.put('/dashboard/goal', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+
+  const goalBooks = req.body?.goalBooks ?? null;
+  if (goalBooks !== null && (!Number.isInteger(goalBooks) || goalBooks < 0)) {
+    return res.status(400).json({ error: 'error.invalid_goal' });
+  }
+
+  const r = await bookorbit.api(req.user.id, ctx, 'PATCH', '/users/me/settings', {
+    settings: { dashboardConfig: { readingGoal: goalBooks } },
+  });
+  if (!r.ok) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.status(204).end();
 });
 
 module.exports = router;

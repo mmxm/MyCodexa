@@ -1,5 +1,5 @@
 import { apiFetch } from './api.js';
-import { toast, setButtonLoading } from './ui.js';
+import { toast, setButtonLoading, showBlockingOverlay } from './ui.js';
 import { t, applyTranslations } from './i18n.js';
 import { reloadShelves } from './sidebar.js';
 import { reloadLibrary, openInfoModal } from './library.js';
@@ -465,17 +465,37 @@ function renderPeekButton(coverWrapEl, entry) {
       e.stopPropagation();
       btn.disabled = true;
       btn.classList.add('opds-btn-busy');
+      // See bookorbit.js's identical peek handler for why this needs a blocking overlay instead
+      // of real byte progress: the download happens server-side (OPDS acquisition), so the
+      // client only sees a single request resolve at the end, with no intermediate progress.
+      let cancelled = false;
+      const overlay = showBlockingOverlay(t('bookorbit.peek_downloading'), () => {
+        cancelled = true;
+        btn.disabled = false;
+        btn.classList.remove('opds-btn-busy');
+      });
+      const slowTimer = setTimeout(() => overlay.setMessage(t('common.download_slow_hint')), 8000);
       try {
         const result = await apiFetch(`/opds/peek/${currentServer.id}`, {
           method: 'POST',
           body: JSON.stringify({ href: entry.acqHref, title: entry.title, author: entry.author }),
         });
+        clearTimeout(slowTimer);
+        if (cancelled) {
+          apiFetch(`/books/${result.id}/peek-cleanup`, { method: 'POST' }).catch(() => {});
+          return;
+        }
+        overlay.dismiss();
         saveResumeState();
         window.location.href = `/reader.html?id=${result.id}&peek=1&from=opds`;
       } catch (err) {
-        toast.error(err.message);
-        btn.disabled = false;
-        btn.classList.remove('opds-btn-busy');
+        clearTimeout(slowTimer);
+        if (!cancelled) {
+          overlay.dismiss();
+          toast.error(err.message);
+          btn.disabled = false;
+          btn.classList.remove('opds-btn-busy');
+        }
       }
     });
   }

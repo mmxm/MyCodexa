@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Codexa — Privacy Policy</title>
+<meta name="description" content="Privacy policy for the Codexa self-hosted EPUB and comic reader apps."/>
+<link href="css/docs.css" rel="stylesheet"/>
+<style>
+  /* Standalone page — not part of the docs.js single-page app, so no #layout/#nav here.
+     Reuses docs.css purely for the shared color tokens, reset, and h1/h2/p/ul typography. */
+  body { display: flex; justify-content: center; }
+  main {
+    width: 100%;
+    max-width: 760px;
+    padding: 56px 24px 96px;
+  }
+  .updated { color: var(--text-muted); font-size: .95rem; margin-bottom: 32px; }
+  .back-link { display: inline-block; margin-bottom: 24px; font-size: .95rem; }
+  .tldr {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    margin-bottom: 32px;
+  }
+  .tldr p:last-child { margin-bottom: 0; }
+  section { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back-link" href="index.html">← Back to Codexa docs</a>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Last updated: 8 August 2026 · Applies to the Codexa Android and iOS apps and the Codexa web app</p>
+
+  <div class="tldr">
+    <p><strong>Short version:</strong> Codexa is self-hosted software. The app is a client —
+    it only ever talks to the server address <em>you</em> enter when you set it up. The Codexa
+    project does not operate any server, does not collect any of your data, and has no
+    analytics, ads, or trackers built into the app.</p>
+  </div>
+
+  <section>
+    <h2>Who this policy covers</h2>
+    <p>
+      Codexa is free, open-source software (AGPL-3.0) that you or someone you trust runs on
+      your own server (a home NAS, a small VPS, etc.). The app you installed is a client for
+      that server — it has no independent connection to the Codexa project, and the people who
+      develop Codexa never receive, see, or store any of your data.
+    </p>
+  </section>
+
+  <section>
+    <h2>What data the app handles, and where it goes</h2>
+    <ul>
+      <li><strong>Server address, username, and password/session token</strong> — entered by
+        you, stored locally on your device (in the app's local storage), and sent only to the
+        server address you configured, to log you in and keep you logged in.</li>
+      <li><strong>Books, covers, reading progress, bookmarks, highlights, and notes</strong> —
+        stored on your own server; downloaded books and their progress are also cached locally
+        on your device for offline reading.</li>
+      <li><strong>Reading statistics</strong> (time read, pages turned, sessions) — calculated
+        on-device and stored on your own server, for your own account only.</li>
+    </ul>
+    <p>
+      None of the above is sent anywhere except the server address you configured. There is no
+      Codexa-operated backend of any kind.
+    </p>
+  </section>
+
+  <section>
+    <h2>Optional integrations you control</h2>
+    <p>
+      Codexa can optionally connect to other services, but only if you (or your server's admin)
+      explicitly configure them — none are contacted by default:
+    </p>
+    <ul>
+      <li><strong>OPDS catalogues</strong> you add (e.g. Calibre-Web, Komga, Kavita) — the app
+        talks to whichever catalogue URL you enter.</li>
+      <li><strong>A BookOrbit server</strong> you connect, for library browsing and optional
+        two-way sync of highlights, sessions, and progress.</li>
+      <li><strong>KOReader sync</strong> — either your Codexa server's own built-in sync, or an
+        external KOSync-compatible server you point it at.</li>
+      <li><strong>Single sign-on</strong> (Google, Apple, or a self-hosted provider) — only if
+        your server's admin enables it; authentication happens directly between your device and
+        that provider.</li>
+    </ul>
+    <p>
+      In every case, these connections go directly from your device (or your own server) to the
+      service you specified — the Codexa project is not an intermediary and does not see any of
+      that traffic.
+    </p>
+  </section>
+
+  <section>
+    <h2>What the app does <em>not</em> do</h2>
+    <ul>
+      <li>No analytics or crash-reporting SDKs are built into the app.</li>
+      <li>No advertising, no ad identifiers, no ad networks.</li>
+      <li>No data is sold or shared with third parties by the Codexa project, because the
+        Codexa project never receives any data to begin with.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Permissions</h2>
+    <p>
+      The Android app requests only <code>INTERNET</code> and
+      <code>ACCESS_NETWORK_STATE</code> — needed to talk to the server you configure and to
+      detect when connectivity is restored. It does not request access to your contacts,
+      location, camera, microphone, or files outside what you explicitly pick with the system
+      file/document picker (e.g. when uploading a font or book on an admin account).
+    </p>
+  </section>
+
+  <section>
+    <h2>Children's privacy</h2>
+    <p>
+      Codexa does not knowingly collect personal information from anyone, including children,
+      because it does not collect personal information at all — everything described above is
+      stored on the server you or your household controls, not on any Codexa-operated system.
+    </p>
+  </section>
+
+  <section>
+    <h2>Your server's own responsibilities</h2>
+    <p>
+      Because you (or your admin) run the actual server, you are the one in control of that
+      data — backups, retention, and access to it are up to how you operate your own server.
+      This policy covers the app's own behaviour; it isn't a substitute for securing your
+      server if you expose it to the internet.
+    </p>
+  </section>
+
+  <section>
+    <h2>Changes to this policy</h2>
+    <p>
+      If this policy changes, the updated version will be posted at this same URL with a new
+      "last updated" date above.
+    </p>
+  </section>
+
+  <section>
+    <h2>Contact</h2>
+    <p>
+      Questions about this policy or how Codexa handles data can be raised as an issue on the
+      project's repository:
+      <a href="https://github.com/thehijacker/codexa/issues" rel="noopener" target="_blank">github.com/thehijacker/codexa/issues</a>.
+    </p>
+  </section>
+</main>
+</body>
+</html>

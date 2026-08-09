@@ -9,16 +9,44 @@
  *   --layout-h    window.innerHeight px  (e.g. 852px) — true full screen height
  */
 :root {
-  --sat:      env(safe-area-inset-top,    0px); /* overwritten by JS after settle */
-  --sab:      34px;                             /* safe default for home-indicator iPhones;
-                                                   JS corrects to real value (0 on Android/iPad/home-button phones) */
-  --layout-h: 100svh;                           /* overwritten by JS after settle */
+  --sat:      env(safe-area-inset-top,    0px); /* JS (Android only) overrides after settle */
+  /* Live env() reference, same as --sat above — not a flat 34px guess: that guess (plus the JS
+     logic that used to fall back to it) was found to compound into real lost reading-content
+     space on iOS PWA when the JS snapshot it relied on was wrong (see reader.html's
+     applyInsets()). --sat already proves this exact live-CSS-default pattern works correctly on
+     iOS; --sab now gets the same treatment instead of a JS-computed inline override there. */
+  --sab:      env(safe-area-inset-bottom, 0px); /* JS (Android only) overrides after settle */
+  /* 100lvh (large viewport height — the true full screen, assuming no dynamic browser chrome),
+     not 100dvh/100svh. Measured directly with a purpose-built test page (see temp/pwatest/):
+     on iOS standalone-PWA, dvh/svh/window.innerHeight/visualViewport.height are ALL consistently
+     793px, while lvh/vh/screen.height/outerHeight are ALL consistently 852px — a difference of
+     exactly env(safe-area-inset-top) (59px on that device). This isn't timing/staleness (every
+     reading agreed, taken back-to-back) — dvh/svh apparently define their height as "screen
+     height minus the status bar" in iOS standalone mode. That's wrong for .reader-layout/#box:
+     it starts at top:0 and handles its own top inset via --sat padding, so it needs the true,
+     un-shrunk full-screen height or it necessarily falls exactly env(safe-area-inset-top) short
+     of the real bottom edge — the persistent bottom gap. `100vh` as a fallback for browsers old
+     enough to not support `lvh` (Safari < 16.4) — CSS silently ignores a rule with an unsupported
+     unit, so the vh declaration stays in effect there and lvh simply overrides it where support
+     exists. Android keeps its own separately-set JS window.innerHeight override, unaffected by
+     this — confirmed correct there independently. */
+  --layout-h: 100vh;
+  --layout-h: 100lvh;
 }
 
 html, body {
   overflow: hidden;
   height: var(--layout-h);
   scrollbar-gutter: auto;
+  /* main.css's generic `html, body { background: var(--color-bg); }` is never overridden here
+     otherwise, and --color-bg is only ever set to a rough approximate theme color by the inline
+     bootstrap script in <head> (so the loading screen isn't blank white) — visibly different
+     from .reader-layout's own, precise --reader-page-bg. Any residual sliver of body peeking
+     out from under .reader-layout's height (env()/dvh measurement is never guaranteed
+     pixel-perfect across every device) showed up as a distinct off-shade strip rather than
+     being invisible. Match the same background here so a leftover gap, however small, blends
+     in instead of banding. */
+  background: var(--reader-page-bg, var(--color-bg));
 }
 
 .reader-layout {
@@ -1442,6 +1470,32 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
 .theme-btn.theme-custom    { background: #000000; color: #c8b89a; }
 .spread-btn { background: var(--color-surface2); color: var(--color-text); }
 
+/* Reader-settings presets (Theme tab) */
+.presets-block { display: flex; flex-direction: column; gap: .5rem; width: 100%; }
+.presets-list { display: flex; flex-wrap: wrap; gap: .5rem; }
+.preset-chip {
+  padding: .4rem .8rem;
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface2);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: .8rem;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: border-color .15s, color .15s;
+}
+.preset-chip.active { border-color: var(--color-accent); color: var(--color-accent); }
+.preset-custom-label {
+  font-size: .78rem;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+.presets-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+
 /* Custom color pickers */
 .custom-color-pickers {
   display: flex;
@@ -1481,6 +1535,16 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
   border-color: #000;
 }
 [data-reader-eink] .spread-btn.active {
+  background: #000;
+  color: #fff;
+  border-color: #000;
+}
+[data-reader-eink] .preset-chip {
+  background: #fff;
+  color: #000;
+  border-color: #000;
+}
+[data-reader-eink] .preset-chip.active {
   background: #000;
   color: #fff;
   border-color: #000;

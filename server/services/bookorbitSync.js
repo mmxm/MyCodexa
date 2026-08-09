@@ -158,11 +158,18 @@ async function login(userId, ctx) {
 async function refresh(userId, ctx) {
   const tok = tokens.get(userId);
   if (!tok?.refresh) return login(userId, ctx);
-  const res = await fetch(`${ctx.webBase}/auth/refresh`, {
-    method: 'POST',
-    headers: { cookie: `refresh_token=${encodeURIComponent(tok.refresh)}`, accept: 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
+  let res;
+  try {
+    res = await fetch(`${ctx.webBase}/auth/refresh`, {
+      method: 'POST',
+      headers: { cookie: `refresh_token=${encodeURIComponent(tok.refresh)}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch {
+    // Network failure (e.g. BookOrbit unreachable) — fall back to a fresh login attempt, which
+    // will itself fail cleanly (and record the real error) instead of throwing a raw fetch error.
+    return login(userId, ctx);
+  }
   if (!res.ok) return login(userId, ctx);
   const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
   const access = extractToken(setCookies, 'access_token') || tok.access;
@@ -172,7 +179,13 @@ async function refresh(userId, ctx) {
 
 // Authenticated request: paces calls, refreshes once on 401, backs off on 429.
 async function api(userId, ctx, method, path, body, state = { refreshed: false, throttled: 0 }) {
-  if (!tokens.has(userId)) await login(userId, ctx);
+  // login()/refresh() already record their own failure status; just make sure a rejection here
+  // can never escape as an unhandled promise rejection (login() throws on any network failure,
+  // e.g. DNS resolution — this used to crash the whole process on the very first BookOrbit call).
+  if (!tokens.has(userId)) {
+    try { await login(userId, ctx); }
+    catch (err) { return { ok: false, status: 0, error: err.message }; }
+  }
   const tok = tokens.get(userId);
   await sleep(PACE_MS);
   let res;
@@ -192,7 +205,8 @@ async function api(userId, ctx, method, path, body, state = { refreshed: false, 
     return { ok: false, status: 0, error: err.message };
   }
   if (res.status === 401 && !state.refreshed) {
-    await refresh(userId, ctx);
+    try { await refresh(userId, ctx); }
+    catch (err) { recordStatus(userId, false, err.message); return { ok: false, status: 0, error: err.message }; }
     return api(userId, ctx, method, path, body, { ...state, refreshed: true });
   }
   if (res.status === 429 && state.throttled < MAX_429_RETRIES) {
@@ -550,7 +564,30 @@ function mapRecBook(b) {
   };
 }
 
-const EMPTY_RELATED = { enabled: true, mapped: false, recommendations: [], seriesBooks: [], nextInSeries: null };
+const EMPTY_RELATED = { enabled: true, mapped: false, recommendations: [], seriesBooks: [], nextInSeries: null, authorBooks: [] };
+
+// Shared by getRecommendations() (local bookId, used by the local book info modal's Related tab)
+// and getRelatedByBoId() (direct boBookId, used by the BookOrbit library's own detail modal for
+// books that may not be imported into Codexa yet — there's no local mapping to resolve there).
+async function fetchRelated(userId, ctx, boBookId) {
+  const [recRes, seriesRes, authorRes] = await Promise.all([
+    api(userId, ctx, 'GET', `/books/${boBookId}/recommendations`),
+    api(userId, ctx, 'GET', `/books/${boBookId}/series-books`),
+    api(userId, ctx, 'GET', `/books/${boBookId}/author-books`),
+  ]);
+
+  const recommendations = (recRes.ok && Array.isArray(recRes.data) ? recRes.data : []).map(mapRecBook);
+
+  const seriesRaw = seriesRes.ok && Array.isArray(seriesRes.data) ? seriesRes.data : [];
+  const idx = seriesRaw.findIndex(b => b.id === boBookId);
+  const nextInSeries = idx >= 0 && idx + 1 < seriesRaw.length ? mapRecBook(seriesRaw[idx + 1]) : null;
+  const seriesBooks = seriesRaw.filter(b => b.id !== boBookId).map(mapRecBook);
+
+  const authorBooks = (authorRes.ok && Array.isArray(authorRes.data) ? authorRes.data : [])
+    .filter(b => b.id !== boBookId).map(mapRecBook);
+
+  return { recommendations, seriesBooks, nextInSeries, authorBooks };
+}
 
 async function getRecommendations(userId, bookId) {
   const ctx = getContext(userId);
@@ -563,25 +600,27 @@ async function getRecommendations(userId, bookId) {
   try { if (!tokens.has(userId)) await login(userId, ctx); }
   catch { return EMPTY_RELATED; }
 
-  const [recRes, seriesRes] = await Promise.all([
-    api(userId, ctx, 'GET', `/books/${m.boBookId}/recommendations`),
-    api(userId, ctx, 'GET', `/books/${m.boBookId}/series-books`),
-  ]);
+  const related = await fetchRelated(userId, ctx, m.boBookId);
+  return { enabled: true, mapped: true, ...related };
+}
 
-  const recommendations = (recRes.ok && Array.isArray(recRes.data) ? recRes.data : []).map(mapRecBook);
-
-  const seriesRaw = seriesRes.ok && Array.isArray(seriesRes.data) ? seriesRes.data : [];
-  const idx = seriesRaw.findIndex(b => b.id === m.boBookId);
-  const nextInSeries = idx >= 0 && idx + 1 < seriesRaw.length ? mapRecBook(seriesRaw[idx + 1]) : null;
-  const seriesBooks = seriesRaw.filter(b => b.id !== m.boBookId).map(mapRecBook);
-
-  return { enabled: true, mapped: true, recommendations, seriesBooks, nextInSeries };
+// For a book identified directly by its BookOrbit id (catalog browsing in bookorbit.js — the
+// caller already has boBookId in hand, no local bookId->boBookId resolution needed).
+async function getRelatedByBoId(userId, ctx, boBookId) {
+  try { if (!tokens.has(userId)) await login(userId, ctx); }
+  catch { return { recommendations: [], seriesBooks: [], nextInSeries: null, authorBooks: [] }; }
+  return fetchRelated(userId, ctx, boBookId);
 }
 
 // Fetch a BookOrbit-hosted image (thumbnail) through our own server so the browser never
 // needs BookOrbit's JWT directly. Shares the same token jar as api().
 async function fetchAsset(userId, ctx, path) {
-  if (!tokens.has(userId)) await login(userId, ctx);
+  // Same "never let login()/refresh() throw past us" guard as api() — every current caller
+  // happens to wrap this in its own try/catch, but that shouldn't be the only thing standing
+  // between a BookOrbit network failure and a process-crashing unhandled rejection.
+  if (!tokens.has(userId)) {
+    try { await login(userId, ctx); } catch { return { ok: false }; }
+  }
   const doFetch = () => {
     const tok = tokens.get(userId);
     return fetch(`${ctx.webBase}${path}`, {
@@ -592,7 +631,7 @@ async function fetchAsset(userId, ctx, path) {
   let res;
   try { res = await doFetch(); } catch { return { ok: false }; }
   if (res.status === 401) {
-    await refresh(userId, ctx);
+    try { await refresh(userId, ctx); } catch { return { ok: false }; }
     try { res = await doFetch(); } catch { return { ok: false }; }
   }
   if (!res.ok) return { ok: false, status: res.status };
@@ -703,6 +742,7 @@ module.exports = {
   parseBoIds,
   VALID_STATUS,
   getRecommendations,
+  getRelatedByBoId,
   getCover,
   api,
   fetchAsset,

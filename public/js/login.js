@@ -1,6 +1,10 @@
 import { apiFetch, setToken } from '/js/api.js';
-import { setButtonLoading }  from '/js/ui.js';
+import { setButtonLoading, syncStatusBarAppearance }  from '/js/ui.js';
 import { initI18n, t, initIconLangPicker } from '/js/i18n.js';
+
+function syncStatusBar() {
+  syncStatusBarAppearance(getComputedStyle(document.documentElement).getPropertyValue('--color-bg'));
+}
 
 (async () => {
   await initI18n();
@@ -25,6 +29,7 @@ import { initI18n, t, initIconLangPicker } from '/js/i18n.js';
     }
     document.documentElement.setAttribute('data-lib-theme', resolved);
   }
+  syncStatusBar();
 
   // E-ink toggle row (only visible inside Android app)
   if (typeof window.AndroidCodexa?.isEinkMode === 'function') {
@@ -49,6 +54,7 @@ import { initI18n, t, initIconLangPicker } from '/js/i18n.js';
           }
           document.documentElement.setAttribute('data-lib-theme', resolved);
         }
+        syncStatusBar();
       });
     }
   }
@@ -65,6 +71,31 @@ import { initI18n, t, initIconLangPicker } from '/js/i18n.js';
       if (regBtn) regBtn.style.display = 'none';
     }
   } catch (_) { /* silently ignore */ }
+
+  // ── OIDC sign-in buttons (Google/Apple/self-hosted IdP) ───────────────────
+  // No buttons render at all if OIDC_PROVIDERS isn't configured server-side —
+  // this endpoint just returns an empty list, so the plain login form is
+  // completely unchanged for installs that haven't set up OIDC.
+  try {
+    const providers = await apiFetch('/auth/oidc/providers');
+    if (Array.isArray(providers) && providers.length) {
+      const wrap = document.getElementById('oidc-providers');
+      wrap.innerHTML = providers.map(p => `
+        <a class="btn btn-secondary oidc-btn" href="/api/auth/oidc/${encodeURIComponent(p.id)}/start">
+          ${t('login.oidc_sign_in_with', { name: p.name })}
+        </a>
+      `).join('') + `<div class="oidc-divider"><span>${t('login.oidc_divider')}</span></div>`;
+      wrap.style.display = 'flex';
+    }
+  } catch (_) { /* silently ignore — OIDC not configured or IdP unreachable */ }
+
+  // Surface a failed OIDC round-trip (server redirects here with this query param)
+  const oidcError = new URLSearchParams(window.location.search).get('error');
+  if (oidcError === 'oidc_registration_disabled') {
+    showAlert('login-alert', t('error.oidc_registration_disabled'));
+  } else if (oidcError === 'oidc_failed') {
+    showAlert('login-alert', t('error.oidc_failed'));
+  }
 
   // ── Tabs ─────────────────────────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -169,10 +200,11 @@ import { initI18n, t, initIconLangPicker } from '/js/i18n.js';
 
     setButtonLoading(btn, true);
     try {
-      const name = document.getElementById('reg-name').value.trim();
+      const name  = document.getElementById('reg-name').value.trim();
+      const email = document.getElementById('reg-email').value.trim();
       const data = await apiFetch('/auth/register', {
         method: 'POST',
-        body: JSON.stringify({ name, username, password }),
+        body: JSON.stringify({ name, username, password, email }),
       });
       setToken(data.token);
       localStorage.setItem('br_user', JSON.stringify(data.user));

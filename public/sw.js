@@ -1,18 +1,20 @@
 // Codexa Service Worker
 // Caches app shell for offline use. EPUBs are cached on demand in BOOKS_CACHE.
 
-const CACHE_VERSION = 'br-v20260717002';
+const CACHE_VERSION = 'br-v20260808001';
 const BOOKS_CACHE   = 'codexa-books-v2';
 const APP_SHELL = [
   '/',
   '/index.html',
   '/login.html',
+  '/oidc-callback.html',
   '/reader.html',
   '/settings.html',
   '/opds.html',
   '/css/main.css',
   '/css/reader.css',
   '/js/app.js',
+  '/js/logger.js',
   '/js/login.js',
   '/js/router.js',
   '/js/settings.js',
@@ -25,7 +27,17 @@ const APP_SHELL = [
   '/js/i18n.js',
   '/js/opds.js',
   '/js/bookorbit.js',
+  '/js/bookorbitDash.js',
   '/js/reader.js',
+  // Dynamically imported by reader.js (await import('./cxreader/index.js')) when opening a
+  // book. Inlined already when serving the bundled dist/js/reader.js, but reader.js is loaded
+  // unbundled straight from here when dist/ isn't in use — must be precached for that path too.
+  '/js/cxreader/index.js',
+  '/js/cxreader/epub-parser.js',
+  '/js/cxreader/renderer.js',
+  '/js/cxreader/column-paginator.js',
+  '/js/cxreader/fixed-paginator.js',
+  '/js/cxreader/cbz-parser.js',
   '/js/vendor/jszip.min.js',
   '/locales/en.json',
   '/locales/de.json',
@@ -34,6 +46,7 @@ const APP_SHELL = [
   '/locales/it.json',
   '/locales/pt.json',
   '/locales/sl.json',
+  '/locales/zh-CN.json',
   '/images/codexa.svg',
   '/images/codexa_bw.svg',
   '/images/all_library.svg',
@@ -140,10 +153,21 @@ const APP_SHELL = [
   '/images/density_normal_bw.svg',
   '/images/density_large.svg',
   '/images/density_large_bw.svg',
+  '/images/appearance.svg',
+  '/images/appearance_bw.svg',
+  '/images/display_size.svg',
+  '/images/display_size_bw.svg',
+  '/images/bookorbit.svg',
+  '/images/bookorbit_bw.svg',
+  '/images/add_to_codexa.svg',
+  '/images/collections.svg',
+  '/images/github.svg',
   '/icons/android-chrome-192x192.png',
   '/icons/android-chrome-512x512.png',
   '/icons/apple-touch-icon.png',
   '/icons/favicon-32x32.png',
+  '/icons/favicon-16x16.png',
+  '/icons/favicon.ico',
   '/manifest.json',
 ];
 

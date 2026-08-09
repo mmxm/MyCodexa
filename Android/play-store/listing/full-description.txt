@@ -1,0 +1,40 @@
+Codexa is a self-hosted EPUB and comic book reader you connect to your own Codexa server — this app is a client, not a standalone library. You (or someone you trust) run the free, open-source Codexa server on a home NAS, small VPS, or similar, then read from it here, offline-capable, with your highlights and progress synced across every device.
+
+IMPORTANT: This app requires a Codexa server to connect to. It is not a book store and does not include any books. Learn how to set up a server at the project's GitHub/Codeberg page (linked below).
+
+WHY CODEXA
+• Built on CXReader, Codexa's own EPUB engine — replaces generic third-party libraries with something built for reliability, faithful formatting, and real-world messy EPUBs, fixed-layout comics, and CBZ/CBR files alike.
+• Books and comics live in one library — first-class EPUB, fixed-layout EPUB, CBZ, and CBR support, no separate apps needed.
+• True two-way KOReader sync — a built-in KOSync-compatible server keeps your e-reader and phone on the same page, no extra software, no cloud.
+• Multi-user with per-user libraries, progress, and settings.
+• Your data stays yours — no cloud account, no tracking, no ads. Everything (books, covers, highlights, progress) lives on your own server.
+
+READING
+• Exact position restore — reopens on the precise page, not just an approximate percentage
+• Bookmarks, and highlights in four colours with optional notes
+• Full-text in-book search
+• Built-in dictionary lookup with local StarDict dictionaries, including proper Chinese/Japanese/Korean word segmentation
+• Footnote and endnote popups without leaving the page
+• Bionic reading, two-page spread, fullscreen mode, auto-hiding toolbar
+• Page-turn animations: none, fade, slide, paper, momentum, or zoom
+
+OFFLINE & MOBILE
+• Full offline reading once a book is downloaded
+• Volume-key page turning, sleep timer, sync status indicators
+• Home-screen widget-style resume banner if you close mid-chapter
+
+THEMES & DISPLAY
+• Seven reading themes (Light, Sepia, Dark, Sepia Dark, Midnight, Nord) plus a fully custom theme
+• Dedicated e-ink mode: high-contrast black-and-white for e-ink displays
+• One-tap UI scaling that works from phones to tablets
+
+LIBRARY & CATALOGUES
+• Browse and download from any OPDS catalogue (Calibre-Web, Komga, Kavita, Ubooquity, and more)
+• Optional BookOrbit integration: browse a self-hosted BookOrbit server's libraries, preview books before downloading, and sync highlights, reading sessions, and progress two-way
+• Shelves, series support, sort & search, reading statistics
+
+ACCOUNTS
+• Multi-user with JWT authentication
+• Optional single sign-on (Google, Apple, or a self-hosted provider) alongside local accounts, if your admin enables it
+
+Codexa is licensed AGPL-3.0 and developed in the open. Source code, setup instructions, and full documentation are linked from the developer page.

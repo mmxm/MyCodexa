@@ -82,11 +82,15 @@ export class ChapterRenderer {
       if (!blobUrl) continue;
       try {
         const cssText  = await fetch(blobUrl).then(r => r.text());
-        const rewritten = this._rewriteCssUrls(cssText, absPath);
+        const rewritten = this._clampLargeMargins(this._rewriteCssUrls(cssText, absPath));
         const style = doc.createElement('style');
         style.textContent = rewritten;
         link.replaceWith(style);
       } catch { link.remove(); }
+    }
+    // Inline <style> blocks (no url()s to resolve, but can carry the same margin issue)
+    for (const styleEl of [...doc.querySelectorAll('style')]) {
+      styleEl.textContent = this._clampLargeMargins(styleEl.textContent);
     }
 
     // Rewrite element resource attributes to blob (or data: on legacy WebViews) URLs
@@ -218,6 +222,28 @@ export class ChapterRenderer {
       const url = this._blobFor(this._resolve(href, cssBase));
       return url ? `url("${url}")` : match;
     });
+  }
+
+  // Some books fake layout with large fixed left/right margins on paragraphs (e.g.
+  // right-indenting SMS-style dialogue ~10em on a wide print page). Sized for a print
+  // page, that collapses reflowable text into an unreadably narrow column on phone-width
+  // viewports. Cap the declared value instead of stripping it — this keeps the visual
+  // "this paragraph is distinct" cue while bounding how much width it can eat. Only
+  // longhand margin-left/right(/inline-start/end) are handled; shorthand `margin: a b c d`
+  // is rare for this specific pattern and left untouched.
+  static _MAX_MARGIN_EM = 2;
+
+  _clampLargeMargins(cssText) {
+    return cssText.replace(
+      /(margin-(?:left|right|inline-start|inline-end)\s*:\s*)(-?[\d.]+)(em|rem)(\s*(?:!important)?\s*;)/gi,
+      (match, prop, num, unit, tail) => {
+        const val = parseFloat(num);
+        const max = ChapterRenderer._MAX_MARGIN_EM;
+        if (Math.abs(val) <= max) return match;
+        const capped = val < 0 ? -max : max;
+        return `${prop}${capped}${unit}${tail}`;
+      }
+    );
   }
 
   // Resolve a chapter-relative href to an absolute ZIP entry path (no leading slash),

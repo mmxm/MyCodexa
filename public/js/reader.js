@@ -1,5 +1,5 @@
 ﻿import { apiFetch, requireAuth, getToken } from './api.js';
-import { toast, initSortMenuFor, resyncSortMenu } from './ui.js';
+import { toast, initSortMenuFor, resyncSortMenu, syncStatusBarAppearance } from './ui.js';
 import { t, initI18n, applyTranslations, getCurrentLang } from './i18n.js';
 import { isBookDownloaded, downloadBook, fetchOfflineBookFile, getBookMeta, saveBookMeta, removeBook } from './offline.js';
 import { queueProgress, clearProgress, flushProgressOutbox } from './progress-outbox.js';
@@ -8,6 +8,20 @@ import { log, warn } from './logger.js';
 const READER_BUILD = 'br-v89-cxreader-only';
 const _i18nReady = initI18n();
 log('[codexa] reader build', READER_BUILD);
+
+// initI18n() reveals the page (visibility:hidden → '', set by the inline script in <head>) as
+// soon as locale strings are ready — usually off a cached locale, faster than reader.html's
+// safe-area probe settling. That showed --sat as an unsettled/wrong value for a beat, then
+// visibly snapped once the probe finished — the "screen jump" right after opening a book.
+// Re-hide immediately if insets aren't settled yet, and reveal again once they are; if they
+// already were, this costs one harmless same-tick hide+reveal, imperceptible to the user.
+_i18nReady.then(() => {
+  if (!window.__insetsReadyPromise) return; // script blocked/absent — don't get stuck hidden
+  document.documentElement.style.visibility = 'hidden';
+  window.__insetsReadyPromise.then(() => {
+    document.documentElement.style.visibility = '';
+  });
+});
 
 // Module-level detection (mirrors init()'s _legacyWebView) so module-scope code can guard
 // features that break Chrome 83 Android WebView.
@@ -294,6 +308,15 @@ let _cxViewerPaddingSet = false; // true after the first post-render inset measu
 let _cxTouchNavIframe = null; // iframe that currently has touch-nav handlers attached
 let currentBook  = null;
 let prefs        = loadPrefs();
+// Which reader_presets row (if any) is currently selected. This is a UI selection, not a
+// "still matches exactly" flag: it stays set through further edits (so Update/Rename/Delete
+// remain available) and only changes when the user applies a different preset, saves a new
+// one, or deletes the selected one. null = nothing selected ("Custom").
+// Deliberately per-device (localStorage), NOT synced to the server: presets themselves are
+// shared across devices, but which one each device is currently using is not — e.g. an
+// e-ink device and a phone can each stay on their own preset instead of the last device to
+// switch overwriting every other device's choice.
+let activePresetId = loadActivePresetId();
 let currentCfi   = '';
 let currentPct        = 0;
 let lastKnownGoodPct  = 0;
@@ -395,6 +418,12 @@ const RENDITION_BOTTOM_RESERVE = 40;
 const readerLayout   = document.querySelector('.reader-layout');
 const loadingOverlay = document.getElementById('loading-overlay');
 const loadingMsg     = document.getElementById('loading-msg');
+const loadingCancelBtn = document.getElementById('loading-cancel-btn');
+// Cancelling never calls AbortController.abort() on the in-flight fetch — passing a signal to
+// fetch() is known to hang indefinitely on some old WebView builds (see the NOTE in api.js).
+// Navigating away is a safe, native way to give up on it instead: the browser tears down any
+// pending request for this document as part of unloading it, no matter how old the WebView is.
+loadingCancelBtn?.addEventListener('click', () => { window.location.href = libraryReturnUrl; });
 const epubViewer     = document.getElementById('epub-viewer');
 const bookTitleEl    = document.getElementById('book-title');
 const chapterTitleEl = document.getElementById('chapter-title');
@@ -444,38 +473,45 @@ const annotationAcceptBtn = document.getElementById('btn-annotation-accept');
 // Keys that are stored per-book (content appearance).  All others are global.
 const PER_BOOK_KEYS = ['fontSize','fontFamily','lineHeight','letterSpacing','margin','theme','overrideStyles','paraIndent','paraIndentSize','paraSpacing','dictionaries','dictionaryOrder','bionicReading','skipOpenProgressCheck','skipSaveOnClose'];
 
+// Deep-merge a saved prefs object onto DEFAULT_PREFS (missing keys/nested keys fall
+// back to defaults). Shared by loadPrefs() (source: localStorage) and the server pull
+// in init() (source: GET /api/settings) so the merge rules can't drift between the two.
+function mergePrefsWithDefaults(saved) {
+  const sb = saved.statusBar || {};
+  const legacyBtnPx = typeof saved.headerButtonSize === 'number' ? saved.headerButtonSize : null;
+  const btnBase = window.matchMedia('(max-width: 640px)').matches ? 44 : 36;
+  return {
+    ...DEFAULT_PREFS,
+    ...saved,
+    headerButtonScalePct: saved.headerButtonScalePct ?? (
+      legacyBtnPx != null && legacyBtnPx > 0
+        ? Math.min(225, Math.max(75, Math.round(legacyBtnPx / btnBase * 100)))
+        : DEFAULT_PREFS.headerButtonScalePct
+    ),
+    edgePadding: { ...DEFAULT_PREFS.edgePadding, ...(saved.edgePadding || {}) },
+    statusBar: {
+      ...DEFAULT_STATUS_BAR,
+      ...sb,
+      positions:       {
+        ...DEFAULT_STATUS_BAR.positions,
+        // On mobile with no saved br slot, show battery + connection by default.
+        ...(!('br' in (sb.positions || {})) && window.matchMedia('(max-width: 640px)').matches
+            ? { br: ['battery', 'online'] } : {}),
+        ...sb.positions,
+      },
+      showIcons:       { ...DEFAULT_STATUS_BAR.showIcons,       ...sb.showIcons },
+      bookProgressBar: { ...DEFAULT_STATUS_BAR.bookProgressBar, ...sb.bookProgressBar },
+      chapProgressBar: { ...DEFAULT_STATUS_BAR.chapProgressBar, ...sb.chapProgressBar },
+      clockFormat:     sb.clockFormat || DEFAULT_STATUS_BAR.clockFormat,
+    },
+  };
+}
+
 function loadPrefs() {
   try {
     const s = localStorage.getItem('br_reader_prefs');
     const saved = s ? JSON.parse(s) : {};
-    const sb = saved.statusBar || {};
-    const legacyBtnPx = typeof saved.headerButtonSize === 'number' ? saved.headerButtonSize : null;
-    const btnBase = window.matchMedia('(max-width: 640px)').matches ? 44 : 36;
-    const merged = {
-      ...DEFAULT_PREFS,
-      ...saved,
-      headerButtonScalePct: saved.headerButtonScalePct ?? (
-        legacyBtnPx != null && legacyBtnPx > 0
-          ? Math.min(225, Math.max(75, Math.round(legacyBtnPx / btnBase * 100)))
-          : DEFAULT_PREFS.headerButtonScalePct
-      ),
-      edgePadding: { ...DEFAULT_PREFS.edgePadding, ...(saved.edgePadding || {}) },
-      statusBar: {
-        ...DEFAULT_STATUS_BAR,
-        ...sb,
-        positions:       {
-          ...DEFAULT_STATUS_BAR.positions,
-          // On mobile with no saved br slot, show battery + connection by default.
-          ...(!('br' in (sb.positions || {})) && window.matchMedia('(max-width: 640px)').matches
-              ? { br: ['battery', 'online'] } : {}),
-          ...sb.positions,
-        },
-        showIcons:       { ...DEFAULT_STATUS_BAR.showIcons,       ...sb.showIcons },
-        bookProgressBar: { ...DEFAULT_STATUS_BAR.bookProgressBar, ...sb.bookProgressBar },
-        chapProgressBar: { ...DEFAULT_STATUS_BAR.chapProgressBar, ...sb.chapProgressBar },
-        clockFormat:     sb.clockFormat || DEFAULT_STATUS_BAR.clockFormat,
-      },
-    };
+    const merged = mergePrefsWithDefaults(saved);
     if (localStorage.getItem('br_library_theme') === 'eink') merged.eink = true;
     return merged;
   } catch { return { ...DEFAULT_PREFS, statusBar: { ...DEFAULT_STATUS_BAR } }; }
@@ -543,12 +579,269 @@ function persistPrefs() {
   // The per-book layer is stored separately in br_book_prefs; on load, loadBookPrefs() re-applies
   // the overrides so global prefs naturally reflect the last used values for each book context.
   localStorage.setItem('br_reader_prefs', JSON.stringify(prefs));
+  localStorage.setItem('br_active_preset_id', JSON.stringify(activePresetId));
   // Also track per-book overrides when a book is open
   if (currentBook?.id) saveBookPrefs(currentBook.id);
+  renderPresetsUi();
   apiFetch('/settings', {
     method: 'PUT',
     body: JSON.stringify({ reader_prefs: prefs }),
   }).catch(() => {});
+}
+
+// ── Reader-settings presets ────────────────────────────────────────────────────
+// Named snapshots of prefs (minus dictionary selection, which has its own global
+// sync + per-book-language-default logic), synced via the backend so the same list
+// is available on every device — see server/routes/settings.js.
+let presetsList = []; // [{id, name, prefs, updated_at}], cached in memory once fetched
+// True only after a presets API call has actually succeeded. Drives whether
+// Save/Update/Rename/Delete are offered — navigator.onLine/_isOnline is NOT enough here:
+// it only reflects whether a network interface is up, so "connected to WiFi but the
+// server is unreachable" (server down, wrong network, etc.) still reports online:true
+// and would let the user attempt — and fail — a save. This flag reflects the real thing.
+let _presetsReachable = false;
+
+function loadActivePresetId() {
+  try {
+    const raw = localStorage.getItem('br_active_preset_id');
+    return raw != null ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function loadPresetsList() {
+  try {
+    presetsList = await apiFetch('/settings/presets');
+    _presetsReachable = true;
+  } catch {
+    _presetsReachable = false;
+    renderPresetsUi();
+    return presetsList;
+  }
+  // This device remembers it was using a preset — refresh to the latest saved version (it
+  // may have been edited from another device since applying it here) so this device stays
+  // consistent with that preset rather than a possibly-stale local copy of its content.
+  if (activePresetId != null) {
+    if (presetsList.some(p => p.id === activePresetId)) applyPreset(activePresetId);
+    else { activePresetId = null; persistPrefs(); } // preset was deleted elsewhere
+  } else {
+    renderPresetsUi();
+  }
+  return presetsList;
+}
+
+function currentPrefsForPreset() {
+  const { dictionaries, dictionaryOrder, dictionaryMeta, ...rest } = prefs;
+  return rest;
+}
+
+async function saveCurrentAsPreset(name) {
+  const preset = await apiFetch('/settings/presets', {
+    method: 'POST',
+    body: JSON.stringify({ name, prefs: currentPrefsForPreset() }),
+  });
+  presetsList.push(preset);
+  activePresetId = preset.id;
+  persistPrefs();
+  return preset;
+}
+
+async function updatePreset(id) {
+  const preset = await apiFetch(`/settings/presets/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ prefs: currentPrefsForPreset() }),
+  });
+  const i = presetsList.findIndex(p => p.id === id);
+  if (i !== -1) presetsList[i] = preset;
+  renderPresetsUi();
+  return preset;
+}
+
+async function renamePreset(id, name) {
+  const preset = await apiFetch(`/settings/presets/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name }),
+  });
+  const i = presetsList.findIndex(p => p.id === id);
+  if (i !== -1) presetsList[i] = preset;
+  renderPresetsUi();
+  return preset;
+}
+
+async function deletePreset(id) {
+  await apiFetch(`/settings/presets/${id}`, { method: 'DELETE' });
+  presetsList = presetsList.filter(p => p.id !== id);
+  if (activePresetId === id) {
+    activePresetId = null;
+    persistPrefs();
+  } else {
+    renderPresetsUi();
+  }
+}
+
+// Apply a saved preset's settings onto the live prefs. Deliberately leaves this book's
+// per-book overrides (br_book_prefs) untouched — "Reset for this book"
+// (#btn-reset-book-prefs, see clearBookPrefs()) is the existing, explicit way to clear
+// those if the user wants the preset to fully take over a book with its own overrides.
+function applyPreset(id) {
+  const preset = presetsList.find(p => p.id === id);
+  if (!preset) return;
+  const { dictionaries, dictionaryOrder, dictionaryMeta, ...rest } = preset.prefs;
+
+  // bionicReading rewrites the chapter DOM at render time (word-prefix spans); like its own
+  // settings-panel toggle (see 'bionic-reading-toggle' handler), changing it only takes
+  // effect after a reload — detect that up front so we reload the same way the toggle does,
+  // instead of silently leaving the old rendering in place until the user notices and reloads.
+  const bionicChanging = 'bionicReading' in rest && !!rest.bionicReading !== !!prefs.bionicReading;
+
+  Object.assign(prefs, rest);
+  activePresetId = id;
+
+  if (bionicChanging) {
+    persistPrefs();
+    saveBionicReloadState();
+    location.reload();
+    return;
+  }
+
+  applyUiTheme();
+  // Sync column-layout state (two-column on/off, inter-column gap) from the preset's
+  // spread/margin BEFORE repaginating, so the single reapplyStyles() call below already
+  // paginates with the preset's layout in effect — otherwise it silently keeps whatever
+  // single/dual-page state the reader was in before the preset was applied.
+  if (_cxReader) {
+    _cxReader._twoColumn = cxWantsTwoCol();
+    _cxReader._columnGap = prefs.margin * 2;
+  }
+  reapplyStyles();
+  // Every other setting category has its own dedicated "apply" function, normally invoked
+  // only by that setting's own control in the settings panel. A preset can change all of them
+  // at once, so re-run each here too — otherwise they silently keep whatever value was in
+  // effect before the preset switch until the next full reload.
+  applyStatusBarStyles();
+  renderStatusSlots();
+  applyEdgePadding();
+  applyNavZones();
+  applyHeaderButtonSize();
+  applyHeaderBtnVisibility();
+  applyFloatNavBtn();
+  applyPageShadow();
+  applyAutoHide();
+  updateBookmarkBadge();
+  updateAnnotationBadge();
+  if (prefs.keepScreenOn) acquireWakeLock(); else releaseWakeLock();
+  applyVolumeKeyMode(prefs.volumeKeysEnabled);
+  void applyPortraitLock(prefs.lockPortrait);
+  syncSettingsUi();
+  persistPrefs();
+}
+
+// Render the preset list + active/"Custom" state into the Theme tab (#presets-list,
+// #btn-preset-update/rename/delete, #preset-custom-label). No-op before the settings
+// panel exists in the DOM (it always does — reader.html is static markup — but this
+// is also called from async callbacks that may resolve unusually early or late).
+function renderPresetsUi() {
+  const listEl = document.getElementById('presets-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  presetsList.forEach(p => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'preset-chip' + (p.id === activePresetId ? ' active' : '');
+    btn.textContent = p.name;
+    btn.addEventListener('click', () => applyPreset(p.id));
+    listEl.appendChild(btn);
+  });
+  document.getElementById('preset-custom-label')?.classList.toggle('hidden', activePresetId != null);
+  const hasActive = activePresetId != null;
+  document.getElementById('btn-preset-update')?.classList.toggle('hidden', !hasActive);
+  document.getElementById('btn-preset-rename')?.classList.toggle('hidden', !hasActive);
+  document.getElementById('btn-preset-delete')?.classList.toggle('hidden', !hasActive);
+
+  // Save/Update/Rename/Delete all need a server round trip (Save needs the server-assigned
+  // id back; the others must not silently no-op) — disable them until we've actually
+  // confirmed the presets API is reachable, rather than let the user hit a failed-request
+  // toast. Applying a preset stays enabled: it's a local merge of already-fetched data,
+  // degrading the same way any other settings change already does.
+  const disabled = !_presetsReachable;
+  for (const id of ['btn-preset-save', 'btn-preset-update', 'btn-preset-rename', 'btn-preset-delete']) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = disabled;
+    btn.title = disabled ? t('reader.preset_offline_hint') : '';
+  }
+}
+
+// Small text-input modal, matching the style of the existing shelf-rename modal
+// (library.js) — this codebase doesn't use native prompt()/confirm() anywhere.
+function presetNamePrompt(title, defaultValue = '') {
+  return new Promise(resolve => {
+    // Snapshot the safe-area vars before the input below is focused and opens the on-screen
+    // keyboard. On some mobile browsers, the keyboard show/hide cycle leaves a fresh
+    // env(safe-area-inset-*) re-probe reporting 0 for a while afterward (timing varies by
+    // device — a single delayed re-probe wasn't reliable), collapsing the status bar under
+    // the notch/camera cutout. Restoring these known-good values verbatim, instead of
+    // trusting a fresh measurement, sidesteps that unreliability entirely.
+    const root = document.documentElement;
+    const savedSat = root.style.getPropertyValue('--sat');
+    const savedSab = root.style.getPropertyValue('--sab');
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:340px">
+        <h2>${title}</h2>
+        <div class="form-group">
+          <input type="text" id="preset-name-input" maxlength="60" autofocus />
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="preset-name-cancel">${t('common.cancel')}</button>
+          <button class="btn btn-primary"   id="preset-name-save">${t('common.save')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+    const input = backdrop.querySelector('#preset-name-input');
+    input.value = defaultValue; // set as a property, not interpolated into the HTML string
+    const close = value => {
+      backdrop.remove();
+      resolve(value);
+      const restore = () => {
+        if (savedSat) root.style.setProperty('--sat', savedSat);
+        if (savedSab) root.style.setProperty('--sab', savedSab);
+        reapplyStyles();
+      };
+      // Several passes at increasing delays — keyboard-dismiss timing varies a lot across
+      // devices/browsers, so no single delay is reliable (matches the multi-probe settle
+      // strategy reader.html's own safe-area bootstrap already uses for the same reason).
+      [50, 300, 700, 1200].forEach(ms => setTimeout(restore, ms));
+    };
+    backdrop.querySelector('#preset-name-cancel').addEventListener('click', () => close(null));
+    backdrop.querySelector('#preset-name-save').addEventListener('click', () => close(input.value.trim() || null));
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') close(input.value.trim() || null); });
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) close(null); });
+    input.focus();
+    input.select();
+  });
+}
+
+// Small confirm modal, mirroring kosyncConfirm() below.
+function presetConfirm(msg) {
+  return new Promise(resolve => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:340px">
+        <p style="margin-bottom:1.5rem">${msg}</p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="preset-confirm-cancel">${t('common.cancel')}</button>
+          <button class="btn btn-primary"   id="preset-confirm-ok">${t('common.confirm')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+    const close = ok => { backdrop.remove(); resolve(ok); };
+    backdrop.querySelector('#preset-confirm-cancel').addEventListener('click', () => close(false));
+    backdrop.querySelector('#preset-confirm-ok').addEventListener('click',     () => close(true));
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) close(false); });
+  });
 }
 
 function readBionicReloadState() {
@@ -788,8 +1081,111 @@ function fontStyleFromFilename(f) {
   return (l.includes('italic') || l.includes('oblique')) ? 'italic' : 'normal';
 }
 
+let _fontBlobUrls = [];
+
+// Fetch a custom font file's raw bytes, network first, falling back to the Service
+// Worker's persistent font cache (BOOKS_CACHE in sw.js) read directly via the Cache
+// Storage API. Reading the cache here — once, from the top-level page — instead of
+// relying on a plain fetch() being intercepted by the SW matters because CXReader
+// renders each chapter into a fresh sandboxed blob: iframe, and whether such an
+// iframe's own fetches are actually routed through the controlling Service Worker is
+// inconsistent across WebView versions/chapters (observed: works for the first couple
+// of chapters offline, then silently stops). Resolving bytes up front sidesteps that.
+async function fetchFontBytes(filename) {
+  try {
+    const res = await fetch(`/user-fonts/${encodeURIComponent(filename)}`);
+    if (res.ok) return await res.arrayBuffer();
+  } catch { /* offline or network error — fall through to cache */ }
+  try {
+    if ('caches' in window) {
+      const cache = await caches.open('codexa-books-v2');
+      const cached = await cache.match(`/user-fonts/${encodeURIComponent(filename)}`);
+      if (cached) return await cached.arrayBuffer();
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function _setFontFaceStyle(css) {
+  fontFaceCSS = css;
+  let hostStyle = document.getElementById('_custom-font-faces');
+  if (!hostStyle) {
+    hostStyle = document.createElement('style');
+    hostStyle.id = '_custom-font-faces';
+    document.head.appendChild(hostStyle);
+  }
+  hostStyle.textContent = fontFaceCSS;
+}
+
+// Builds fontFaceCSS immediately, referencing each font by its live network URL —
+// no bytes are fetched by JS here, so this resolves synchronously fast and the
+// browser applies the font itself as soon as it paints text with it (exactly how
+// this worked before offline support was added). Kept as the initial/online path
+// so opening a book online is never delayed by the (slower) blob upgrade below.
+function _buildLiveFontCss(families) {
+  const cssLines = [];
+  for (const [family, ffiles] of Object.entries(families)) {
+    ffiles.forEach(f => {
+      // No format() hint: it's inferred from the file extension, but renamed/repackaged
+      // fonts often have an extension that doesn't match their actual sfnt data, and a
+      // wrong format() makes browsers silently drop the whole @font-face (the font then
+      // never applies and falls back to Georgia). Omitting it lets the engine sniff the
+      // bytes. Absolute origin URL so it also resolves inside CXReader's blob: iframe,
+      // whose document origin can be opaque on Android WebView.
+      cssLines.push(`@font-face {
+  font-family: "${family}";
+  src: url("${location.origin}/user-fonts/${encodeURIComponent(f)}");
+  font-weight: ${fontWeightFromFilename(f)};
+  font-style: ${fontStyleFromFilename(f)};
+}`);
+    });
+    customFonts.push({ label: family, value: `"${family}", Georgia, serif` });
+  }
+  return cssLines.join('\n');
+}
+
+// Re-resolves every custom font's bytes (network first, cache fallback) into blob:
+// URLs and swaps fontFaceCSS to reference those instead of the live network path.
+// Runs in the background, AFTER the fast live-URL CSS above is already showing the
+// right font, so it never delays the initial paint. It exists because each chapter
+// is rendered into a fresh sandboxed blob: iframe, and whether such an iframe's own
+// fetch() for an @font-face src is actually routed through the controlling Service
+// Worker is inconsistent across WebView versions/chapters (observed: works for the
+// first couple of chapters offline, then silently reverts to the default font).
+// Resolving bytes once here and handing every chapter a local blob: URL sidesteps
+// that entirely, including for chapters rendered fully offline.
+async function _upgradeFontsToBlobs(families) {
+  const cssLines = [];
+  const newCustomFonts = [];
+  for (const [family, ffiles] of Object.entries(families)) {
+    const results = await Promise.all(ffiles.map(async f => ({ f, bytes: await fetchFontBytes(f) })));
+    let hasFace = false;
+    for (const { f, bytes } of results) {
+      if (!bytes) continue; // neither network nor cache had it — skip this face
+      hasFace = true;
+      const blobUrl = URL.createObjectURL(new Blob([bytes]));
+      _fontBlobUrls.push(blobUrl);
+      cssLines.push(`@font-face {
+  font-family: "${family}";
+  src: url("${blobUrl}");
+  font-weight: ${fontWeightFromFilename(f)};
+  font-style: ${fontStyleFromFilename(f)};
+}`);
+    }
+    if (hasFace) newCustomFonts.push({ label: family, value: `"${family}", Georgia, serif` });
+  }
+  if (!cssLines.length) return; // nothing resolved — keep the live-URL CSS as-is
+  customFonts = newCustomFonts;
+  customFonts.sort((a, b) => a.label.localeCompare(b.label));
+  _setFontFaceStyle(cssLines.join('\n'));
+  if (_cxReader) reapplyStyles();
+  populateFontSelect();
+}
+
 async function loadCustomFonts() {
   customFonts = [];
+  _fontBlobUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch {} });
+  _fontBlobUrls = [];
   let files;
   try {
     files = await apiFetch('/fonts', { timeout: 8000 });
@@ -806,43 +1202,9 @@ async function loadCustomFonts() {
       if (!families[fam]) families[fam] = [];
       families[fam].push(f);
     });
-    const cssLines = [];
-    Object.entries(families).forEach(([family, ffiles]) => {
-      ffiles.forEach(f => {
-        // No format() hint: it's inferred from the file extension, but renamed/repackaged
-        // fonts often have an extension that doesn't match their actual sfnt data, and a
-        // wrong format() makes browsers silently drop the whole @font-face (the font then
-        // never applies and falls back to Georgia). Omitting it lets the engine sniff the
-        // bytes. Absolute origin URL so it also resolves inside CXReader's blob: iframe,
-        // whose document origin can be opaque on Android WebView.
-        cssLines.push(`@font-face {
-  font-family: "${family}";
-  src: url("${location.origin}/user-fonts/${encodeURIComponent(f)}");
-  font-weight: ${fontWeightFromFilename(f)};
-  font-style: ${fontStyleFromFilename(f)};
-}`);
-      });
-      customFonts.push({ label: family, value: `"${family}", Georgia, serif` });
-    });
-    fontFaceCSS = cssLines.join('\n');
+    _setFontFaceStyle(_buildLiveFontCss(families));
     customFonts.sort((a, b) => a.label.localeCompare(b.label));
-    let hostStyle = document.getElementById('_custom-font-faces');
-    if (!hostStyle) {
-      hostStyle = document.createElement('style');
-      hostStyle.id = '_custom-font-faces';
-      document.head.appendChild(hostStyle);
-    }
-    hostStyle.textContent = fontFaceCSS;
-    // Proactively fetch every custom font's bytes (not just whichever one is active), so the
-    // SW's network-first/cache-fallback handler for /user-fonts/ (public/sw.js) warms its cache
-    // for all of them. @font-face only triggers a fetch when text is actually painted with it —
-    // a font picked in Settings but never yet rendered on this device (or one whose cache got
-    // wiped by an app-update CACHE_VERSION bump) would otherwise stay uncached until the next
-    // time it's used online, and silently fall back to the default font offline in the meantime
-    // (a failed @font-face fetch just drops that font-face, no error surfaces).
-    if (navigator.onLine) {
-      files.forEach(f => { fetch(`/user-fonts/${encodeURIComponent(f)}`).catch(() => {}); });
-    }
+    _upgradeFontsToBlobs(families).catch(() => {});
   } catch (err) {
     warn('[reader] Custom fonts not loaded:', err.message);
   }
@@ -940,7 +1302,7 @@ ${_supportsWhere
   ? ':where(p) { margin-top: 0; margin-bottom: 0.3em; }'
   : 'p { margin-top: 0; margin-bottom: 0.3em; }'}
 ${fontOverrides}
-img:not(.codexa-dropcap-img) {
+img:not(.codexa-dropcap-img):not(a img) {
   max-width:   100% !important;
   max-height:  75vh !important;
   width:       auto !important;
@@ -949,6 +1311,15 @@ img:not(.codexa-dropcap-img) {
   display:     block !important;
   margin-left: auto !important;
   margin-right: auto !important;
+  mix-blend-mode: multiply !important;
+}
+/* Images wrapped in a link (footnote/note markers, inline icons) are almost always meant
+   to sit inline with the surrounding text, sized by the book's own CSS — unlike standalone
+   illustrations, don't force them to display:block or override their width/height. */
+a img:not(.codexa-dropcap-img) {
+  max-width:  100% !important;
+  max-height: 75vh !important;
+  object-fit: contain !important;
   mix-blend-mode: multiply !important;
 }
 figure { background: transparent !important; background-color: transparent !important; }
@@ -1278,6 +1649,16 @@ document.addEventListener('visibilitychange', () => {
     // backgrounding — re-establish one here if it didn't, so reading after a wake isn't silently
     // untracked until the next checkpoint.
     if (currentBook && isReady && !statsSessionId) startStatsSession(currentBook.id);
+    if (navigator.onLine) flushSessionCheckpoints().catch(() => {});
+    // Android can reset its "hidden system bars" state on screen-off, requiring
+    // MainActivity.onWindowFocusChanged to reassert immersive mode once the screen wakes back
+    // up (see Android/.../MainActivity.kt) — while that's settling, the top/bottom safe-area
+    // inset can end up stale or wrong. Re-probe a couple of times to catch the value once the
+    // bars have actually finished re-hiding, same margin as the post-activation probe in init().
+    if (isAndroidApp() && window.__applyInsets) {
+      setTimeout(() => window.__applyInsets(false), 400);
+      setTimeout(() => window.__applyInsets(true), 900);
+    }
   }
   if (document.visibilityState === 'hidden') {
     writeInterruptedSession();
@@ -1328,6 +1709,7 @@ function applyUiTheme() {
     document.documentElement.style.setProperty('--reader-header-text-muted',  text);
     if (safeAreaFill) safeAreaFill.style.background = bg;
     epubViewer.style.background = bg;
+    syncStatusBarAppearance(bg);
   } else {
     document.documentElement.removeAttribute('data-reader-eink');
     // Apply full reader-theme palette to all shell UI (panels, sidebars, inputs …)
@@ -1359,6 +1741,7 @@ function applyUiTheme() {
     // Safe-area fill: solid (opaque) page colour so the translucent header doesn't leak through
     if (safeAreaFill) safeAreaFill.style.background = theme.bg;
     epubViewer.style.background = theme.bg;
+    syncStatusBarAppearance(ui.bg);
   }
   applyPageShadow();
   // Tag body with current theme name so CSS can target per-theme overrides.
@@ -1419,6 +1802,37 @@ function attachIframeKeyboard(contents) {
   }, { passive: true });
 }
 
+// Word-boundary detection shared by long-press / right-click / double-click "look up this
+// word". CJK scripts (Chinese, Japanese) don't separate words with spaces, so simply expanding
+// through consecutive Unicode letters (as the fallback below does) swallows an entire
+// punctuation-delimited clause as "one word" instead of stopping at a real word boundary.
+// Intl.Segmenter's dictionary-based word breaking (supported on Android/Chrome and Safari 14.1+)
+// gives real boundaries for those scripts; everything else (Latin, Korean — already
+// space-delimited) keeps using the cheaper regex walk, unchanged.
+let _cjkSegmenter = null;
+const CJK_NO_SPACE_RE = /[\u3400-\u9fff\u3040-\u30ff\uf900-\ufaff]/; // Han ideographs + Hiragana/Katakana
+
+function _resolveWordBounds(text, offset) {
+  const ch = text[offset] ?? text[offset - 1];
+  if (ch && CJK_NO_SPACE_RE.test(ch) && typeof Intl?.Segmenter === 'function') {
+    try {
+      _cjkSegmenter ||= new Intl.Segmenter(undefined, { granularity: 'word' });
+      for (const s of _cjkSegmenter.segment(text)) {
+        const end = s.index + s.segment.length;
+        if (offset >= s.index && offset < end) {
+          // isWordLike is false for punctuation/whitespace segments — treat like landing
+          // on punctuation with the regex walk below (empty word, no lookup).
+          return s.isWordLike ? { start: s.index, end } : { start: offset, end: offset };
+        }
+      }
+    } catch { /* fall through to the generic boundary walk below */ }
+  }
+  let s = offset, e = offset;
+  while (s > 0 && /[\p{L}\p{N}'’\-]/u.test(text[s - 1])) s--;
+  while (e < text.length && /[\p{L}\p{N}'’\-]/u.test(text[e])) e++;
+  return { start: s, end: e };
+}
+
 // Inject long-press (mobile) and right-click (desktop) dictionary lookup
 // into each epub.js iframe page. Uses postMessage to ask the host to show the popup.
 function attachIframeDictionary(contents) {
@@ -1426,7 +1840,7 @@ function attachIframeDictionary(contents) {
   const doc = contents.document;
   const win = contents.window;
   const coarsePointer = !!win.matchMedia?.('(pointer: coarse)')?.matches;
-  let pressTimer = null, pressX = 0, pressY = 0, selectionTimer = null, lastSelectionWord = '', lastSelectionTs = 0;
+  let pressTimer = null, pressX = 0, pressY = 0;
 
   // iOS: suppress native callout and text-selection takeover inside epub iframes.
   if (isIOS) {
@@ -1453,9 +1867,7 @@ function attachIframeDictionary(contents) {
     }
     if (!node || node.nodeType !== 3) return '';
     const text = node.textContent;
-    let s = offset, e = offset;
-    while (s > 0 && /[\p{L}\p{N}'\u2019\-]/u.test(text[s - 1])) s--;
-    while (e < text.length && /[\p{L}\p{N}'\u2019\-]/u.test(text[e])) e++;
+    const { start: s, end: e } = _resolveWordBounds(text, offset);
     return text.slice(s, e).replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
   }
 
@@ -1477,9 +1889,7 @@ function attachIframeDictionary(contents) {
     }
     if (!node || node.nodeType !== 3) return null;
     const text = node.textContent;
-    let s = offset, e = offset;
-    while (s > 0 && /[\p{L}\p{N}'\u2019\-]/u.test(text[s - 1])) s--;
-    while (e < text.length && /[\p{L}\p{N}'\u2019\-]/u.test(text[e])) e++;
+    const { start: s, end: e } = _resolveWordBounds(text, offset);
     const word = text.slice(s, e).replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
     if (!word) return null;
     try {
@@ -1490,19 +1900,6 @@ function attachIframeDictionary(contents) {
     } catch { return null; }
   }
 
-  function triggerSelectionLookup() {
-    const sel = win.getSelection?.();
-    const raw = (sel?.toString() || '').trim();
-    if (!raw) return;
-    const word = raw.split(/\s+/)[0].replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
-    if (!word) return;
-    const now = Date.now();
-    if (word === lastSelectionWord && now - lastSelectionTs < 900) return;
-    lastSelectionWord = word;
-    lastSelectionTs = now;
-    window.parent.postMessage({ type: 'dict-lookup', word }, '*');
-  }
-
   doc.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
     pressX = t.clientX;
@@ -1510,20 +1907,38 @@ function attachIframeDictionary(contents) {
     pressTimer = setTimeout(() => {
       pressTimer = null;
       suppressNextTap = true;
+
+      // Long-press on an existing highlight/annotation → open its edit sheet instead of
+      // starting a new selection, on every platform.
+      const pointEl = doc.elementFromPoint(pressX, pressY);
+      const existingMark = pointEl?.closest?.('mark[data-annot-id]');
+      if (existingMark) {
+        const annotId = parseInt(existingMark.dataset.annotId);
+        if (!isNaN(annotId)) window.parent.postMessage({ type: 'annotation-click', id: annotId }, '*');
+        return;
+      }
+
+      if (!isIOS) {
+        // Android/other touch platforms keep native text selection enabled (see the
+        // contextmenu/dblclick handlers below and attachIframeAnnotation), so let the OS's
+        // own long-press-to-select run its course here instead of guessing a word/compound
+        // boundary ourselves — it's the same engine desktop double-click uses, gets CJK
+        // compound boundaries right (which our own Intl.Segmenter-based guess sometimes
+        // doesn't), and stays draggable to extend/shrink afterward. We never preventDefault()
+        // here, so there's nothing to hand back. attachIframeAnnotation's selectionchange/
+        // touchend listeners (same doc) pick up the settled — and any later re-adjusted —
+        // selection and open the bottom toolbar. Nothing here fires a dictionary lookup
+        // automatically; only that toolbar's explicit dict button (and desktop's
+        // dblclick/right-click below) do.
+        return;
+      }
+
+      // iOS disables native selection entirely (see the iosStyle block above), so there's no
+      // OS gesture to defer to — build the selection ourselves from the tapped word/compound
+      // boundary (same Intl.Segmenter-aware lookup getWordAtPoint above uses).
       const result = getWordRangeAtPoint(pressX, pressY);
       if (!result) return;
       const { word, range } = result;
-      // If the tapped word is inside an existing annotation mark, open its edit sheet
-      const _tappedNode = range.commonAncestorContainer;
-      const _existingMark = (_tappedNode.nodeType === 3 ? _tappedNode.parentElement : _tappedNode)
-        ?.closest?.('mark[data-annot-id]');
-      if (_existingMark) {
-        const _annotId = parseInt(_existingMark.dataset.annotId);
-        if (!isNaN(_annotId)) {
-          window.parent.postMessage({ type: 'annotation-click', id: _annotId }, '*');
-          return;
-        }
-      }
       win.getSelection?.()?.removeAllRanges?.();
       let cfiRange = '';
       if (prefs.bionicReading) {
@@ -1559,27 +1974,20 @@ function attachIframeDictionary(contents) {
 
   doc.addEventListener('touchcancel', () => { clearTimeout(pressTimer); pressTimer = null; }, { passive: true });
 
-  if (coarsePointer && !isIOS) {
-    // Fire dict lookup on pointer release, not during drag. selectionchange fires continuously
-    // while the user drags to select text (triggering lookup mid-drag); mouseup/touchend only
-    // fires when the user stops, which is the moment they expect the lookup.
-    const _onSelEnd = () => {
-      clearTimeout(selectionTimer);
-      selectionTimer = setTimeout(triggerSelectionLookup, 120);
-    };
-    doc.addEventListener('mouseup', _onSelEnd);
-    doc.addEventListener('touchend', _onSelEnd, { passive: true });
-  }
-
-  doc.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    const sel     = win.getSelection?.();
-    const selText = sel?.toString().trim();
-    const word    = selText ? selText.split(/\s+/)[0] : getWordAtPoint(e.clientX, e.clientY);
-    if (word) window.parent.postMessage({ type: 'dict-lookup', word }, '*');
-  });
-
   if (!coarsePointer) {
+    // contextmenu (right-click) is desktop-only: Android/mobile browsers also fire this
+    // event once a long-press finishes selecting text (their equivalent of a right-click),
+    // which — now that long-press is left to run native selection, see touchstart above —
+    // made every touch selection auto-trigger a dictionary lookup here. Left gated to a real
+    // right-click, matching the dblclick gate right below.
+    doc.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const sel     = win.getSelection?.();
+      const selText = sel?.toString().trim();
+      const word    = selText ? selText.split(/\s+/)[0] : getWordAtPoint(e.clientX, e.clientY);
+      if (word) window.parent.postMessage({ type: 'dict-lookup', word }, '*');
+    });
+
     doc.addEventListener('dblclick', (e) => {
       // Skip if the mouse button is still held — user is double-click-dragging to extend a
       // selection, not looking up a word. Let mouseup → annotation toolbar handle that case.
@@ -1766,9 +2174,17 @@ function attachIframeAnnotation(contents) {
   function onSelectionEnd(e) {
     if (e?.button !== undefined && e.button !== 0) return; // ignore right/middle clicks
     const sel = doc.getSelection();
-    if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) {
+      // Selection was cleared — e.g. the user tapped elsewhere in the book to dismiss it
+      // (a plain tap collapses any active selection on its own). Close the toolbar to match,
+      // instead of leaving it stranded open with nothing selected underneath it.
+      window.parent.postMessage({ type: 'annotation-deselect' }, '*');
+      return;
+    }
     const text = sel.toString().trim();
-    if (text.length < 2) return;
+    // A single character is a real, complete word for CJK scripts (e.g. "书" = book) — only
+    // reject a genuinely empty selection, not a short one.
+    if (!text) return;
     let cfiRange;
     if (prefs.bionicReading) {
       cfiRange = cfiFromBionicRange(sel.getRangeAt(0), doc, contents);
@@ -1783,6 +2199,12 @@ function attachIframeAnnotation(contents) {
   }
   doc.addEventListener('mouseup', onSelectionEnd);
   doc.addEventListener('touchend', () => setTimeout(() => onSelectionEnd(), 50));
+  // Keep the toolbar's underlying cfiRange/text in sync while the user keeps adjusting a
+  // selection via native drag handles after it first settles — handle drags are native OS
+  // UI, not synthetic DOM touch events, so touchend above never fires for them, but the
+  // Selection object (and this event) still updates. onSelectionEnd's own debounce coalesces
+  // the bursts of change events a drag produces into one update.
+  doc.addEventListener('selectionchange', () => onSelectionEnd());
 }
 
 // Generate a CFI compatible with the non-bionic DOM, even when bionic is currently active.
@@ -2529,12 +2951,19 @@ function applyEdgePadding() {
   root.style.setProperty('--edge-pad-left',   p.left   + 'px');
   // For CXReader: re-measure how much the status bars overlap the viewer (their position
   // shifts when edge-pad vars change), then re-apply the iframe inset and repaginate.
-  if (_cxReader) {
-    setTimeout(() => {
-      _cxMeasureViewerInset();
-      _cxReader.reapplyCss(buildEpubCss());
-    }, 30);
-  }
+  _cxRemeasureAndRepaginate();
+}
+
+// Re-measure the space #sb-top/#sb-bottom reserve and repaginate the open book. Call after
+// any change that can alter their rendered height (edge padding, status bar font size,
+// separators, item layout) — otherwise book content keeps the stale inset from the last
+// measurement (taken once, the first time a chapter renders) until a full reload.
+function _cxRemeasureAndRepaginate() {
+  if (!_cxReader) return;
+  setTimeout(() => {
+    _cxMeasureViewerInset();
+    _cxReader.reapplyCss(buildEpubCss());
+  }, 30);
 }
 
 // Apply CSS variables for status bar font/size/style
@@ -2572,6 +3001,8 @@ function applyStatusBarStyles() {
 
   // Progress bars
   applyProgressBarLayout();
+
+  _cxRemeasureAndRepaginate();
 }
 
 function applyProgressBarLayout() {
@@ -3048,6 +3479,7 @@ function closePanels() {
   closeFontPicker();
   const activeEl = document.activeElement;
   const searchHadFocus = !!activeEl && searchSidebar.contains(activeEl);
+  const searchWasOpen  = searchSidebar.classList.contains('open');
   tocSidebar.classList.remove('open');
   settingsPanel.classList.remove('open');
   searchSidebar.classList.remove('open');
@@ -3056,6 +3488,21 @@ function closePanels() {
   panelBackdrop.classList.remove('visible');
   closeJumpPanel();
   if (searchHadFocus && typeof activeEl.blur === 'function') activeEl.blur();
+  if (searchWasOpen) {
+    clearInterval(_searchSafeAreaTimer);
+    _searchSafeAreaTimer = null;
+    // Restore the safe-area vars snapshotted in openSearch() — several passes at increasing
+    // delays, since keyboard-dismiss timing varies a lot across devices/browsers (same
+    // multi-probe strategy presetNamePrompt() uses for the same reason). Covers the settle
+    // window right after the live guard above stops.
+    const root = document.documentElement;
+    const restore = () => {
+      if (_searchSat) root.style.setProperty('--sat', _searchSat);
+      if (_searchSab) root.style.setProperty('--sab', _searchSab);
+      reapplyStyles();
+    };
+    [50, 300, 700, 1200].forEach(ms => setTimeout(restore, ms));
+  }
   if (prefs.autoHideHeader) forceHideAutoHeader();
 }
 
@@ -3128,12 +3575,34 @@ async function toggleFullscreen() {
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
+let _searchSat = '', _searchSab = ''; // snapshot before focusing searchInput opens the keyboard
+let _searchSafeAreaTimer = null;
+
+// Some Android browsers/WebViews rewrite --sat/--sab (or a resize handler reacting to the
+// on-screen keyboard does) as soon as the keyboard opens — not only after search closes, but
+// live, for as long as it's open, visibly collapsing both the search panel's own header and the
+// dimmed reader pane behind it under the camera cutout. Even dismissing just the keyboard (its
+// own hide button, search input still focused) doesn't fix it back up. Rather than chase exactly
+// which resize/probe is responsible, keep reasserting the known-good snapshot for as long as the
+// search panel stays open — cheap and self-correcting regardless of the cause.
+function _reassertSearchSafeArea() {
+  const root = document.documentElement;
+  if (_searchSat && root.style.getPropertyValue('--sat') !== _searchSat) root.style.setProperty('--sat', _searchSat);
+  if (_searchSab && root.style.getPropertyValue('--sab') !== _searchSab) root.style.setProperty('--sab', _searchSab);
+}
+
 function openSearch() {
   searchSidebar.classList.add('open');
   tocSidebar.classList.remove('open');
   settingsPanel.classList.remove('open');
   panelBackdrop.classList.add('visible');
   if (prefs.autoHideHeader) forceHideAutoHeader();
+  // Snapshot safe-area vars before focusing opens the on-screen keyboard.
+  const root = document.documentElement;
+  _searchSat = root.style.getPropertyValue('--sat');
+  _searchSab = root.style.getPropertyValue('--sab');
+  clearInterval(_searchSafeAreaTimer);
+  _searchSafeAreaTimer = setInterval(_reassertSearchSafeArea, 150);
   setTimeout(() => searchInput.focus(), 280);
 }
 
@@ -3378,7 +3847,7 @@ async function renderDictSettings() {
   const rawLang  = (_cxReader && _cxReader._book?.metadata?.language) || currentBook?.language;
   const bookLang = normalizeBookLang(rawLang);
   const defaultIds = bookLang
-    ? (dicts.filter(d => (prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang).map(d => d.id))
+    ? (dicts.filter(d => normalizeBookLang(prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang).map(d => d.id))
     : [];
   const defaultEnabledIds = defaultIds.length ? defaultIds : allIds;
   // enabled set: null = none; [] = default (book-language match, or all); [...] = explicit list
@@ -3494,7 +3963,7 @@ async function showDictPopup(word) {
     const allIds   = dicts.map(d => d.id);
     if (bookLang) {
       const matched = dicts
-        .filter(d => (prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang)
+        .filter(d => normalizeBookLang(prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang)
         .map(d => d.id);
       enabled = matched.length ? matched : allIds; // fallback to all if no tagged match
     } else {
@@ -3580,6 +4049,14 @@ window.addEventListener('message', (e) => {
   if (e.data?.type === 'annotation-click') {
     const a = annotationsCache.find(x => x.id === e.data.id);
     if (a) showAnnotationEditSheet(a);
+  }
+  if (e.data?.type === 'annotation-deselect') {
+    // Only act if the plain selection toolbar is actually showing — the note editor and
+    // dict popup flows close it (keepHighlight) while deliberately keeping _pendingAnnotation
+    // alive for when they're done, and this must not clobber that.
+    if (document.getElementById('annot-toolbar')?.classList.contains('open')) {
+      closeAnnotationToolbar();
+    }
   }
 });
 
@@ -3942,12 +4419,14 @@ function renderSbItems() {
       if (newPos !== 'off') prefs.statusBar.positions[newPos].push(id);
       persistPrefs();
       renderStatusSlots();
+      _cxRemeasureAndRepaginate();
     });
 
     row.querySelector('.sb-icon-chk').addEventListener('change', (e) => {
       prefs.statusBar.showIcons[id] = e.target.checked;
       persistPrefs();
       renderStatusSlots();
+      _cxRemeasureAndRepaginate();
     });
 
     container.appendChild(row);
@@ -4203,6 +4682,53 @@ function initSettingsUi() {
     updateBookPrefsIndicator();
   });
 
+  // A write failing mid-session (server unreachable while the browser still thinks it's
+  // online — see _presetsReachable) means don't wait for the next online/offline event to
+  // disable further attempts; react to the failure itself.
+  const onPresetActionFailed = err => {
+    _presetsReachable = false;
+    renderPresetsUi();
+    toast.error(t('common.err_prefix') + err.message);
+  };
+  document.getElementById('btn-preset-save')?.addEventListener('click', async () => {
+    // Belt-and-suspenders: don't rely on the button's disabled attribute alone — some
+    // WebViews (see _legacyWebView elsewhere in this file) still fire click/touchend on a
+    // disabled button. This is the guard that actually matters.
+    if (!_presetsReachable) return;
+    const name = await presetNamePrompt(t('reader.preset_save_title'));
+    if (!name) return;
+    try {
+      await saveCurrentAsPreset(name);
+      toast.success(t('reader.preset_saved'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-update')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    try {
+      await updatePreset(activePresetId);
+      toast.success(t('reader.preset_updated'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-rename')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    const current = presetsList.find(p => p.id === activePresetId);
+    const name = await presetNamePrompt(t('reader.preset_rename_title'), current?.name || '');
+    if (!name) return;
+    try {
+      await renamePreset(activePresetId, name);
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-delete')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    const current = presetsList.find(p => p.id === activePresetId);
+    if (!await presetConfirm(t('reader.preset_delete_confirm', { name: sbEsc(current?.name || '') }))) return;
+    try {
+      await deletePreset(activePresetId);
+      toast.success(t('reader.preset_deleted'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  loadPresetsList();
+
   document.getElementById('font-size-slider').addEventListener('input', (e) => {
     prefs.fontSize = parseInt(e.target.value);
     document.getElementById('font-size-value').textContent = prefs.fontSize + 'px';
@@ -4217,8 +4743,10 @@ function initSettingsUi() {
     prefs.margin = parseInt(e.target.value);
     document.getElementById('margin-value').textContent = prefs.margin + 'px';
     // CXReader two-column mode: update the inter-column gap before re-applying CSS so
-    // _initPaginator uses the new gap (it's set via setLayout, not derived from CSS).
-    if (_cxReader) _cxReader.setLayout({ columnGap: prefs.margin * 2 });
+    // _initPaginator uses the new gap (it's set directly, not derived from CSS). Setting
+    // it here rather than via setLayout() avoids re-paginating twice (once with the old
+    // margin CSS, again a moment later inside reapplyStyles with the new CSS).
+    if (_cxReader) _cxReader._columnGap = prefs.margin * 2;
     reapplyStyles();
     persistPrefs();
   });
@@ -4639,6 +5167,9 @@ function initOnlineStatus() {
   const refresh = () => {
     _isOnline = navigator.onLine;
     updateStatusBar();
+    // Re-verify actual reachability rather than trust the browser's online flag alone
+    // (see _presetsReachable) — this also calls renderPresetsUi() once it settles.
+    loadPresetsList();
   };
   window.addEventListener('online',  refresh);
   window.addEventListener('offline', refresh);
@@ -4833,11 +5364,16 @@ async function syncOnOpen(localProgress) {
   const int = intResult.status === 'fulfilled' ? intResult.value : null;
   log('[kosync] remote:', ext, 'internal:', int);
 
-  // Pick the freshest remote source
+  // Pick the freshest remote source. A source is usable if it has a numeric percentage —
+  // that's all the percentage-based jump below actually needs; .progress (a KOReader
+  // xpointer string) is only an optional precision refinement, so a percentage-only
+  // response (progress:null, as returned by some KOSync-compatible servers) must not be
+  // discarded outright.
+  const hasPosition = r => r && typeof r.percentage === 'number';
   let best = null;
-  if (ext?.progress) best = ext;
-  if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
-  if (!best?.progress) {
+  if (hasPosition(ext)) best = ext;
+  if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  if (!hasPosition(best)) {
     log('[kosync] no remote progress found');
     return null;
   }
@@ -4845,7 +5381,7 @@ async function syncOnOpen(localProgress) {
   // Cache the precise xpointer so we can push it back unchanged when on the same chapter.
   // This prevents overwriting KOReader's /body/DocFragment[N]/body/div/p[M]/text().K
   // with a coarser chapter-start xpointer.
-  if (best.progress.startsWith('/body/DocFragment[')) {
+  if (best.progress && best.progress.startsWith('/body/DocFragment[')) {
     lastKnownXPointer = best.progress;
   }
 
@@ -4908,10 +5444,11 @@ async function networkRestoreSync() {
     ]);
     const ext = extResult.status === 'fulfilled' ? extResult.value : null;
     const int = intResult.status === 'fulfilled' ? intResult.value : null;
+    const hasPosition = r => r && typeof r.percentage === 'number';
     let best = null;
-    if (ext?.progress) best = ext;
-    if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
-    if (!best?.progress) { log('[kosync] networkRestoreSync: no remote progress found'); return; }
+    if (hasPosition(ext)) best = ext;
+    if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+    if (!hasPosition(best)) { log('[kosync] networkRestoreSync: no remote progress found'); return; }
 
     const remotePct = best.percentage || 0;
     if (remotePct > bestKnownRemotePct) bestKnownRemotePct = remotePct;
@@ -4925,7 +5462,7 @@ async function networkRestoreSync() {
     }
 
     log('[kosync] networkRestoreSync: auto-pulling remote position', Math.round(remotePct * 100) + '%');
-    if (best.progress.startsWith('/body/DocFragment[')) lastKnownXPointer = best.progress;
+    if (best.progress && best.progress.startsWith('/body/DocFragment[')) lastKnownXPointer = best.progress;
     if (_cxReader) {
       await _cxReader.goToPct(remotePct);
       _cxReader.seekToPercent(remotePct);
@@ -4976,6 +5513,11 @@ window.addEventListener('online', () => {
   if (!currentBook) return;
   syncOfflineBookmarks(currentBook.id).catch(() => {});
   syncOfflineAnnotations(currentBook.id).catch(() => {});
+  flushSessionCheckpoints().catch(() => {});
+  // A session-start or rotate attempted while offline leaves statsSessionId null with no
+  // retry of its own (unlike the checkpoints above) — re-establish one now so reading after
+  // reconnect isn't silently untracked until the next visibilitychange.
+  if (isReady && !statsSessionId) startStatsSession(currentBook.id);
   triggerNetworkRestore('online');
 });
 
@@ -5862,6 +6404,16 @@ function isAndroidApp() {
   return navigator.userAgent.includes('CodexaApp');
 }
 
+// True while a text-editable element holds focus — the on-screen keyboard can only be open
+// because of that, and it's the deterministic signal (see the resize listener below) for
+// "this resize/layout-var churn is keyboard noise, not a real size change".
+function isTextInputFocused() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+}
+
 // Running inside a Capacitor-wrapped WKWebView (iOS native app).
 // window.Capacitor is injected by the Capacitor bridge into every page the WKWebView loads.
 function isIOSApp() {
@@ -5929,19 +6481,71 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
 
 window.addEventListener('resize', debounce(() => {
   applyHeaderButtonSize();
-  // When running inside the Android app, system bars are always hidden in reader.
-  // Update layout vars here since this resize fires right after bars hide/show.
+  // Skip entirely while a text input is focused — the on-screen keyboard opening/closing fires
+  // 'resize' too (both in a plain browser and, per the branch below, inside the wrapped Android
+  // app), and reacting to it was rewriting --layout-h to whatever the keyboard-shrunk/restored
+  // window.innerHeight happened to be at that moment, then re-paginating CXReader against it —
+  // twice per keyboard cycle (once on open, once on close), each at a different height. The
+  // camera-cutout inset and true full-screen height don't actually change just because a
+  // keyboard opened, so there's nothing here that legitimately needs to react to it; skipping
+  // avoids both the visible resize/jerk and CXReader drifting to the wrong page in the process.
+  if (isTextInputFocused()) return;
+  // When running inside the Android app, system bars are hidden in reader, but that doesn't
+  // mean the top/bottom inset is zero — a camera cutout (or gesture-nav pill) still reserves
+  // real space that env(safe-area-inset-*) reports independently of bar visibility. This used
+  // to hardcode --sat/--sab to 0px here (pre-dating cutout-aware safe-area support), which
+  // silently stomped the correct probed value on every resize — including the spurious resize
+  // some devices fire when the screen turns back on after sleep, permanently zeroing the top
+  // safe area until the book was reopened. Re-probe instead of guessing.
   if (isAndroidApp()) {
     const r = document.documentElement;
-    r.style.setProperty('--sat', '0px');
-    r.style.setProperty('--sab', '0px');
     r.style.setProperty('--layout-h', window.innerHeight + 'px');
+    window.__applyInsets?.(true);
   }
   // CXReader re-evaluates column mode and re-paginates directly.
   if (_cxReader) _cxSyncLayout();
 }, 300));
 
 // ── Reading statistics ────────────────────────────────────────────────────────
+
+// Reading-session checkpoint outbox (offline resilience). A rotate/close checkpoint's
+// PATCH can fail simply because the device is offline at that exact moment — unlike
+// bookmarks/annotations/position, this data has no other local copy once statsSessionId
+// is cleared, so a failed checkpoint was previously lost forever, and BookOrbit's
+// uploadSessions() (server/services/bookorbitSync.js) would never see it since it only
+// reads reading_sessions rows that already have an end_ts. Queue it here instead and
+// retry on reconnect, mirroring the bookmarks/annotations queues below.
+const SESSION_Q_KEY = 'br_session_q';
+
+function enqueueSessionCheckpoint(id, body) {
+  try {
+    const q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]');
+    q.push({ id, body });
+    localStorage.setItem(SESSION_Q_KEY, JSON.stringify(q));
+  } catch { /* ignore */ }
+}
+
+async function flushSessionCheckpoints() {
+  let q;
+  try { q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]'); } catch { q = []; }
+  if (!q.length) return;
+  const remaining = [];
+  for (const item of q) {
+    try {
+      await apiFetch(`/stats/session/${item.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item.body),
+      });
+      log('[stats] flushed queued session checkpoint id:', item.id);
+    } catch (e) {
+      warn('[stats] session checkpoint still undeliverable, keeping queued:', e.message);
+      remaining.push(item);
+    }
+  }
+  try { localStorage.setItem(SESSION_Q_KEY, JSON.stringify(remaining)); } catch { /* ignore */ }
+}
+
 async function startStatsSession(bookId) {
   try {
     const res = await apiFetch('/stats/session', {
@@ -5972,12 +6576,13 @@ function endStatsSessionBackground() {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
+  const body = { end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct };
   fetch(`/api/stats/session/${id}`, {
     method: 'PATCH',
     headers,
-    body: JSON.stringify({ end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct }),
+    body: JSON.stringify(body),
     keepalive: true,
-  }).catch(() => {});
+  }).catch(() => enqueueSessionCheckpoint(id, body));
 }
 
 async function endStatsSession() {
@@ -5989,14 +6594,16 @@ async function endStatsSession() {
   statsSessionId   = null;
   sessionPageCount = 0;
   sessionStartPct  = null;
+  const body = { end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct };
   try {
     await apiFetch(`/stats/session/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
-    warn('[stats] failed to end session:', e.message);
+    warn('[stats] failed to end session, queued for retry:', e.message);
+    enqueueSessionCheckpoint(id, body);
   }
 }
 
@@ -6418,23 +7025,41 @@ document.getElementById('kosync-zone-bl')?.addEventListener('click', async () =>
   if (!await kosyncConfirm('pull')) return;
 
   const docKey = externalDocKey();
-  const [extResult, intResult] = await Promise.allSettled([
+  const [extResult, intResult, ownResult] = await Promise.allSettled([
     apiFetch(`/kosync/remote/${encodeURIComponent(docKey)}`),
     apiFetch(`/kosync/internal/${encodeURIComponent(docKey)}`),
+    // Codexa's own cross-device progress (independent of KOSync, always kept up to date
+    // by saveProgress on every device) — this session may have loaded this book without
+    // ever refetching it (e.g. resumed from a WebView paused/backgrounded state rather
+    // than a fresh navigation), so a manual pull needs to check it too, not just KOSync.
+    apiFetch(`/progress/${encodeURIComponent(currentBook.file_hash)}`),
   ]);
 
-  if (extResult.status === 'rejected' && intResult.status === 'rejected') {
+  if (extResult.status === 'rejected' && intResult.status === 'rejected' && ownResult.status === 'rejected') {
     toast.error(t('reader.kosync_fetch_error'));
     return;
   }
 
   const ext = extResult.status === 'fulfilled' ? extResult.value : null;
   const int = intResult.status === 'fulfilled' ? intResult.value : null;
-  let best = null;
-  if (ext?.progress) best = ext;
-  if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  const ownRaw = ownResult.status === 'fulfilled' ? ownResult.value : null;
+  // Reshaped to the same { percentage, progress, timestamp, device } shape as ext/int so
+  // it can be compared alongside them; it has no KOReader xpointer, only a plain percentage.
+  const own = (ownRaw && typeof ownRaw.percentage === 'number')
+    ? { percentage: ownRaw.percentage, progress: null, timestamp: ownRaw.updated_at || 0, device: ownRaw.device || 'web' }
+    : null;
 
-  if (!best?.progress) { toast.info(t('reader.kosync_no_progress')); return; }
+  // Pick the freshest usable source. A source is usable if it has a numeric percentage —
+  // .progress (KOReader xpointer) is only an optional precision refinement, never required
+  // to jump (see the percentage-only navigation below). Checked ext → int → own so own only
+  // wins ties against ext/int if strictly newer, matching the existing int-vs-ext tie-break.
+  const hasPosition = r => r && typeof r.percentage === 'number';
+  let best = null;
+  if (hasPosition(ext)) best = ext;
+  if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  if (hasPosition(own) && (!best || (own.timestamp || 0) > (best.timestamp || 0))) best = own;
+
+  if (!hasPosition(best)) { toast.info(t('reader.kosync_no_progress')); return; }
 
   if (Math.abs((best.percentage || 0) - currentPct) <= 0.01) {
     toast.info(t('reader.kosync_same_position'));
@@ -6725,7 +7350,10 @@ async function init() {
   await _i18nReady;
 
   // If localStorage was cleared (no saved prefs), restore dict selection/order from the
-  // server copy so word lookups use the user's configured dictionaries, not the language default.
+  // server copy so word lookups use the user's configured dictionaries, not the language
+  // default. Deliberately narrow (dictionaries only, only on a genuinely empty device): the
+  // rest of `prefs` is per-device on purpose — see activePresetId above. A device that's
+  // already been used keeps its own settings/preset rather than inheriting another device's.
   if (!localStorage.getItem('br_reader_prefs')) {
     apiFetch('/settings').then(s => {
       const sp = typeof s.reader_prefs === 'string' ? JSON.parse(s.reader_prefs) : (s.reader_prefs || {});
@@ -6880,6 +7508,14 @@ async function init() {
   // ── EPUB file ──────────────────────────────────────────────────────────────
   log('[reader] loading epub...');
   let arrayBuffer;
+  // On the legacy WebView path (and the rare modern-path case with no Content-Length) there's no
+  // byte-level progress to show at all, just a static message, for as long as the 12s connect +
+  // 30s body timeouts allow — exactly the "nothing happens for a while on a large book" complaint.
+  // Escalate to a "this may be a large file" hint after a few seconds so it's clear the download
+  // is still in flight rather than stuck; the Cancel button in the overlay covers the actual bail-out.
+  const _slowFileDlTimer = setTimeout(() => {
+    if (loadingMsg) loadingMsg.textContent = t('common.download_slow_hint');
+  }, 8000);
   try {
     _rafStop = true; // stop dots — show progress % for network downloads
     loadingMsg.textContent = t('reader.loading_file');
@@ -6945,7 +7581,9 @@ async function init() {
         log('[reader] epub from network, bytes:', arrayBuffer.byteLength);
       }
     }
+    clearTimeout(_slowFileDlTimer);
   } catch (err) {
+    clearTimeout(_slowFileDlTimer);
     warn('[reader] epub load failed:', err?.message);
     if (!arrayBuffer) {
       const msg = !navigator.onLine
@@ -6995,10 +7633,13 @@ async function init() {
   if (isAndroidApp() && window.AndroidCodexa?.setReaderMode) {
     window.AndroidCodexa.setReaderMode(true);
     setTimeout(() => {
+      // Re-probe (not hardcode) once immersive mode has settled: a camera cutout still
+      // reserves real top-inset space even with the status bar hidden, so pinning --sat/--sab
+      // to 0px here — as this used to do, from before cutout-aware safe-area support existed —
+      // wiped out the correct value reader.html's own probe had already set moments earlier.
       const r = document.documentElement;
-      r.style.setProperty('--sat', '0px');
-      r.style.setProperty('--sab', '0px');
       r.style.setProperty('--layout-h', window.innerHeight + 'px');
+      window.__applyInsets?.(true);
       if (_cxReader) _cxSyncLayout();
     }, 600);
   }

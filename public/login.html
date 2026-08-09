@@ -94,6 +94,26 @@
        global box-sizing:border-box absorbs padding into min-height. */
     body.kb-focus { align-items: flex-start; }
     body.kb-focus .login-wrap { margin-bottom: 60vh; }
+
+    .oidc-providers { display: flex; flex-direction: column; gap: .6rem; margin-bottom: 1.25rem; }
+    .oidc-btn {
+      width: 100%;
+      justify-content: center;
+    }
+    .oidc-divider {
+      display: flex;
+      align-items: center;
+      text-align: center;
+      color: var(--color-text-muted);
+      font-size: .85rem;
+      margin-top: .35rem;
+    }
+    .oidc-divider::before, .oidc-divider::after {
+      content: '';
+      flex: 1;
+      border-bottom: 1px solid var(--color-border);
+    }
+    .oidc-divider span { padding: 0 .75rem; }
   </style>
 </head>
 <body>
@@ -111,10 +131,11 @@
 
       <!-- Login -->
       <div class="tab-panel active" id="tab-login">
+        <div id="oidc-providers" class="oidc-providers" style="display:none"></div>
         <div id="login-alert"></div>
         <form id="login-form" novalidate>
           <div class="form-group">
-            <label for="login-username" data-i18n="login.label_username">Uporabniško ime</label>
+            <label for="login-username" data-i18n="login.label_username_or_email">Uporabniško ime ali e-pošta</label>
             <input type="text" id="login-username" autocomplete="username" required />
           </div>
           <div class="form-group">
@@ -140,6 +161,11 @@
             <label for="reg-username" data-i18n="login.label_username">Uporabniško ime</label>
             <input type="text" id="reg-username" autocomplete="username" required
                    data-i18n-placeholder="login.reg_user_placeholder" placeholder="3–32 znakov, brez presledkov" />
+          </div>
+          <div class="form-group">
+            <label for="reg-email" data-i18n="login.reg_email">E-pošta (neobvezno)</label>
+            <input type="email" id="reg-email" autocomplete="email"
+                   data-i18n-placeholder="login.reg_email_placeholder" placeholder="ime@primer.com" />
           </div>
           <div class="form-group">
             <label for="reg-password" data-i18n="login.label_password">Geslo</label>

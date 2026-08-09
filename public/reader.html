@@ -2,6 +2,12 @@
 <html lang="sl" data-i18n-doc-title="reader.loading_book">
 <head>
   <meta charset="UTF-8" />
+  <!-- Must come before the safe-area probe script below: env(safe-area-inset-*) only resolves
+       to a real value once viewport-fit=cover is active, so probing it while this tag hadn't
+       been parsed yet always read 0 on the very first (synchronous) probe — the correct value
+       only showed up once a later delayed re-probe ran, producing a visible "jump" in the top
+       status bar padding right after opening a book. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <!-- Chrome 83 WebView (inkPalmPlus/zxh_wv_te): when any SW controls the page,
        return-without-respondWith for same-origin fetch() causes the response to hang
        forever — regardless of file size. Ensure no SW is active before the page runs. -->
@@ -79,23 +85,46 @@
                     window.matchMedia('(display-mode: standalone)').matches ||
                     window.matchMedia('(display-mode: fullscreen)').matches;
 
-        // SAB fallback: iOS 26 PWA returns 0 until chrome settles.
-        // Only apply 34px hardcoded on final probe, only on iOS PWA with home indicator.
-        // Android reports SAB correctly, so don't override it there.
         var isIos = /iP(hone|ad|od)/.test(navigator.userAgent);
-        if (sab === 0 && isPwa && isIos && isFinal) sab = 34;
 
-        // --layout-h: window.innerHeight gives true full-screen height in PWA.
-        // On Android PWA innerHeight is already correct from the start.
-        // On iOS PWA 100svh is too short (excludes status bar area).
-        // On regular browser: don't override — let CSS 100svh handle it.
+        // --layout-h: window.innerHeight gives the true full-screen height on Android PWA
+        // (already correct from the start there). On iOS PWA this same window.innerHeight
+        // snapshot under-reports the real screen height by exactly env(safe-area-inset-top) —
+        // confirmed with a dedicated test page (temp/pwatest/): iOS standalone mode defines
+        // window.innerHeight/dvh/svh to exclude the status-bar area, but .reader-layout starts
+        // at top:0 and needs the TRUE full height since it pads for --sat itself. CSS's 100lvh
+        // (the --layout-h default in reader.css) is the browser's own live measurement of the
+        // true full screen and doesn't have that problem, so leave --layout-h alone on iOS
+        // entirely and let that default govern. On a regular (non-PWA) browser tab: don't
+        // override either way — 100lvh/100vh in reader.css handles it.
         var r = document.documentElement;
         r.style.setProperty('--sat', sat + 'px');
-        // Always set --sab: corrects the CSS default (34px) for devices that don't need it
-        r.style.setProperty('--sab', sab + 'px');
-        if (isPwa) r.style.setProperty('--layout-h', window.innerHeight + 'px');
+        // Same story as --layout-h above, applied to --sab: this same probeEnv() snapshot
+        // technique (and the old "measured 0 → hardcode 34" guess that used to sit here for
+        // iOS) has now been shown unreliable on this iOS/PWA combo too — not just returning a
+        // stale 0, but apparently a wrong *non-zero* value, which _cxMeasureViewerInset()
+        // (reader.js) then live-measures the bottom status bar's position against and reserves
+        // that much + a buffer out of the actual reading area — compounding a wrong --sab into
+        // an even bigger loss of visible text. --sat already defaults to a live
+        // env(safe-area-inset-top) in reader.css and is working correctly, so give --sab the
+        // exact same treatment: a live env() CSS default (reader.css) instead of a JS snapshot,
+        // and don't touch it here on iOS at all. Android keeps the JS-set value (unaffected,
+        // already reports correctly per the removed comment above).
+        if (!isIos) r.style.setProperty('--sab', sab + 'px');
+        if (isPwa && !isIos) r.style.setProperty('--layout-h', window.innerHeight + 'px');
         return { sat: sat, sab: sab, isPwa: isPwa };
       }
+
+      // Exposed so reader.js can hold the page hidden (it's already visibility:hidden from the
+      // very first inline script above) until insets have actually settled, instead of
+      // revealing as soon as translations load (initI18n(), often near-instant off a cached
+      // locale) — which was consistently faster than this probe settling, showing the wrong
+      // --sat for a beat and then visibly snapping to the right one. A safety timeout below
+      // guarantees this resolves even if something above throws, so a probe failure can never
+      // leave the page stuck hidden.
+      var _resolveInsetsReady;
+      window.__insetsReadyPromise = new Promise(function (resolve) { _resolveInsetsReady = resolve; });
+      setTimeout(_resolveInsetsReady, 2000);
 
       // First probe — correct immediately on Android PWA and desktop
       applyInsets(false);
@@ -104,22 +133,52 @@
       window.addEventListener('DOMContentLoaded', function () {
         setTimeout(function () {
           applyInsets(false);
+          _resolveInsetsReady();
           // Final probe at 1s — last chance for iOS SAB to resolve
           setTimeout(function () { applyInsets(true); }, 500);
         }, 500);
       });
 
-      // Re-probe on orientation change / resize
+      // Re-probe on orientation change / resize — but skip resizes caused by the on-screen
+      // keyboard opening/closing (e.g. focusing the in-book search box). iOS fires an ordinary
+      // 'resize' for those too, and re-probing env(safe-area-inset-*) while the keyboard is
+      // up/settling is exactly the unreliable window documented above and in presetNamePrompt()
+      // (reader.js) — a stale 0 here overwrites the correct --sat/--layout-h, and unlike that
+      // function's own snapshot/restore, nothing here ever corrects it back afterward, so the
+      // status bar stays collapsed under the notch even after the keyboard closes.
+      //
+      // Telling a keyboard-driven resize apart from a real rotation/chrome-change by comparing
+      // visualViewport.height against window.innerHeight is NOT reliable here: on iOS 26 PWA,
+      // window.innerHeight itself is already known to misbehave (see the note above this script)
+      // and can shrink right along with visualViewport when the keyboard opens, defeating a
+      // ratio check. Whether a text input currently holds focus is deterministic instead of
+      // inferred — the keyboard can only be open because of that, and it's reliably cleared by
+      // the time a close-triggered resize fires (blur() runs synchronously before the keyboard's
+      // dismiss animation/resize).
+      function isTextInputFocused() {
+        var el = document.activeElement;
+        if (!el) return false;
+        var tag = el.tagName;
+        return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+      }
       window.addEventListener('resize', function () {
-        setTimeout(function () { applyInsets(true); }, 200);
+        if (isTextInputFocused()) return;
+        if (window.visualViewport && window.visualViewport.height < window.innerHeight * 0.75) return;
+        // isFinal=false here, not true: isFinal is what gates the SAB "hardcode to 34 if
+        // measured 0" fallback a few lines up, meant as a one-time safety net for iOS's
+        // cold-launch chrome-settling quirk — not something that should ever fire from an
+        // ordinary resize (rotation, or a stray resize during initial page settle). Passing
+        // true here let ANY resize permanently lock in a bogus 34px bottom inset whenever it
+        // happened to catch a real (correctly zero, e.g. no home indicator) measurement before
+        // the device's true value had been established — a real blank gap at the bottom of the
+        // reader that nothing since ever corrected back down.
+        setTimeout(function () { applyInsets(false); }, 200);
       });
 
       // Expose globally so reader JS can re-probe after Android immersive mode activates
       window.__applyInsets = applyInsets;
     })();
   </script>
-  <!-- <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1, user-scalable=no" /> -->
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32x32.png" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
@@ -136,6 +195,7 @@
   <div id="loading-overlay">
     <span class="spinner"></span>
     <span id="loading-msg" data-i18n="reader.loading_book">Nalagam knjigo…</span>
+    <button id="loading-cancel-btn" class="btn btn-secondary" data-i18n="common.cancel">Prekliči</button>
   </div>
 
   <!-- Safe-area fill: solid strip that sits behind the translucent header in PWA mode -->
@@ -365,6 +425,19 @@
 
       <!-- TAB: Theme -->
       <div class="settings-tab-pane" data-tab="theme">
+        <div class="setting-row">
+          <div class="setting-label" data-i18n="reader.presets_label">Presets</div>
+          <div class="presets-block">
+            <div id="presets-list" class="presets-list"></div>
+            <span id="preset-custom-label" class="preset-custom-label hidden" data-i18n="reader.preset_custom">Custom</span>
+            <div class="presets-actions">
+              <button id="btn-preset-save" class="btn btn-secondary btn-sm" data-i18n="reader.btn_preset_save">Save as preset</button>
+              <button id="btn-preset-update" class="btn btn-secondary btn-sm hidden" data-i18n="reader.btn_preset_update">Update</button>
+              <button id="btn-preset-rename" class="btn btn-secondary btn-sm hidden" data-i18n="reader.btn_preset_rename">Rename</button>
+              <button id="btn-preset-delete" class="btn btn-secondary btn-sm hidden" data-i18n="reader.btn_preset_delete">Delete</button>
+            </div>
+          </div>
+        </div>
         <div class="setting-row">
           <div class="setting-label" data-i18n="reader.sb_theme">Tema</div>
           <div class="theme-buttons">

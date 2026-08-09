@@ -26,6 +26,16 @@ function isValidUsername(u) {
   return typeof u === 'string' && /^[a-zA-Z0-9_]{3,32}$/.test(u);
 }
 
+// Not full RFC 5322 validation — just enough to catch typos. Emails are only ever an
+// optional second login identifier / OIDC account-linking key, not verified via a sent link.
+function isValidEmail(e) {
+  return typeof e === 'string' && e.length <= 255 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+function normalizeEmail(e) {
+  return typeof e === 'string' ? e.trim().toLowerCase() : '';
+}
+
 function signToken(user) {
   return jwt.sign(
     { id: user.id, username: user.username },
@@ -35,7 +45,7 @@ function signToken(user) {
 }
 
 function safeUser(user) {
-  return { id: user.id, username: user.username, name: user.name || '' };
+  return { id: user.id, username: user.username, name: user.name || '', email: user.email || '' };
 }
 
 function isAdmin(userId) {
@@ -58,7 +68,7 @@ router.get('/registration-status', (req, res) => {
 
 router.post('/register', authLimiter, async (req, res) => {
   try {
-    const { name, username, password } = req.body;
+    const { name, username, password, email } = req.body;
     if (!username || !password) {
       return res.status(400).json({ error: 'error.credentials_required' });
     }
@@ -69,6 +79,13 @@ router.post('/register', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'error.password_too_short' });
     }
     const cleanName = typeof name === 'string' ? name.trim().slice(0, 100) : '';
+    let cleanEmail = null;
+    if (typeof email === 'string' && email.trim() !== '') {
+      cleanEmail = normalizeEmail(email);
+      if (!isValidEmail(cleanEmail)) {
+        return res.status(400).json({ error: 'error.email_invalid' });
+      }
+    }
     const db = getDb();
     const hasUsers = !!db.prepare('SELECT 1 FROM users LIMIT 1').get();
     if (hasUsers && !isRegistrationEnabled(db)) {
@@ -77,12 +94,15 @@ router.post('/register', authLimiter, async (req, res) => {
     if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
       return res.status(409).json({ error: 'error.username_taken' });
     }
+    if (cleanEmail && db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail)) {
+      return res.status(409).json({ error: 'error.email_taken' });
+    }
     const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
     const result = db.prepare(
-      'INSERT INTO users (username, name, password_hash) VALUES (?, ?, ?)'
-    ).run(username, cleanName, password_hash);
+      'INSERT INTO users (username, name, password_hash, email) VALUES (?, ?, ?, ?)'
+    ).run(username, cleanName, password_hash, cleanEmail);
     db.prepare('INSERT INTO user_settings (user_id) VALUES (?)').run(result.lastInsertRowid);
-    const newUser = { id: result.lastInsertRowid, username, name: cleanName };
+    const newUser = { id: result.lastInsertRowid, username, name: cleanName, email: cleanEmail };
     res.status(201).json({ token: signToken(newUser), user: safeUser(newUser) });
   } catch (err) {
     console.error('[auth] register error:', err.message);
@@ -98,7 +118,10 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(400).json({ error: 'error.credentials_required' });
     }
     const db   = getDb();
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    // Accept either the username or the account's email in the same field.
+    const user = db.prepare(
+      'SELECT * FROM users WHERE username = ? OR (email IS NOT NULL AND email = ?)'
+    ).get(username, normalizeEmail(username));
     const hashToCheck = user ? user.password_hash : DUMMY_HASH;
     const valid = await bcrypt.compare(String(password), hashToCheck);
     if (!user || !valid) {
@@ -113,7 +136,7 @@ router.post('/login', authLimiter, async (req, res) => {
 
 router.get('/me', authenticateToken, (req, res) => {
   const db   = getDb();
-  const user = db.prepare('SELECT id, username, name FROM users WHERE id = ?').get(req.user.id);
+  const user = db.prepare('SELECT id, username, name, email FROM users WHERE id = ?').get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({ user: safeUser(user), isAdmin: isAdmin(req.user.id) });
 });
@@ -144,6 +167,35 @@ router.put('/password', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('[auth] change password error:', err.message);
     res.status(500).json({ error: 'error.password_change_failed' });
+  }
+});
+
+// ── Change own email ──────────────────────────────────────────────────────────
+// Setting this lets the account also log in by email, and lets a future OIDC login
+// (Google/self-hosted IdP/...) whose provider asserts a verified matching email auto-link
+// to this existing account instead of creating a new one — see server/routes/oidc.js.
+router.put('/email', authenticateToken, (req, res) => {
+  try {
+    const { email } = req.body;
+    const db = getDb();
+    if (typeof email !== 'string' || email.trim() === '') {
+      // Empty value clears it (e.g. to stop using it for login / OIDC linking).
+      db.prepare('UPDATE users SET email = NULL WHERE id = ?').run(req.user.id);
+      return res.json({ email: '' });
+    }
+    const cleanEmail = normalizeEmail(email);
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'error.email_invalid' });
+    }
+    const existing = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(cleanEmail, req.user.id);
+    if (existing) {
+      return res.status(409).json({ error: 'error.email_taken' });
+    }
+    db.prepare('UPDATE users SET email = ? WHERE id = ?').run(cleanEmail, req.user.id);
+    res.json({ email: cleanEmail });
+  } catch (err) {
+    console.error('[auth] change email error:', err.message);
+    res.status(500).json({ error: 'error.email_change_failed' });
   }
 });
 
@@ -191,4 +243,6 @@ router.delete('/admin/users/:id', authenticateToken, (req, res) => {
   res.status(204).end();
 });
 
-module.exports = router;
+// Exposed for server/routes/oidc.js, which mints the same kind of app JWT and follows the
+// same username/user-row conventions for its own auto-provisioned accounts.
+module.exports = Object.assign(router, { signToken, safeUser, isValidUsername, normalizeEmail, isRegistrationEnabled, SALT_ROUNDS, authLimiter });

@@ -1355,6 +1355,12 @@ export async function openInfoModal(book, startTab = '') {
           <div class="imt-related-scroller">${data.seriesBooks.map(cardHtml).join('')}</div>`);
       }
 
+      if (data.authorBooks?.length) {
+        sections.push(`
+          <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_by_author')}</div>
+          <div class="imt-related-scroller">${data.authorBooks.map(cardHtml).join('')}</div>`);
+      }
+
       if (data.recommendations?.length) {
         sections.push(`
           <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_more_like_this')}</div>

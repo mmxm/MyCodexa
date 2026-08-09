@@ -1,4 +1,4 @@
-const PANELS = ['library', 'settings', 'opds', 'bookorbit'];
+const PANELS = ['library', 'settings', 'opds', 'bookorbit', 'bookorbit-dash'];
 const _inits  = {};
 let _current  = null;
 

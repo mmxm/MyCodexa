@@ -251,6 +251,18 @@
 
         <hr class="section-divider" style="margin-top:1.25rem">
 
+        <div style="font-size:.875rem;font-weight:600;margin-bottom:.75rem" data-i18n="settings.email_title">E-pošta</div>
+        <div class="form-group">
+          <label for="account-email" data-i18n="settings.email_label">E-poštni naslov</label>
+          <input type="email" id="account-email" autocomplete="email" placeholder="ime@primer.com" />
+        </div>
+        <div class="setting-toggle-hint" style="margin-bottom:.75rem" data-i18n="settings.email_hint">Neobvezno. Omogoča prijavo z e-pošto in samodejno povezavo z OIDC prijavo (Google, Apple, samostojni ponudnik), če se e-pošta ujema.</div>
+        <div class="card-actions">
+          <button id="btn-save-email" class="btn btn-primary btn-sm" data-i18n="settings.email_save_btn">Shrani e-pošto</button>
+        </div>
+
+        <hr class="section-divider" style="margin-top:1.25rem">
+
         <div style="font-size:.875rem;font-weight:600;margin-bottom:.75rem" data-i18n="settings.change_pw_title">Sprememba gesla</div>
         <div class="form-group">
           <label for="pw-new" data-i18n="settings.change_pw_new">Novo geslo</label>
@@ -569,6 +581,22 @@
           <div id="bookorbit-pagination" hidden></div>
         </div>
 
+      </div>
+    </div>
+
+    <div id="panel-bookorbit-dash" class="app-panel app-main" hidden>
+      <div class="bookorbit-dash-wrap">
+        <h2 class="bookorbit-dash-title" data-i18n="bookorbit_dash.title">BookOrbit Dash</h2>
+        <div id="bookorbit-dash-loading">
+          <span class="spinner"></span>
+          <span style="display:block;margin-top:.5rem;font-size:.85rem" data-i18n="opds.loading">Nalagam…</span>
+        </div>
+        <div id="bookorbit-dash-error" class="alert alert-error" hidden></div>
+        <div id="bookorbit-dash-content" hidden>
+          <div class="stats-summary-grid" id="bookorbit-dash-cards"></div>
+          <div class="bookorbit-dash-section" id="bookorbit-dash-reading"></div>
+          <div class="bookorbit-dash-section" id="bookorbit-dash-highlight"></div>
+        </div>
       </div>
     </div>
 

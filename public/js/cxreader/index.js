@@ -336,6 +336,7 @@ export class CXReader {
     const savedPage = this._paginator?.currentPage || 1;
     this._initPaginator(iframe);
     this._paginator?.goToPage(savedPage);
+    this._fireRelocated();
   }
 
   // Navigate to the page containing the annotation <mark> with the given id.

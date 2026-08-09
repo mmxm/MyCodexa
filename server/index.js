@@ -4,9 +4,10 @@ const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const compression = require('compression');
-const { initDb, DATA_DIR } = require('./db');
+const { initDb, closeDb, DATA_DIR } = require('./db');
 
 const authRoutes     = require('./routes/auth');
+const oidcRoutes     = require('./routes/oidc');
 const settingsRoutes = require('./routes/settings');
 const booksRoutes    = require('./routes/books');
 const progressRoutes = require('./routes/progress');
@@ -130,6 +131,7 @@ app.use('/user-fonts', express.static(path.join(DATA_DIR, 'fonts')));
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.use('/api/auth',     authRoutes);
+app.use('/api/auth/oidc', oidcRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/books',    booksRoutes);
 app.use('/api/shelves',  shelvesRoutes);
@@ -160,9 +162,38 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[server] Codexa running on http://localhost:${PORT}`);
 });
+
+// ── Graceful shutdown ──────────────────────────────────────────────────────────
+// Without this, SIGTERM (every `docker stop`/restart) kills the process immediately —
+// better-sqlite3 never gets to checkpoint its WAL file, which has been implicated in
+// native-addon crashes (Assertion failed in RemoveEnvironmentCleanupHook) on the next start.
+// server.close() alone isn't enough to bound the wait: opds.js and bookorbit.js hold
+// long-lived SSE connections open that it would otherwise wait on indefinitely, so a
+// force-exit timer backs it up — either way, closeDb() runs before the process actually exits.
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal} received, shutting down...`);
+
+  const forceExitTimer = setTimeout(() => {
+    console.warn('[server] shutdown timed out waiting for connections to drain, forcing exit');
+    closeDb();
+    process.exit(1);
+  }, 5000);
+
+  server.close(() => {
+    clearTimeout(forceExitTimer);
+    closeDb();
+    console.log('[server] shutdown complete');
+    process.exit(0);
+  });
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 // ── BookOrbit extended sync — periodic background reconcile ───────────────────
 // Event-driven triggers (on highlight/session/status change) sync just the

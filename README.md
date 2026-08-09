@@ -49,7 +49,8 @@ Codexa is a self-hosted EPUB and comic book reader with multi-user support, full
 - **Bookmarks** — add, label, and jump to bookmarks; badge shows bookmark count
 - **Highlights & annotations** — highlight in four colours (yellow, green, blue, pink) with optional notes; tap any highlight to edit or delete
 - **Search** — full-text search within a book with result navigation and back/accept buttons
-- **Dictionary lookup** — double-tap any word; supports multiple local StarDict dictionaries (`.ifo/.idx/.dict`); defaults to dictionaries matching a book's own language on first open
+- **Dictionary lookup** — double-click a word on desktop, or select text and tap the dictionary icon on mobile; supports multiple local StarDict dictionaries (`.ifo/.idx/.dict`); defaults to dictionaries matching a book's own language on first open
+- **CJK-aware word selection** — proper Chinese/Japanese/Korean word segmentation (not just per-character), including single-character lookups; on mobile, selecting CJK text uses the OS's own native selection handles so a selection can be extended/adjusted normally
 - **Footnote popup** — inline footnote and endnote display without leaving the page
 - **Bionic reading** — emphasises word prefixes to guide the eye for faster reading
 - **Two-page spread** — optional side-by-side layout for wider screens
@@ -64,12 +65,14 @@ Codexa is a self-hosted EPUB and comic book reader with multi-user support, full
 - **Extensive text settings** — font, size, line height, letter spacing, paragraph indent, paragraph spacing, justification, hyphenation with per-language support
 - **Configurable status bar** — up to 6 overlay slots (top/bottom × left/centre/right) showing any combination of: chapter/book page numbers, pages left, progress %, time-to-finish, title, author, chapter, and current time
 - **Screen edge padding** — adjustable insets for curved-screen phones and notches
+- **Reader-settings presets** — save your theme, font, and layout settings as a named preset and switch between them from the Theme tab; presets sync across all your devices, while each device remembers which preset it's currently using (dictionary selection is not included in presets)
 
 ### Sync & Progress
 - **Automatic progress saving** — position saved locally and to the server; restored on any device
 - **KOReader sync** — built-in KOSync-compatible server; connect KOReader devices with no extra software
 - **External KOSync server** — also works with a separate KOSync server; conflict-resolution dialog when positions differ
 - **BookOrbit extended sync** — optional two-way sync of highlights, reading sessions, live reading progress, and book status/rating with a self-hosted BookOrbit server
+- **BookOrbit Dash** — a dedicated sidebar panel showing account-wide reading stats from a connected BookOrbit server: current/longest reading streak, an editable yearly reading goal, a currently-reading shelf, library overview (books/authors/series/storage), and a daily highlight pulled from your synced annotations
 - **Interrupted session recovery** — banner on next visit offers one-tap resume if the app was closed mid-chapter
 
 ### Offline & Mobile
@@ -86,18 +89,20 @@ Codexa is a self-hosted EPUB and comic book reader with multi-user support, full
 - **OPDS shelf sync** — bulk-download an entire OPDS folder into a shelf; stale-book detection
 - **BookOrbit library browser** — native browsing of a self-hosted BookOrbit server's libraries, smart scopes, collections, series, and authors; add books to Codexa, peek them without downloading, edit collection membership, and view any book on BookOrbit directly
 - **BookOrbit collection/smart scope sync** — link a shelf to a BookOrbit collection or smart scope for one-click resync, same as OPDS shelf sync
+- **Related books** — "Similar books," "More by author," and "More in series" recommendations powered by a connected BookOrbit server, shown in both the local book info modal and the BookOrbit library's own book detail modal
 - **Reading statistics** — time read, pages turned, sessions, books started/finished, per-book history
 - **Series support** — series name, number, and one-click series filter
 - **Sort & search** — sort by date, title, author, progress, or series; real-time library search
 
 ### Admin
 - **User management** — view all users, delete accounts
-- **Font management** — upload and delete custom fonts available to all users
-- **Dictionary management** — upload StarDict ZIP archives, delete dictionaries
+- **Font management** — upload (with progress indicator) and delete custom fonts available to all users
+- **Dictionary management** — upload StarDict ZIP archives (with progress indicator), delete dictionaries
 - **Registration control** — enable or disable new-user sign-up
+- **OIDC login** — optional single sign-on via Google, Apple, or a self-hosted provider (Dex, Authelia, Keycloak, ...), alongside local accounts — see [OIDC Login](#oidc-login-google-apple-self-hosted) below
 
 ### Internationalisation
-- **7 languages** — English, Slovenian, German, Spanish, French, Italian, Portuguese
+- **8 languages** — English, Slovenian, German, Spanish, French, Italian, Portuguese, Simplified Chinese
 
 ---
 
@@ -142,6 +147,130 @@ All configuration is via environment variables:
 | `DATA_DIR` | no | `./data` | Path to persistent data (books, covers, fonts, DB) |
 | `CORS_ORIGIN` | no | _(same-origin)_ | Allowed CORS origin, e.g. `https://books.example.com` |
 | `DEBUG` | no | `false` | Set to `true` to enable verbose browser console logging (all `[reader]`, `[api]`, `[kosync]`, etc. messages). Off by default — only warnings and errors are shown. |
+| `OIDC_PROVIDERS` | no | _(none)_ | Comma-separated list of OIDC provider keys to enable. See [OIDC Login](#oidc-login-google-apple-self-hosted). |
+| `OIDC_BASE_URL` | only if `OIDC_PROVIDERS` set | — | Public base URL Codexa is reachable at, used to build the OIDC callback URL |
+| `OIDC_<KEY>_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_NAME` | only for each key in `OIDC_PROVIDERS` | — | Per-provider OIDC credentials and display name |
+
+---
+
+## OIDC Login (Google, Apple, self-hosted)
+
+Codexa supports logging in via any standard OIDC provider as an alternative to local
+username/password registration — Google, Apple, or a self-hosted identity provider you
+run yourself. It's disabled by default; setting `OIDC_PROVIDERS` turns it on.
+
+The first successful login from a given identity is matched against existing accounts in
+two steps:
+
+1. **By provider + subject ID** — if this exact identity has logged in before, it reuses
+   that account.
+2. **By verified email** — otherwise, if the provider vouches for the email (sends
+   `email_verified: true`) and it matches the email on an existing, not-yet-linked local
+   account (set via Settings → Email, or at registration), that account is linked instead
+   of creating a new one. This is what lets someone who already registered locally start
+   using OIDC without ending up with a second, empty account — the emails on both sides
+   (Codexa's Settings and your OIDC provider's user config) just need to match.
+
+If neither matches, a new account is **auto-created**. There is no separate admin approval
+step inside Codexa — access control lives at whichever identity provider you point Codexa
+at. That's exactly what makes a self-hosted provider with a fixed user list (below) work as
+a way to "predefine" who can log in.
+
+> **Note:** an email match only ever links to an account that isn't already linked to some
+> other identity — it won't reassign an account that's already tied to a different provider.
+> A provider that doesn't assert `email_verified` (or doesn't send an email at all) always
+> falls through to creating a new account, never links by an unverified email — otherwise a
+> malicious or misconfigured provider could take over an unrelated local account just by
+> claiming its email address.
+
+> **Note:** Facebook isn't included — it doesn't implement standard OIDC (no discovery
+> document, no `id_token`), so it can't use this generic integration.
+
+> **Note:** An account created via OIDC has no local password, so it can't be used to log
+> in to [KOReader Sync](#koreader-sync-setup) (which authenticates with username/password).
+> Set one via Settings → Change Password first if you need that account to also work with
+> KOReader Sync.
+
+### Example: Google
+
+1. Create an OAuth 2.0 Client ID in the [Google Cloud Console](https://console.cloud.google.com/apis/credentials) (Web application), with an authorized redirect URI of `https://<your-domain>/api/auth/oidc/google/callback`.
+2. Set the environment variables:
+   ```
+   OIDC_PROVIDERS=google
+   OIDC_BASE_URL=https://<your-domain>
+   OIDC_GOOGLE_ISSUER=https://accounts.google.com
+   OIDC_GOOGLE_CLIENT_ID=<your client id>
+   OIDC_GOOGLE_CLIENT_SECRET=<your client secret>
+   OIDC_GOOGLE_NAME=Google
+   ```
+
+Apple (Sign in with Apple) works the same way with `OIDC_APPLE_ISSUER=https://appleid.apple.com`,
+except Apple's "client secret" is itself a JWT you generate and sign with an Apple private
+key, valid for at most 6 months — you'll need to regenerate and redeploy it periodically.
+
+### Example: self-hosted provider with predefined users (Dex)
+
+If you'd rather not open the door to a third-party account at all, you can run your own
+minimal OIDC provider with a fixed list of users you define yourself. [Dex](https://dexidp.io/)
+is a good fit for this — a single small container, no database, users declared directly in
+its config file.
+
+`dex-config.yaml`:
+```yaml
+issuer: https://auth.example.com/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+staticClients:
+  - id: codexa
+    name: Codexa
+    secret: <a-random-client-secret>
+    redirectURIs:
+      - https://books.example.com/api/auth/oidc/dex/callback
+enablePasswordDB: true
+staticPasswords:
+  - email: "alice@domain.com"
+    # Generate with: htpasswd -bnBC 10 "" '<password>' | tr -d ':\n'
+    hash: "<bcrypt hash>"
+    username: "alice"
+    userID: "1"
+  - email: "bob@doma.com"
+    hash: "<bcrypt hash>"
+    username: "bob"
+    userID: "2"
+```
+
+Add Dex as a second service in your `docker-compose.yaml`:
+```yaml
+services:
+  codexa:
+    image: ghcr.io/thehijacker/codexa:latest
+    # ...existing config...
+    environment:
+      JWT_SECRET: "..."
+      OIDC_PROVIDERS: "dex"
+      OIDC_BASE_URL: "https://books.example.com"
+      OIDC_DEX_ISSUER: "https://auth.example.com/dex"
+      OIDC_DEX_CLIENT_ID: "codexa"
+      OIDC_DEX_CLIENT_SECRET: "<the same random client secret as above>"
+      OIDC_DEX_NAME: "Home SSO"
+
+  dex:
+    image: dexidp/dex:latest
+    container_name: dex
+    restart: unless-stopped
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+```
+
+Put both `books.example.com` and `auth.example.com` behind your reverse proxy (see
+[Self-Hosting Behind a Reverse Proxy](#self-hosting-behind-a-reverse-proxy)) with HTTPS —
+OIDC providers generally require HTTPS redirect URIs. Only the usernames/passwords you add
+to `staticPasswords` will ever be able to log in to Codexa this way.
 
 ---
 
@@ -199,6 +328,10 @@ as you close the reader.
 ## BookOrbit
 
 Add your server URL in **Settings → BookOrbit** to enable the native library browser (libraries, smart scopes, collections, series, authors) and, optionally, two-way sync of highlights, reading sessions, reading progress, and status/rating. Requires BookOrbit **v2.1.0 or higher**.
+
+Once extended sync is on, two more things become available:
+- **BookOrbit Dash** — a sidebar panel with account-wide reading stats: reading streak, an editable yearly reading goal, currently-reading shelf, library overview, and a daily highlight from your synced annotations. These use BookOrbit's own reading-session and dashboard APIs — since Codexa already reports reading sessions to BookOrbit as part of extended sync, the numbers reflect real activity from the moment sync is turned on.
+- **Related books** — a "Related" tab (Similar books / More by author / More in series) on book detail views, both for your own library and while browsing BookOrbit's catalogue. Powered by BookOrbit's recommendation engine — books with too little reading/rating history may show fewer or no results, and a very old BookOrbit server without these APIs will simply show an empty tab.
 
 ---
 

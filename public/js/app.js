@@ -5,6 +5,7 @@ import { initLibrary, selectShelf, initGridDensityToggle } from './library.js';
 import { initSettings } from './settings.js';
 import { initOpds } from './opds.js';
 import { initBookorbit } from './bookorbit.js';
+import { initBookorbitDash } from './bookorbitDash.js';
 import { requireAuth } from './api.js';
 import { flushProgressOutbox } from './progress-outbox.js';
 import { log } from './logger.js';
@@ -128,6 +129,7 @@ document.addEventListener('app:network-restored', fetchAndShowVersion);
     settings:  initSettings,
     opds:      initOpds,
     bookorbit: initBookorbit,
+    'bookorbit-dash': initBookorbitDash,
   });
 })();
 

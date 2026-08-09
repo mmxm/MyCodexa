@@ -3,6 +3,32 @@
  */
 import { t } from './i18n.js';
 
+// ── Native status bar appearance sync (Android app only) ─────────────────────
+// The Android host never learns which in-app theme is active — the WebView's
+// system status/nav bar icon color is whatever the OS last set it to, so a light
+// in-app theme on a phone with light-icon system defaults renders invisible
+// (white icons on a white bar). Call this whenever a theme is applied/resolved,
+// passing the actual background color that theme just set — the Android app
+// exposes AndroidCodexa.setStatusBarAppearance(isLight) to flip icon color to
+// match. No-op outside the Android app (bridge method won't exist) and no-op on
+// older installed APKs that predate this bridge method.
+function isLightColor(color) {
+  const hex = String(color || '').trim().replace('#', '');
+  const full = hex.length === 3 ? hex.split('').map(c => c + c).join('') : hex;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5;
+}
+
+export function syncStatusBarAppearance(bgColor) {
+  if (typeof window.AndroidCodexa?.setStatusBarAppearance !== 'function') return;
+  const light = isLightColor(bgColor);
+  if (light === null) return;
+  window.AndroidCodexa.setStatusBarAppearance(light);
+}
+
 // ── Toast notifications ──────────────────────────────────────────────────────
 function ensureToastContainer() {
   let el = document.getElementById('toast-container');
@@ -57,11 +83,48 @@ export function showProgressToast(label, formatCount) {
       el.querySelector('.toast-progress-counter').textContent =
         formatCount ? formatCount(current, total) : `${current} / ${total}`;
     },
-    dismiss() {
+    // instant: skip the fade and remove right away — use when a follow-up toast (e.g. a
+    // success/error result) is about to appear immediately after, so the two don't overlap
+    // on screen for the ~300ms the fade would otherwise take.
+    dismiss(instant = false) {
+      if (instant) { el.remove(); return; }
       el.style.opacity = '0';
       el.style.transition = 'opacity .3s';
       setTimeout(() => el.remove(), 320);
     },
+  };
+}
+
+// ── Blocking overlay (spinner + message + cancel) ────────────────────────────
+// For actions that wait on a server-side operation with no client-visible byte
+// progress (e.g. the server fetching a not-yet-owned book from a remote OPDS/
+// BookOrbit catalog before a "peek"). Covers the whole viewport like
+// confirmDialog's backdrop so nothing else is clickable while it's up.
+// Cancel is intentionally "soft" — it never calls AbortController.abort() on the
+// underlying request. Passing a signal to fetch() is known to hang indefinitely
+// on some old WebView builds (see the NOTE in api.js), so cancelling here just
+// hides the overlay and hands control back to the caller; the in-flight request
+// is left to resolve or fail on its own and the caller decides what to do with
+// a late result (see bookorbit.js/opds.js peek handlers).
+export function showBlockingOverlay(message, onCancel) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop blocking-overlay';
+  backdrop.innerHTML = `
+    <div class="modal blocking-overlay-box" role="alertdialog" aria-modal="true" aria-live="polite">
+      <span class="spinner"></span>
+      <p class="blocking-overlay-msg"></p>
+      <button class="btn btn-secondary" id="blocking-overlay-cancel">${t('common.cancel')}</button>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const msgEl = backdrop.querySelector('.blocking-overlay-msg');
+  msgEl.textContent = message;
+  backdrop.querySelector('#blocking-overlay-cancel').addEventListener('click', () => {
+    backdrop.remove();
+    onCancel?.();
+  });
+  return {
+    setMessage(msg) { msgEl.textContent = msg; },
+    dismiss() { backdrop.remove(); },
   };
 }
 

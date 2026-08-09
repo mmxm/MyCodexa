@@ -129,6 +129,23 @@ class MainActivity : AppCompatActivity() {
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit().putBoolean("eink_mode", enabled).apply()
         }
+
+        /**
+         * Called by web JS whenever it applies/resolves a theme, so the system status bar
+         * and navigation bar icon color can be flipped to match. The WebView content's theme
+         * (day/night/eink/sepia/...) is decided entirely in CSS/JS and the native shell has no
+         * other way to learn it — without this, system bar icons stay whatever color they
+         * defaulted to (independent of the in-app theme) and can become invisible against it
+         * (e.g. light system icons on a bright in-app background).
+         */
+        @JavascriptInterface
+        fun setStatusBarAppearance(light: Boolean) {
+            runOnUiThread {
+                val controller = WindowInsetsControllerCompat(window, window.decorView)
+                controller.isAppearanceLightStatusBars = light
+                controller.isAppearanceLightNavigationBars = light
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -186,6 +203,18 @@ class MainActivity : AppCompatActivity() {
         (webView.parent as? android.view.ViewGroup)?.removeView(webView)
         webView.destroy()
         super.onDestroy()
+    }
+
+    // The system can re-show the status/nav bars on its own whenever this window regains
+    // focus (backgrounding via home button / recents / notification shade / a system dialog,
+    // then returning) — hiding them once in onPageStarted/onPageFinished isn't enough to keep
+    // them hidden across that. Reasserting here on every focus-regain is the documented fix
+    // for immersive mode "not sticking" after the app comes back from the background.
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            setImmersiveMode(isOnReader())
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -49,21 +49,34 @@ router.post('/chapter', (req, res) => {
 const REAL_SESSION = 'end_ts IS NOT NULL AND pages_nav >= 2 AND (end_ts - start_ts) >= 60';
 
 // GET /api/stats — aggregate stats for the current user
+// Every time/session/page figure is live reading_sessions PLUS book_stats_archive: the archive
+// holds the rolled-up totals of books that have since been deleted (see trg_books_archive_stats
+// in server/db.js), which would otherwise vanish from these numbers along with the book's
+// cascade-deleted session rows.
 router.get('/', (req, res) => {
   const db  = getDb();
   const uid = req.user.id;
 
-  const sessions = db.prepare(
-    `SELECT COUNT(*) as total, SUM(end_ts - start_ts) as total_secs, SUM(pages_nav) as total_pages FROM reading_sessions WHERE user_id = ? AND ${REAL_SESSION}`
+  const live = db.prepare(
+    `SELECT COUNT(*) as total, COALESCE(SUM(end_ts - start_ts), 0) as total_secs, COALESCE(SUM(pages_nav), 0) as total_pages FROM reading_sessions WHERE user_id = ? AND ${REAL_SESSION}`
   ).get(uid);
-
-  const avgRow = db.prepare(
-    `SELECT AVG(end_ts - start_ts) as avg_secs FROM reading_sessions WHERE user_id = ? AND ${REAL_SESSION}`
+  const archived = db.prepare(
+    'SELECT COALESCE(SUM(sessions), 0) as total, COALESCE(SUM(total_secs), 0) as total_secs, COALESCE(SUM(pages), 0) as total_pages FROM book_stats_archive WHERE user_id = ?'
   ).get(uid);
+  const totalSessions = live.total + archived.total;
+  const totalSecs     = live.total_secs + archived.total_secs;
+  const totalPages    = live.total_pages + archived.total_pages;
 
+  // Distinct by content hash so a book that was deleted and re-added (live sessions + an archive
+  // row under the same hash) still counts once.
   const booksStarted = db.prepare(
-    `SELECT COUNT(DISTINCT book_id) as n FROM reading_sessions WHERE user_id = ? AND ${REAL_SESSION}`
-  ).get(uid);
+    `SELECT COUNT(*) as n FROM (
+       SELECT b.file_hash AS h FROM reading_sessions rs JOIN books b ON b.id = rs.book_id
+        WHERE rs.user_id = ? AND ${REAL_SESSION}
+       UNION
+       SELECT document_hash FROM book_stats_archive WHERE user_id = ?
+     )`
+  ).get(uid, uid);
 
   // Reads from the book_completions log (see server/utils/bookCompletion.js), not a live join
   // against reading_progress/books — a finished book keeps counting even after it's deleted or
@@ -72,8 +85,8 @@ router.get('/', (req, res) => {
     'SELECT COUNT(DISTINCT document_hash) as n FROM book_completions WHERE user_id = ?'
   ).get(uid);
 
-  const topBooks = db.prepare(
-    `SELECT b.id, b.title, b.author, b.cover_path,
+  const liveTop = db.prepare(
+    `SELECT b.id, b.file_hash AS hash, b.title, b.author, b.cover_path,
             COUNT(rs.id) as session_count,
             SUM(rs.end_ts - rs.start_ts) as total_secs,
             MAX(rs.start_ts) as last_read
@@ -82,18 +95,90 @@ router.get('/', (req, res) => {
      WHERE rs.user_id = ? AND ${REAL_SESSION}
      GROUP BY rs.book_id
      ORDER BY total_secs DESC
-     LIMIT 5`
+     LIMIT 20`
   ).all(uid);
+  const archivedTop = db.prepare(
+    `SELECT document_hash AS hash, title, author,
+            SUM(sessions) as session_count, SUM(total_secs) as total_secs, MAX(last_read) as last_read
+     FROM book_stats_archive
+     WHERE user_id = ?
+     GROUP BY document_hash
+     ORDER BY total_secs DESC
+     LIMIT 20`
+  ).all(uid);
+  // Merge by hash (a re-added book has both), then take the overall top 5. A deleted book has no
+  // id/cover any more — the UI falls back to its placeholder.
+  const merged = new Map();
+  for (const r of liveTop) merged.set(r.hash, { ...r });
+  for (const r of archivedTop) {
+    const cur = merged.get(r.hash);
+    if (cur) {
+      cur.session_count += r.session_count;
+      cur.total_secs    += r.total_secs;
+      cur.last_read      = Math.max(cur.last_read || 0, r.last_read || 0);
+    } else {
+      merged.set(r.hash, { id: null, cover_path: null, ...r });
+    }
+  }
+  const topBooks = [...merged.values()]
+    .sort((a, b) => b.total_secs - a.total_secs)
+    .slice(0, 5)
+    .map(({ hash, ...rest }) => rest);
 
   res.json({
-    total_sessions:   sessions.total        || 0,
-    total_secs:       sessions.total_secs   || 0,
-    avg_session_secs: Math.round(avgRow.avg_secs || 0),
-    total_pages:      sessions.total_pages  || 0,
+    total_sessions:   totalSessions,
+    total_secs:       totalSecs,
+    avg_session_secs: totalSessions ? Math.round(totalSecs / totalSessions) : 0,
+    total_pages:      totalPages,
     books_started:    booksStarted.n        || 0,
     books_completed:  booksCompleted.n      || 0,
     top_books:        topBooks,
   });
+});
+
+// GET /api/stats/completions — every distinct book the user has finished, newest first, from the
+// permanent book_completions log (so deleted books still appear, by their snapshotted title).
+// `times` > 1 means it was finished more than once (re-read). total_secs is the real reading time
+// recorded for it, live + archived.
+router.get('/completions', (req, res) => {
+  const db  = getDb();
+  const uid = req.user.id;
+  const rows = db.prepare(
+    `SELECT document_hash AS hash, MAX(completed_at) AS completed_at, COUNT(*) AS times, title, author
+       FROM book_completions
+      WHERE user_id = ?
+      GROUP BY document_hash
+      ORDER BY completed_at DESC
+      LIMIT 500`
+  ).all(uid);
+
+  const liveBook = db.prepare('SELECT id, title, author, cover_path FROM books WHERE user_id = ? AND file_hash = ? LIMIT 1');
+  const liveSecs = db.prepare(
+    `SELECT COALESCE(SUM(rs.end_ts - rs.start_ts), 0) AS s FROM reading_sessions rs
+       JOIN books b ON b.id = rs.book_id
+      WHERE rs.user_id = ? AND b.file_hash = ? AND ${REAL_SESSION}`
+  );
+  const archSecs = db.prepare('SELECT COALESCE(SUM(total_secs), 0) AS s FROM book_stats_archive WHERE user_id = ? AND document_hash = ?');
+  // BookOrbit's cross-device totals (cached by bookorbitSync.backfillFinishedStats / per-book sync).
+  // They already include what Codexa pushed, so they're a separate "all devices" figure.
+  const boStats = db.prepare('SELECT total_seconds, total_sessions, by_source FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ? AND fetched_at IS NOT NULL');
+
+  res.json(rows.map(r => {
+    const book = liveBook.get(uid, r.hash);
+    const bo   = boStats.get(uid, r.hash);
+    return {
+      title:        book?.title  || r.title,
+      author:       book ? (book.author || '') : (r.author || ''),
+      completed_at: r.completed_at,
+      times:        r.times,
+      total_secs:   liveSecs.get(uid, r.hash).s + archSecs.get(uid, r.hash).s,
+      book_id:      book?.id ?? null,
+      cover_path:   book?.cover_path ?? null,
+      bo_total_secs: bo ? bo.total_seconds  : null,
+      bo_sessions:   bo ? bo.total_sessions : null,
+      bo_sources:    bo ? JSON.parse(bo.by_source || '[]') : [],
+    };
+  }));
 });
 
 // GET /api/stats/sessions/:bookId — per-book reading sessions (newest first, max 50)
@@ -154,6 +239,7 @@ router.delete('/history', (req, res) => {
 router.delete('/', (req, res) => {
   const db = getDb();
   db.prepare('DELETE FROM reading_sessions WHERE user_id = ?').run(req.user.id);
+  db.prepare('DELETE FROM book_stats_archive WHERE user_id = ?').run(req.user.id);
   db.prepare('DELETE FROM chapter_visits WHERE user_id = ?').run(req.user.id);
   res.status(204).end();
 });

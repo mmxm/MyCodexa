@@ -128,6 +128,48 @@ function initDb() {
       FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
     );
 
+    -- Per-book reading totals rolled up from reading_sessions at the moment a book is deleted
+    -- (see trg_books_archive_stats below). reading_sessions.book_id cascades away with the book,
+    -- so without this, finishing a book and then deleting it (or shelf sync removing it) erased
+    -- all of its time/pages/sessions from the statistics — confirmed live: a finished book kept
+    -- its book_completions row but every session it ever had vanished. Rows carry the same
+    -- file_hash the book had (document_hash), so a book re-added later still merges with its
+    -- archived history in the stats queries.
+    CREATE TABLE IF NOT EXISTS book_stats_archive (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id        INTEGER NOT NULL,
+      document_hash  TEXT    NOT NULL,
+      title          TEXT    NOT NULL,
+      author         TEXT    DEFAULT '',
+      total_secs     INTEGER DEFAULT 0,
+      sessions       INTEGER DEFAULT 0,
+      pages          INTEGER DEFAULT 0,
+      first_read     INTEGER,
+      last_read      INTEGER,
+      archived_at    INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- BookOrbit's own cross-device reading totals for a book (GET /books/:id/sessions -> stats),
+    -- cached so the finished list can show them without a network call per row. Keyed by Codexa's
+    -- content hash with no FK to books — same reason as book_stats_archive: it has to outlive the
+    -- book. bo_book_id is the mapping itself (bookorbit_sync_state's copy cascades away with the
+    -- book, and BookOrbit only knows its own MD5-flavored hashes, so a deleted book can't be
+    -- looked up again by Codexa's hash); fetched_at NULL = mapping known, totals not fetched yet.
+    CREATE TABLE IF NOT EXISTS bookorbit_book_stats (
+      user_id           INTEGER NOT NULL,
+      document_hash     TEXT    NOT NULL,
+      bo_book_id        INTEGER NOT NULL,
+      total_seconds     INTEGER DEFAULT 0,
+      total_sessions    INTEGER DEFAULT 0,
+      first_session_at  INTEGER,
+      last_session_at   INTEGER,
+      by_source         TEXT    DEFAULT '[]',
+      fetched_at        INTEGER,
+      PRIMARY KEY (user_id, document_hash),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS shelves (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id    INTEGER NOT NULL,
@@ -359,6 +401,63 @@ function initDb() {
     `);
   } catch (e) {
     console.warn('[db] idx_book_completions_user creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_book_stats_archive_user
+        ON book_stats_archive(user_id, document_hash)
+    `);
+  } catch (e) {
+    console.warn('[db] idx_book_stats_archive_user creation:', e.message);
+  }
+
+  // A trigger rather than code in each delete route because books get deleted from several
+  // places (DELETE /api/books/:id, shelf-sync stale removal, peek cleanup) — one DB-level hook
+  // covers all of them. BEFORE DELETE, so reading_sessions rows still exist: the FK cascade that
+  // removes them only runs after the book row itself is gone. Same "real session" bar as
+  // stats.js's REAL_SESSION. The users-exists guard is for `DELETE FROM users` cascading into
+  // books: archiving then would insert a row for a user that's already being removed.
+  try {
+    database.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_books_archive_stats
+      BEFORE DELETE ON books
+      WHEN EXISTS (SELECT 1 FROM users WHERE id = OLD.user_id)
+       AND EXISTS (
+         SELECT 1 FROM reading_sessions
+          WHERE book_id = OLD.id AND end_ts IS NOT NULL AND pages_nav >= 2 AND (end_ts - start_ts) >= 60
+       )
+      BEGIN
+        INSERT INTO book_stats_archive
+          (user_id, document_hash, title, author, total_secs, sessions, pages, first_read, last_read)
+        SELECT OLD.user_id, OLD.file_hash, OLD.title, COALESCE(OLD.author, ''),
+               SUM(end_ts - start_ts), COUNT(*), SUM(pages_nav), MIN(start_ts), MAX(start_ts)
+          FROM reading_sessions
+         WHERE book_id = OLD.id AND end_ts IS NOT NULL AND pages_nav >= 2 AND (end_ts - start_ts) >= 60;
+      END
+    `);
+  } catch (e) {
+    console.warn('[db] trg_books_archive_stats creation:', e.message);
+  }
+
+  // Keeps the BookOrbit id of a book that's about to be deleted (bookorbit_sync_state cascades
+  // away with it) so its cross-device totals can still be fetched later. OR IGNORE: an existing
+  // cache row for this hash already has the mapping (and possibly totals) — don't clobber it.
+  try {
+    database.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_books_keep_bo_mapping
+      BEFORE DELETE ON books
+      WHEN EXISTS (SELECT 1 FROM users WHERE id = OLD.user_id)
+       AND EXISTS (SELECT 1 FROM bookorbit_sync_state WHERE user_id = OLD.user_id AND book_id = OLD.id AND bo_book_id IS NOT NULL)
+      BEGIN
+        INSERT OR IGNORE INTO bookorbit_book_stats (user_id, document_hash, bo_book_id)
+        SELECT OLD.user_id, OLD.file_hash, bo_book_id
+          FROM bookorbit_sync_state
+         WHERE user_id = OLD.user_id AND book_id = OLD.id AND bo_book_id IS NOT NULL;
+      END
+    `);
+  } catch (e) {
+    console.warn('[db] trg_books_keep_bo_mapping creation:', e.message);
   }
 
   // Backfill last_opened_at from last progress save, else added_at (counts as "opened when added").

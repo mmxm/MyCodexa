@@ -588,6 +588,112 @@ async function syncBookState(userId, ctx, m, state) {
   }
 }
 
+// ── cross-device reading totals (read-only) ───────────────────────────────────
+// BookOrbit's GET /books/:id/sessions returns, besides one page of rows, a `stats` block computed
+// over EVERY session on that book for this account: the web reader, the KOReader plugin (an
+// Xteink or any other KOReader device), Kobo, its native apps — plus the sessions Codexa itself
+// pushed (uploadSessions posts them under the default 'web' source). pageSize=1 keeps the payload
+// tiny since only `stats` is used. Because Codexa's own pushed sessions are already inside these
+// totals, they're only ever displayed as the all-devices figure, never added to Codexa's own.
+const STATS_REFRESH_SECS   = 120;        // per-book sync: don't re-fetch a book's totals more often than this
+const STATS_BACKFILL_SECS  = 24 * 3600;  // full sweep: refresh finished books' cached totals at most daily
+const STATS_BACKFILL_LIMIT = 25;         // ...and at most this many per sweep (each is one paced API call)
+
+async function fetchSessionStats(userId, ctx, boBookId) {
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=1&pageSize=1`);
+  const st = res.ok ? res.data?.stats : null;
+  if (!st) return null;
+  const toSecs = (v) => {
+    const ms = v ? new Date(v).getTime() : NaN;
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+  };
+  return {
+    totalSeconds:   Number(st.totalSeconds)  || 0,
+    totalSessions:  Number(st.totalSessions) || 0,
+    firstSessionAt: toSecs(st.firstSessionAt),
+    lastSessionAt:  toSecs(st.lastSessionAt),
+    bySource: Array.isArray(st.bySource)
+      ? st.bySource.map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0, totalSessions: Number(x.totalSessions) || 0 }))
+      : [],
+  };
+}
+
+function saveBookStats(db, userId, documentHash, boBookId, stats) {
+  db.prepare(`
+    INSERT INTO bookorbit_book_stats
+      (user_id, document_hash, bo_book_id, total_seconds, total_sessions, first_session_at, last_session_at, by_source, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+    ON CONFLICT (user_id, document_hash) DO UPDATE SET
+      bo_book_id = excluded.bo_book_id, total_seconds = excluded.total_seconds,
+      total_sessions = excluded.total_sessions, first_session_at = excluded.first_session_at,
+      last_session_at = excluded.last_session_at, by_source = excluded.by_source, fetched_at = excluded.fetched_at
+  `).run(userId, documentHash, boBookId, stats.totalSeconds, stats.totalSessions,
+         stats.firstSessionAt, stats.lastSessionAt, JSON.stringify(stats.bySource));
+}
+
+// Per-book sync step: keep the cached totals of a book being read/synced fresh.
+async function refreshBookStats(db, userId, ctx, m) {
+  const book = db.prepare('SELECT file_hash FROM books WHERE id = ?').get(m.bookId);
+  if (!book?.file_hash) return;
+  const cached = db.prepare('SELECT fetched_at FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ?').get(userId, book.file_hash);
+  if (cached?.fetched_at && Date.now() / 1000 - cached.fetched_at < STATS_REFRESH_SECS) return;
+  const stats = await fetchSessionStats(userId, ctx, m.boBookId);
+  if (stats) saveBookStats(db, userId, book.file_hash, m.boBookId, stats);
+}
+
+// Full-sweep step: fill in / refresh the cross-device totals of every book the user has FINISHED,
+// including ones since deleted from the library (their BookOrbit id survives in
+// bookorbit_book_stats — see trg_books_keep_bo_mapping in db.js — since Codexa's own mapping table
+// cascades away with the book). Bounded per sweep so a big backlog spreads over several sweeps.
+async function backfillFinishedStats(userId, ctx) {
+  const db = getDb();
+  const hashes = db.prepare('SELECT DISTINCT document_hash FROM book_completions WHERE user_id = ?').all(userId).map(r => r.document_hash);
+  const getCached = db.prepare('SELECT bo_book_id, fetched_at FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ?');
+  const getLive = db.prepare(
+    `SELECT s.bo_book_id FROM books b JOIN bookorbit_sync_state s ON s.user_id = b.user_id AND s.book_id = b.id
+      WHERE b.user_id = ? AND b.file_hash = ? AND s.bo_book_id IS NOT NULL LIMIT 1`
+  );
+  const now = Date.now() / 1000;
+  let fetched = 0;
+  for (const h of hashes) {
+    if (fetched >= STATS_BACKFILL_LIMIT) break;
+    const cached = getCached.get(userId, h);
+    const boBookId = cached?.bo_book_id ?? getLive.get(userId, h)?.bo_book_id;
+    if (!boBookId) continue;
+    if (cached?.fetched_at && now - cached.fetched_at < STATS_BACKFILL_SECS) continue;
+    fetched++;
+    const stats = await fetchSessionStats(userId, ctx, boBookId);
+    if (stats) saveBookStats(db, userId, h, boBookId, stats);
+  }
+  return fetched;
+}
+
+// On-demand, for the book-details Reading tab: live totals for one local book (so they reflect a
+// session that ended a minute ago), falling back to the cached copy if BookOrbit is unreachable.
+// Returns null when BookOrbit isn't enabled or the book isn't mapped to it.
+async function getBookStats(userId, bookId) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  const book = db.prepare('SELECT file_hash FROM books WHERE user_id = ? AND id = ?').get(userId, bookId);
+  if (!book) return null;
+  const st = db.prepare('SELECT bo_book_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(userId, bookId);
+  const boBookId = st?.bo_book_id || opdsIdsFor(db, userId, bookId, ctx.origin)?.boBookId;
+  if (!boBookId) return null;
+  const live = await fetchSessionStats(userId, ctx, boBookId);
+  if (live) {
+    saveBookStats(db, userId, book.file_hash, boBookId, live);
+    return { ...live, stale: false };
+  }
+  const c = db.prepare('SELECT * FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ? AND fetched_at IS NOT NULL').get(userId, book.file_hash);
+  if (!c) return null;
+  return {
+    totalSeconds: c.total_seconds, totalSessions: c.total_sessions,
+    firstSessionAt: c.first_session_at, lastSessionAt: c.last_session_at,
+    bySource: JSON.parse(c.by_source || '[]'), stale: true,
+  };
+}
+
 // ── recommendations / series lookups (on-demand, read-only, single book) ─────
 function mapRecBook(b) {
   return {
@@ -806,9 +912,9 @@ async function runSync(userId, opts = {}) {
       const db = getDb();
       const books = await resolveBooks(db, userId, ctx, opts);
       if (books.length === 0) {
-        if (opts.bookId != null) console.log(`[bookorbit] book ${opts.bookId} is not in your BookOrbit library (skipping)`);
-        else console.log(`[bookorbit] user ${userId}: no books matched to this BookOrbit server`);
-        return;
+        if (opts.bookId != null) { console.log(`[bookorbit] book ${opts.bookId} is not in your BookOrbit library (skipping)`); return; }
+        // A full sweep still continues: finished-but-deleted books have cached BookOrbit ids to backfill.
+        console.log(`[bookorbit] user ${userId}: no books matched to this BookOrbit server`);
       }
       // Verify auth up front so a bad password fails loudly once, not per book.
       try { if (!tokens.has(userId)) await login(userId, ctx); }
@@ -821,8 +927,19 @@ async function runSync(userId, opts = {}) {
           await syncBookmarks(userId, ctx, m);
           await uploadSessions(userId, ctx, m, state);
           await syncBookState(userId, ctx, m, state);
+          // Per-book syncs only (the one that follows reading a book) — a full sweep would be one
+          // extra API call for every book in the library; backfillFinishedStats covers that case.
+          if (opts.bookId != null) await refreshBookStats(db, userId, ctx, m);
         } catch (e) {
           console.warn(`[bookorbit] book ${m.bookId}:`, e.message);
+        }
+      }
+      if (opts.bookId == null) {
+        try {
+          const n = await backfillFinishedStats(userId, ctx);
+          if (n) console.log(`[bookorbit] user ${userId}: refreshed cross-device totals for ${n} finished book(s)`);
+        } catch (e) {
+          console.warn(`[bookorbit] user ${userId}: finished-book totals backfill failed:`, e.message);
         }
       }
       if (opts.bookId == null) console.log(`[bookorbit] user ${userId}: full sync complete (${books.length} books)`);
@@ -950,6 +1067,8 @@ module.exports = {
   pushProgress,
   triggerProgressPush,
   getProgress,
+  getBookStats,
+  backfillFinishedStats,
   getLastStatus,
   checkReachable,
 };

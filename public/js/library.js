@@ -1238,13 +1238,25 @@ export async function openInfoModal(book, startTab = '') {
   async function loadReadingTab() {
     const inner = backdrop.querySelector('#imt-reading-inner');
     try {
-      const [sessions, bookmarks, annotations] = await Promise.all([
+      const [sessions, bookmarks, annotations, bo] = await Promise.all([
         apiFetch(`/stats/sessions/${fullBook.id}`).catch(() => []),
         apiFetch(`/bookmarks/${fullBook.id}`).catch(() => []),
         apiFetch(`/annotations/${fullBook.id}`).catch(() => []),
+        // null when BookOrbit is off or this book isn't in it; a failure just hides the block.
+        apiFetch(`/bookorbit/book-stats/${fullBook.id}`).catch(() => null),
       ]);
 
       const totalSecs = sessions.reduce((s, r) => s + ((r.end_ts || 0) - (r.start_ts || 0)), 0);
+
+      // BookOrbit's totals cover every device/reader on the account (KOReader, Kobo, its own web
+      // reader, ...) and already include the sessions Codexa pushed — shown as its own block, not
+      // merged into Codexa's list below.
+      const boSourceLabel = b => { const k = `stats.source_${b}`; const v = t(k); return v === k ? b : v; };
+      const boHtml = bo && bo.totalSessions ? `
+        <div class="imt-section-title" style="margin-top:.75rem">${t('library.reading_bo_title')}</div>
+        <div class="imt-reading-summary">${t('library.reading_total_time')}: <strong>${fmtTime(bo.totalSeconds)}</strong> &nbsp;&middot;&nbsp; ${bo.totalSessions} ${t('library.reading_sessions').toLowerCase()}${bo.firstSessionAt ? ` &nbsp;&middot;&nbsp; ${fmtDate(bo.firstSessionAt)}${bo.lastSessionAt && fmtDate(bo.lastSessionAt) !== fmtDate(bo.firstSessionAt) ? ` – ${fmtDate(bo.lastSessionAt)}` : ''}` : ''}</div>
+        ${bo.bySource?.length > 1 ? `<div class="imt-reading-summary" style="opacity:.8">${bo.bySource.map(x => `${escHtml(boSourceLabel(x.bucket))}: ${fmtTime(x.totalSeconds)}`).join(' &nbsp;&middot;&nbsp; ')}</div>` : ''}
+        ${bo.stale ? `<div class="imt-empty">${t('library.reading_bo_stale')}</div>` : ''}` : '';
 
       inner.innerHTML = `
         <div class="imt-section-title">${t('library.reading_bookmarks')}</div>
@@ -1280,6 +1292,7 @@ export async function openInfoModal(book, startTab = '') {
           : `<div class="imt-empty">${t('library.reading_no_highlights')}</div>`}
         </div>
 
+        ${boHtml}
         <div class="imt-section-title" style="margin-top:.75rem">${t('library.reading_sessions')}</div>
         ${sessions.length ? `
           <div class="imt-reading-summary">${t('library.reading_total_time')}: <strong>${fmtTime(totalSecs)}</strong> &nbsp;&middot;&nbsp; ${sessions.length} ${t('library.reading_sessions').toLowerCase()}</div>
@@ -1625,10 +1638,13 @@ async function openStatsDialog() {
 
   let stats = null;
   let history = [];
+  let finished = [];
   try {
-    [stats, history] = await Promise.all([
+    [stats, history, finished] = await Promise.all([
       apiFetch('/stats'),
       apiFetch('/stats/history'),
+      // A failure here shouldn't block the rest of the dialog — it's an add-on list.
+      apiFetch('/stats/completions').catch(() => []),
     ]);
   } catch (err) {
     toast.error(t('common.err_prefix') + err.message);
@@ -1674,6 +1690,37 @@ async function openStatsDialog() {
         </div>`).join('')}
     </div>` : '';
 
+  // Finished books come from the permanent completion log, so books since deleted from the library
+  // still appear (no cover then — the file is gone — just the placeholder). Rows the one-time
+  // backfill created for books already deleted before the log existed have no recoverable title.
+  const finishedHtml = finished.length ? `
+    <details class="stats-history-book" style="margin-top:1.25rem">
+      <summary class="stats-history-summary">
+        <span class="stats-history-book-title stats-section-title" style="margin:0">${t('stats.finished_books')}</span>
+        <span class="stats-history-count">${finished.length}</span>
+      </summary>
+      <div class="stats-top-books" style="margin-top:.5rem">
+        ${finished.map(b => {
+          const unknown = b.title === 'Unknown' && !b.author;
+          const meta = [
+            b.author ? escHtml(b.author) : '',
+            t('stats.finished_on', { date: new Date(b.completed_at * 1000).toLocaleDateString() }),
+            b.total_secs ? fmtDuration(b.total_secs) : '',
+            b.bo_total_secs > 0 ? t('stats.all_devices', { time: fmtDuration(b.bo_total_secs) }) : '',
+            b.times > 1 ? `×${b.times}` : '',
+          ].filter(Boolean).join(' · ');
+          return `
+          <div class="stats-book-row">
+            ${b.cover_path ? `<img src="/covers/${escHtml(b.cover_path)}" class="stats-book-cover" alt="">` : '<div class="stats-book-cover-ph">📖</div>'}
+            <div class="stats-book-info">
+              <div class="stats-book-title">${escHtml(unknown ? t('stats.unknown_book') : b.title)}</div>
+              <div class="stats-book-meta">${meta}</div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </details>` : '';
+
   const historyHtml = history.length ? `
     <div class="stats-section-title" style="margin-top:1.25rem">${t('stats.chapter_history')}</div>
     <div class="stats-history-list">
@@ -1706,6 +1753,7 @@ async function openStatsDialog() {
       </h3>
       ${summaryHtml}
       ${topBooksHtml}
+      ${finishedHtml}
       ${historyHtml}
       <div class="stats-footer">
         <button class="btn btn-secondary" id="stats-clear-history-btn">${t('stats.clear_history')}</button>

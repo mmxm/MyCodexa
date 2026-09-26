@@ -61,6 +61,15 @@ router.get('/progress/:bookId', async (req, res) => {
   res.json(await bookorbit.getProgress(req.user.id, bookId));
 });
 
+// GET /api/bookorbit/book-stats/:bookId — BookOrbit's cross-device reading totals for one local
+// book (every device/reader on the account, not just what Codexa pushed). Null (200) when
+// BookOrbit is off or the book isn't mapped to it — nothing to show, not an error.
+router.get('/book-stats/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  res.json(await bookorbit.getBookStats(req.user.id, bookId));
+});
+
 // Thin GET proxy for the simple "list everything" endpoints. Forwards `q`/`page`/`size` when
 // present — series and authors are genuinely paginated server-side (default page size 50);
 // libraries/collections/smart-scopes ignore page/size since BookOrbit returns them as a flat,

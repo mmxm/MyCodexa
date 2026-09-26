@@ -48,7 +48,7 @@ function maybeMarkBookFinished(userId, documentHash) {
   if (!progress) return;
 
   const book = db.prepare(
-    'SELECT id, title, author, read_status FROM books WHERE user_id = ? AND (file_hash = ? OR file_hash_md5 = ? OR kosync_hash = ?) LIMIT 1'
+    'SELECT id, title, author, file_hash, read_status FROM books WHERE user_id = ? AND (file_hash = ? OR file_hash_md5 = ? OR kosync_hash = ?) LIMIT 1'
   ).get(userId, documentHash, documentHash, documentHash);
   if (!book) return;
 
@@ -61,7 +61,10 @@ function maybeMarkBookFinished(userId, documentHash) {
   if (progress.percentage >= finishThreshold) {
     // Never override a status the user already set deliberately.
     if (book.read_status === 'read' || book.read_status === 'abandoned') return;
-    logCompletion(db, userId, book, documentHash);
+    // file_hash, not the incoming documentHash: KOSync clients send their own MD5 flavor, and
+    // book_completions dedupes "distinct books finished" by hash — a book finished on both a
+    // KOReader device and the web reader must not count twice.
+    logCompletion(db, userId, book, book.file_hash || documentHash);
     db.prepare(`UPDATE books SET read_status = 'read', status_modified = strftime('%s','now') WHERE id = ?`).run(book.id);
     bookorbit.triggerSync(userId, book.id);
     return;

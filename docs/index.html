@@ -1912,6 +1912,47 @@ staticPasswords:
         statistics from the <a data-section="book-details" href="#book-details">Book Details</a>
         dialog → Reading tab.
       </p>
+<p>
+        Only <em>real</em> reading counts: a session needs at least 60 seconds and two page turns,
+        so opening a book to look at it doesn't inflate your numbers. A session is also closed
+        after a stretch with no page turns, so a book left open on a table doesn't accrue reading
+        time.
+      </p>
+<h3>Finished books</h3>
+<p>
+        The statistics dialog lists every book you've finished — newest first, with the finish
+        date and the time you spent reading it. The list is a permanent log: a book stays on it,
+        and stays in your "books finished" count, even after you delete it from the library.
+      </p>
+<h3>Deleted books keep their totals</h3>
+<p>
+        When a book is deleted — manually, or by a shelf sync removing it — its reading totals
+        (time, sessions, pages) are archived automatically, so they still count towards your
+        overall statistics and the "most read" list. If you later add the same book again, its
+        old and new reading merge. <strong>Reset all statistics</strong> clears the archive along
+        with your sessions, but leaves the finished-books log alone.
+      </p>
+<p>
+        Only reading done in Codexa's own reader is timed. Reading on another device that syncs
+        only your position (for example through KOReader Sync) updates your progress and can mark
+        the book finished, but it has no session data to add to these totals.
+      </p>
+<h3>All-devices totals (BookOrbit)</h3>
+<p>
+        With <a data-section="settings" href="#settings">BookOrbit extended sync</a> enabled, Codexa
+        can also show BookOrbit's own reading totals for a book: on the book's
+        <strong>Reading</strong> tab (total time, sessions, first–last date, and the split by
+        reader — BookOrbit's web reader, KOReader, Kobo, mobile apps) and as an
+        <em>All devices</em> figure in the Finished books list. Unlike Codexa's own numbers these
+        cover every device on your BookOrbit account, so reading you did on a KOReader device that
+        reports to BookOrbit shows up here. They already include the sessions Codexa itself pushed,
+        so the two are shown side by side rather than added together.
+      </p>
+<p>
+        Totals for books you finished and then deleted are filled in automatically during the
+        regular background sync (every 30 minutes) — Codexa remembers each book's BookOrbit ID even
+        after the book is removed. If BookOrbit is unreachable, the last saved totals are shown.
+      </p>
 <a class="back-top" href="#about">↑ Top</a>
 </section>
 <!-- ══════════════════════════════════════════════════════════ Shelves ═ -->

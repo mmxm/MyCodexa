@@ -355,6 +355,10 @@ function initDb() {
     // membership) even though read_status itself was never actually set until now.
     [`ALTER TABLE user_settings   ADD COLUMN reading_start_pct       REAL    DEFAULT 0`,        'user_settings.reading_start_pct'],
     [`ALTER TABLE user_settings   ADD COLUMN reading_finish_pct      REAL    DEFAULT 0.95`,      'user_settings.reading_finish_pct'],
+    // Date (YYYY-MM-DD) of the latest 'completed' reading attempt BookOrbit has for this book —
+    // its own record of when it was actually finished, vs book_completions.completed_at which is
+    // just when Codexa's progress crossed the threshold (often the day a KOReader position synced).
+    [`ALTER TABLE bookorbit_book_stats ADD COLUMN finished_on TEXT DEFAULT NULL`, 'bookorbit_book_stats.finished_on'],
   ];
   for (const [sql, label] of migrations) {
     try {

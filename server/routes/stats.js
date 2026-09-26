@@ -161,7 +161,7 @@ router.get('/completions', (req, res) => {
   const archSecs = db.prepare('SELECT COALESCE(SUM(total_secs), 0) AS s FROM book_stats_archive WHERE user_id = ? AND document_hash = ?');
   // BookOrbit's cross-device totals (cached by bookorbitSync.backfillFinishedStats / per-book sync).
   // They already include what Codexa pushed, so they're a separate "all devices" figure.
-  const boStats = db.prepare('SELECT total_seconds, total_sessions, by_source FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ? AND fetched_at IS NOT NULL');
+  const boStats = db.prepare('SELECT total_seconds, total_sessions, by_source, finished_on FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ? AND fetched_at IS NOT NULL');
 
   res.json(rows.map(r => {
     const book = liveBook.get(uid, r.hash);
@@ -177,6 +177,7 @@ router.get('/completions', (req, res) => {
       bo_total_secs: bo ? bo.total_seconds  : null,
       bo_sessions:   bo ? bo.total_sessions : null,
       bo_sources:    bo ? JSON.parse(bo.by_source || '[]') : [],
+      bo_finished_on: bo?.finished_on ?? null,
     };
   }));
 });

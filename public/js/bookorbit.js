@@ -832,7 +832,8 @@ async function openBookorbitDetailModal(book) {
         readingLoaded = true;
         // BookOrbit's own per-session rows for this book, from every device on the account.
         mountBoSessions(backdrop.querySelector('#bod-reading-inner'),
-          p => apiFetch(`/bookorbit/books/${book.boBookId}/sessions?page=${p}`));
+          p => apiFetch(`/bookorbit/books/${book.boBookId}/sessions?page=${p}`),
+          { attempts: async () => (await apiFetch(`/bookorbit/books/${book.boBookId}/attempts`))?.items || [] });
       }
     });
   });

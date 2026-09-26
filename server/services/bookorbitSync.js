@@ -613,6 +613,22 @@ function normalizeSessionStats(st) {
     bySource: Array.isArray(st.bySource)
       ? st.bySource.map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0, totalSessions: Number(x.totalSessions) || 0 }))
       : [],
+    // The rest of BookOrbit's per-book stats block — drives the Reading tab's charts/facts only
+    // (not cached: bookorbit_book_stats keeps just the totals the finished list needs). Days are
+    // BookOrbit's own YYYY-MM-DD buckets in the account's timezone; capped so a years-long
+    // history can't balloon the payload.
+    avgSessionSeconds:     Number(st.avgDurationSeconds) || 0,
+    longestSessionSeconds: Number(st.longestSessionSeconds) || 0,
+    longestSessionAt:      toSecs(st.longestSessionAt),
+    paceProgressDelta:     Number(st.paceProgressDelta) || 0,
+    paceDurationSeconds:   Number(st.paceDurationSeconds) || 0,
+    backtrackCount:        Number(st.backtrackCount) || 0,
+    dailySummary: Array.isArray(st.dailySummary)
+      ? st.dailySummary.filter(d => d && d.day).slice(-366).map(d => ({ day: String(d.day).slice(0, 10), totalMinutes: Number(d.totalMinutes) || 0 }))
+      : [],
+    progressSummary: Array.isArray(st.progressSummary)
+      ? st.progressSummary.filter(d => d && d.day).slice(-366).map(d => ({ day: String(d.day).slice(0, 10), endProgress: Number(d.endProgress) || 0 }))
+      : [],
   };
 }
 
@@ -694,9 +710,63 @@ async function backfillFinishedStats(userId, ctx) {
     if (cached?.fetched_at && now - cached.fetched_at < STATS_BACKFILL_SECS) continue;
     fetched++;
     const stats = await fetchSessionStats(userId, ctx, boBookId);
-    if (stats) saveBookStats(db, userId, h, boBookId, stats);
+    if (stats) {
+      saveBookStats(db, userId, h, boBookId, stats);
+      // One more (paced) call for BookOrbit's own finish date — only for finished books, and only
+      // when the totals were just refreshed, so it's at most once a day per book.
+      const att = await fetchAttempts(userId, ctx, boBookId);
+      if (att) saveFinishedOn(db, userId, h, latestFinishedOn(att.items));
+    }
   }
   return fetched;
+}
+
+// ── reading attempts (read-only) ──────────────────────────────────────────────
+// BookOrbit tracks every read-through of a book as an "attempt": date-only start/end (YYYY-MM-DD,
+// either may be null), an outcome (completed | skimmed | abandoned | null while still open) and the
+// time/sessions recorded against it. Newest first. Only reading them here — creating, editing and
+// re-read starts stay in BookOrbit's own UI.
+async function fetchAttempts(userId, ctx, boBookId) {
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/reading-attempts?page=1&pageSize=50`);
+  if (!res.ok || !res.data) return null;
+  return {
+    items: (Array.isArray(res.data.items) ? res.data.items : []).map(a => ({
+      id:            a.id,
+      startedOn:     a.startedOn ?? null,
+      endedOn:       a.endedOn ?? null,
+      outcome:       a.outcome ?? null,
+      origin:        a.origin ?? null,
+      totalSessions: Number(a.totalSessions) || 0,
+      totalSeconds:  Number(a.totalSeconds) || 0,
+    })),
+    total: Number(res.data.total) || 0,
+  };
+}
+
+// Newest first, so the first completed attempt with an end date is the most recent finish.
+function latestFinishedOn(items) {
+  return items.find(a => a.outcome === 'completed' && a.endedOn)?.endedOn ?? null;
+}
+
+function saveFinishedOn(db, userId, documentHash, finishedOn) {
+  db.prepare('UPDATE bookorbit_book_stats SET finished_on = ? WHERE user_id = ? AND document_hash = ?').run(finishedOn, userId, documentHash);
+}
+
+// For a LOCAL book (Reading tab of Codexa's own dialog). null = BookOrbit off / not mapped;
+// { unreachable: true } = mapped but BookOrbit didn't answer. Also refreshes the cached finish date
+// while it has the data in hand.
+async function getBookAttempts(userId, bookId) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  const book = db.prepare('SELECT file_hash FROM books WHERE user_id = ? AND id = ?').get(userId, bookId);
+  if (!book) return null;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
+  if (!boBookId) return null;
+  const out = await fetchAttempts(userId, ctx, boBookId);
+  if (!out) return { unreachable: true };
+  saveFinishedOn(db, userId, book.file_hash, latestFinishedOn(out.items));
+  return out;
 }
 
 // The BookOrbit id of a local book, from its sync mapping or stored OPDS link (no network).
@@ -1119,6 +1189,8 @@ module.exports = {
   getBookStats,
   getBookSessions,
   fetchSessionPage,
+  getBookAttempts,
+  fetchAttempts,
   backfillFinishedStats,
   getLastStatus,
   checkReachable,

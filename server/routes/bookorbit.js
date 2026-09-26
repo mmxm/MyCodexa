@@ -81,6 +81,27 @@ router.get('/book-sessions/:bookId', async (req, res) => {
   res.json(out);
 });
 
+// GET /api/bookorbit/book-attempts/:bookId — BookOrbit's read-throughs (attempts) of a LOCAL book: start/end
+// dates, outcome, time and sessions each. Same null / 502 contract as /book-sessions above.
+router.get('/book-attempts/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  const out = await bookorbit.getBookAttempts(req.user.id, bookId);
+  if (out?.unreachable) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
+// GET /api/bookorbit/books/:boBookId/attempts — same, keyed by BookOrbit's own id (BookOrbit browser dialog).
+router.get('/books/:boBookId/attempts', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  if (!Number.isFinite(boBookId)) return res.status(400).json({ error: 'error.bookorbit_unreachable' });
+  const out = await bookorbit.fetchAttempts(req.user.id, ctx, boBookId);
+  if (!out) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
 // GET /api/bookorbit/books/:boBookId/sessions?page=&pageSize= — same rows keyed by BookOrbit's own
 // id, for the BookOrbit browser's book dialog (works for books never imported into Codexa).
 router.get('/books/:boBookId/sessions', async (req, res) => {

@@ -1736,6 +1736,15 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
 .imt-session-src { color: var(--color-text-muted); font-size: .78rem; white-space: nowrap; }
 .imt-bo-sessions .imt-session-pages { min-width: 4rem; }
 .imt-bo-more { margin: .15rem 0 .5rem; }
+.imt-attempts .imt-session-row { grid-template-columns: 1fr auto; }
+/* Inline-SVG charts on the Reading tab (progress over time, minutes per day). */
+.imt-bo-chart { margin: .15rem 0 .4rem; }
+.imt-bo-chart svg { width: 100%; height: auto; display: block; }
+.imt-bo-chart text { fill: var(--color-text-muted); font-size: 9px; }
+.imt-bo-chart .gr  { stroke: var(--color-border); stroke-width: 1; }
+.imt-bo-chart .ln  { stroke: var(--color-accent); stroke-width: 2; fill: none; stroke-linejoin: round; }
+.imt-bo-chart .dt  { fill: var(--color-accent); }
+.imt-bo-chart .bar { fill: var(--color-accent); opacity: .85; }
 .imt-reading-row {
   display: flex;
   align-items: center;

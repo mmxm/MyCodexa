@@ -2,7 +2,7 @@ import { apiFetch } from './api.js';
 import { toast, confirmDialog, setButtonLoading, showProgressToast, initSortMenuFor, resyncSortMenu } from './ui.js';
 import { reloadShelves, getShelves, setActive, updateDownloadedCount, updateNavCounts, setShelfBadge, setBookorbitNavVisible } from './sidebar.js';
 import { t } from './i18n.js';
-import { mountBoSessions } from './bookorbitSessions.js';
+import { mountBoSessions, fmtOn } from './bookorbitSessions.js';
 import { showPanel } from './router.js';
 import { openSyncModal, openOpdsBrowserAtFolder } from './opds.js';
 import { renderPdfCoverBlobFromBytes, uploadPdfCover } from './pdf-cover.js';
@@ -1314,7 +1314,8 @@ export async function openInfoModal(book, startTab = '') {
 
       // The per-session rows behind BookOrbit's totals (all devices) — the summary is already above.
       mountBoSessions(inner.querySelector('#imt-bo-sessions'),
-        p => apiFetch(`/bookorbit/book-sessions/${fullBook.id}?page=${p}`), { summary: false });
+        p => apiFetch(`/bookorbit/book-sessions/${fullBook.id}?page=${p}`),
+        { summary: false, attempts: async () => (await apiFetch(`/bookorbit/book-attempts/${fullBook.id}`))?.items || [] });
 
       inner.addEventListener('click', async e => {
         const btn = e.target.closest('.imt-del-btn');
@@ -1709,7 +1710,9 @@ async function openStatsDialog() {
           const unknown = b.title === 'Unknown' && !b.author;
           const meta = [
             b.author ? escHtml(b.author) : '',
-            t('stats.finished_on', { date: new Date(b.completed_at * 1000).toLocaleDateString() }),
+            // BookOrbit's own finish date when it has one (Codexa's completed_at is just when progress
+            // crossed the threshold — often the day a KOReader position finally synced).
+            t('stats.finished_on', { date: fmtOn(b.bo_finished_on) || new Date(b.completed_at * 1000).toLocaleDateString() }),
             b.total_secs ? fmtDuration(b.total_secs) : '',
             b.bo_total_secs > 0 ? t('stats.all_devices', { time: fmtDuration(b.bo_total_secs) }) : '',
             b.times > 1 ? `×${b.times}` : '',

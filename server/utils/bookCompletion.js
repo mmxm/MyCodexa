@@ -59,8 +59,10 @@ function maybeMarkBookFinished(userId, documentHash) {
   const startThreshold  = settings?.reading_start_pct  ?? START_THRESHOLD;
 
   if (progress.percentage >= finishThreshold) {
-    // Never override a status the user already set deliberately.
-    if (book.read_status === 'read' || book.read_status === 'abandoned') return;
+    // Never override a status the user already set deliberately. 'skimmed' is one — a book marked
+    // skimmed at 99% progress means "I skimmed it", not "I read it". 'on_hold' and 'rereading' DO
+    // turn into 'read' here: finishing a paused book or a re-read is exactly a completion.
+    if (book.read_status === 'read' || book.read_status === 'abandoned' || book.read_status === 'skimmed') return;
     // file_hash, not the incoming documentHash: KOSync clients send their own MD5 flavor, and
     // book_completions dedupes "distinct books finished" by hash — a book finished on both a
     // KOReader device and the web reader must not count twice.

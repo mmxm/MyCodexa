@@ -9,6 +9,7 @@
 import { apiFetch } from './api.js';
 import { toast } from './ui.js';
 import { t } from './i18n.js';
+import { mountActivity, activityIsStale } from './bookorbitActivity.js';
 
 let _initialized = false;
 let _lastData     = null; // last successfully fetched dashboard payload, re-rendered (not re-fetched) on langchange
@@ -229,8 +230,25 @@ document.addEventListener('langchange', () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+// Overview is today's page; Activity (all-devices calendar, goal trend, rhythm — see
+// bookorbitActivity.js) loads lazily the first time its tab opens, and again when reopened after
+// a few minutes, so the heavier BookOrbit statistics call never slows down opening the panel.
+function initTabs() {
+  const tabs = document.querySelectorAll('#panel-bookorbit-dash .bod-tab');
+  const overview = document.getElementById('bod-pane-overview');
+  const activity = document.getElementById('bod-pane-activity');
+  tabs.forEach(btn => btn.addEventListener('click', () => {
+    const which = btn.dataset.dtab;
+    tabs.forEach(b => b.classList.toggle('active', b === btn));
+    overview.hidden = which !== 'overview';
+    activity.hidden = which !== 'activity';
+    if (which === 'activity' && activityIsStale()) mountActivity(activity);
+  }));
+}
+
 export async function initBookorbitDash() {
   if (_initialized) return;
   _initialized = true;
+  initTabs();
   await loadDashboard();
 }

@@ -12,7 +12,7 @@ const bookorbit = require('../services/bookorbitSync');
 const { logCompletion } = require('../utils/completions');
 
 // Aligned with BookOrbit's ReadStatus vocabulary so values sync 1:1.
-const VALID_READ_STATUS = ['', 'want_to_read', 'reading', 'read', 'abandoned'];
+const VALID_READ_STATUS = ['', 'want_to_read', 'reading', 'rereading', 'on_hold', 'read', 'skimmed', 'abandoned'];
 
 const router    = express.Router();
 const BOOKS_DIR = path.join(DATA_DIR, 'books');

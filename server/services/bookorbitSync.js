@@ -36,9 +36,9 @@ const MAX_429_RETRIES = 4;  // back off and retry when rate-limited
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// BookOrbit web read-status vocabulary (packages/types ReadStatus); Codexa uses
-// a clean subset, sent verbatim. '' clears to 'unread'.
-const VALID_STATUS = ['want_to_read', 'reading', 'read', 'abandoned'];
+// BookOrbit web read-status vocabulary (packages/types ReadStatus) minus 'unread', which Codexa
+// models as the empty string; everything else is sent/adopted verbatim. '' clears to 'unread'.
+const VALID_STATUS = ['want_to_read', 'reading', 'rereading', 'on_hold', 'read', 'skimmed', 'abandoned'];
 
 // Codexa highlight styles -> BookOrbit annotation styles. Codexa only makes
 // color highlights, so everything maps to 'highlight'; foreign styles round-trip
@@ -538,6 +538,11 @@ async function uploadSessions(userId, ctx, m, state) {
 }
 
 // ── read status + rating (push on local change; adopt remote when local empty) ─
+// A 4xx that isn't auth/timeout/throttle is BookOrbit saying "no" to this specific request (e.g. it
+// refuses 'rereading' for a book with no completed read-through, or the book isn't accessible) —
+// resending the identical request every sweep forever can't change the answer.
+const isPermanentRejection = (r) => r.status >= 400 && r.status < 500 && ![401, 408, 429].includes(r.status);
+
 async function syncBookState(userId, ctx, m, state) {
   const db = getDb();
   const b = db.prepare('SELECT id, title, author, file_hash, read_status, rating, status_modified FROM books WHERE id = ?').get(m.bookId);
@@ -545,28 +550,43 @@ async function syncBookState(userId, ctx, m, state) {
   const wm = state.state_watermark || 0;
 
   if ((b.status_modified || 0) > wm) {
-    // Both pushes' results are checked before advancing the watermark — previously this ran
+    // Every push's result is checked before advancing the watermark — previously this ran
     // fire-and-forget (api() never throws, it resolves {ok:false,...} on failure) and advanced
     // the watermark unconditionally right after, so a rejected/ignored push (BookOrbit down for
     // that request, a validation error, a transient 5xx) would look locally identical to a
     // successful one: Codexa believed it synced, never retried, and the two sides stayed silently
-    // out of sync forever. Confirmed as the likely explanation for a report of a book Codexa
-    // marked 'read' staying 'Reading' in BookOrbit indefinitely.
+    // out of sync forever. Transient failures (network, 5xx, 429, 401) still hold the watermark
+    // back so the next sweep retries; permanent rejections are logged once and let go.
+    // 2 = accepted, 1 = permanently rejected (give up), 0 = transient failure (retry next sweep)
+    const send = async (method, path, body, what) => {
+      const res = await api(userId, ctx, method, path, body);
+      if (res.ok) return 2;
+      if (isPermanentRejection(res)) {
+        console.warn(`[bookorbit] book ${m.bookId}: ${what} rejected by BookOrbit (HTTP ${res.status}) — not retrying`);
+        return 1;
+      }
+      return 0;
+    };
     let pushOk = true;
+    let pushedStatus; // undefined = leave the recorded value alone; only ever set from an ACCEPTED push
     if (b.read_status && VALID_STATUS.includes(b.read_status)) {
-      const res = await api(userId, ctx, 'PATCH', `/books/${m.boBookId}/status`, { status: b.read_status });
-      if (!res.ok) pushOk = false;
-    } else if (!b.read_status) {
-      const res = await api(userId, ctx, 'PATCH', `/books/${m.boBookId}/status`, { status: 'unread' });
-      if (!res.ok) pushOk = false;
+      const r = await send('PATCH', `/books/${m.boBookId}/status`, { status: b.read_status }, `status '${b.read_status}'`);
+      if (r === 2) pushedStatus = b.read_status;
+      if (r === 0) pushOk = false;
+    } else if (!b.read_status && state.pushed_status) {
+      // Only reset BookOrbit to 'unread' when the user CLEARED a status we had synced. An empty
+      // local status alone means "no opinion" (e.g. only a rating changed) and must not wipe
+      // whatever status BookOrbit — or a KOReader/Kobo device — has set there.
+      const r = await send('PATCH', `/books/${m.boBookId}/status`, { status: 'unread' }, "status 'unread'");
+      if (r === 2) pushedStatus = '';
+      if (r === 0) pushOk = false;
     }
     if (b.rating != null) {
-      const res = await api(userId, ctx, 'POST', '/books/bulk-set-rating', { bookIds: [m.boBookId], rating: b.rating });
-      if (!res.ok) pushOk = false;
+      if ((await send('POST', '/books/bulk-set-rating', { bookIds: [m.boBookId], rating: b.rating }, 'rating')) === 0) pushOk = false;
     }
     if (pushOk) {
-      db.prepare('UPDATE bookorbit_sync_state SET state_watermark = ? WHERE user_id = ? AND book_id = ?')
-        .run(b.status_modified, userId, m.bookId);
+      db.prepare('UPDATE bookorbit_sync_state SET state_watermark = ?, pushed_status = COALESCE(?, pushed_status) WHERE user_id = ? AND book_id = ?')
+        .run(b.status_modified, pushedStatus === undefined ? null : pushedStatus, userId, m.bookId);
     }
     // else: leave the watermark alone — status_modified will still be > wm next run, so this
     // retries automatically instead of silently drifting.
@@ -579,10 +599,14 @@ async function syncBookState(userId, ctx, m, state) {
       const rsRaw = res.data.readStatus;
       const rs = typeof rsRaw === 'string' ? rsRaw : rsRaw?.status;
       const rt = res.data.rating;
-      if ((rs && VALID_STATUS.includes(rs)) || rt != null) {
-        if (rs === 'read') logCompletion(db, userId, b, b.file_hash);
+      // 'unread' (or anything Codexa doesn't model) adopts as the empty status.
+      const adopted = VALID_STATUS.includes(rs) ? rs : '';
+      if (adopted || rt != null) {
+        if (adopted === 'read') logCompletion(db, userId, b, b.file_hash);
         db.prepare('UPDATE books SET read_status = ?, rating = ?, status_modified = strftime(\'%s\',\'now\') WHERE id = ?')
-          .run(VALID_STATUS.includes(rs) ? rs : '', rt != null ? rt : null, m.bookId);
+          .run(adopted, rt != null ? rt : null, m.bookId);
+        // BookOrbit already holds this status — remember that, so clearing it locally later resets it.
+        db.prepare('UPDATE bookorbit_sync_state SET pushed_status = ? WHERE user_id = ? AND book_id = ?').run(adopted, userId, m.bookId);
       }
     }
   }

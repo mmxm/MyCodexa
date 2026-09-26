@@ -1745,6 +1745,43 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
 .imt-bo-chart .ln  { stroke: var(--color-accent); stroke-width: 2; fill: none; stroke-linejoin: round; }
 .imt-bo-chart .dt  { fill: var(--color-accent); }
 .imt-bo-chart .bar { fill: var(--color-accent); opacity: .85; }
+.bod-bars .bar { opacity: .5; }
+.bod-bars .bar.hl { opacity: 1; }
+.imt-bo-chart .ln.tgt { stroke: var(--color-text-muted); stroke-dasharray: 4 3; stroke-width: 1.5; }
+
+/* BookOrbit Dash tabs (Overview / Activity) — same look as the info-modal tabs. */
+.bod-tabs { display: flex; border-bottom: 1px solid var(--color-border); margin: .25rem 0 1rem; }
+.bod-tab {
+  flex-shrink: 0; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--color-text-muted); cursor: pointer; font-size: .9rem; font-weight: 600;
+  padding: .5rem 1rem; margin-bottom: -1px; transition: color .15s, border-color .15s;
+}
+.bod-tab:hover { color: var(--color-text); }
+.bod-tab.active { color: var(--color-accent); border-bottom-color: var(--color-accent); }
+
+/* Activity tab: year heatmap (intensity = stepped opacity of the accent, so it stays legible in
+   the monochrome e-ink theme), legend, day drill-down, small widgets. */
+.bod-heat-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .25rem; }
+.bod-year-nav { display: flex; align-items: center; gap: .5rem; }
+.bod-heat-scroll { overflow-x: auto; padding-bottom: .25rem; }
+.bod-heat svg { display: block; max-width: none; }
+.bod-heat text, .bod-heat-legend text { fill: var(--color-text-muted); font-size: 9px; }
+.hc { fill: var(--color-surface2); }
+.hc.h1 { fill: var(--color-accent); fill-opacity: .25; }
+.hc.h2 { fill: var(--color-accent); fill-opacity: .45; }
+.hc.h3 { fill: var(--color-accent); fill-opacity: .7; }
+.hc.h4 { fill: var(--color-accent); fill-opacity: 1; }
+.hc.f  { fill: none; stroke: var(--color-border); stroke-width: .5; }
+.hc[data-day] { cursor: pointer; }
+.hc.sel { stroke: var(--color-text); stroke-width: 1.5; }
+.bod-heat-legend { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; font-size: .75rem; color: var(--color-text-muted); margin-top: .25rem; }
+.bod-day-detail { margin-top: .25rem; }
+.bod-day-list .imt-session-date a { color: var(--color-accent); }
+.bod-delta { font-size: .7rem; font-weight: 600; color: var(--color-text-muted); }
+.bod-src-row { margin-bottom: .55rem; }
+.bod-src-label { display: flex; justify-content: space-between; font-size: .82rem; margin-bottom: .2rem; }
+.bod-key { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--color-accent); vertical-align: middle; }
+.bod-key-target { border-top: 2px dashed var(--color-text-muted); }
 .imt-reading-row {
   display: flex;
   align-items: center;
@@ -1908,6 +1945,9 @@ html[data-lib-theme="eink"] .imt-related-bo-badge {
 .book-status-badge--reading      { background: #2196f3; }
 .book-status-badge--read         { background: #4caf50; }
 .book-status-badge--abandoned    { background: #b0653a; }
+.book-status-badge--rereading    { background: #7e57c2; }
+.book-status-badge--on_hold      { background: #d99a1e; }
+.book-status-badge--skimmed      { background: #26a69a; }
 .book-rating-badge  { font-size: .75rem; letter-spacing: -1px; }
 .book-rating-filled { color: #f5c518; }
 .book-rating-empty  { color: #ccc; }

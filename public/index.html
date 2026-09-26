@@ -633,16 +633,23 @@
     <div id="panel-bookorbit-dash" class="app-panel app-main" hidden>
       <div class="bookorbit-dash-wrap">
         <h2 class="bookorbit-dash-title" data-i18n="bookorbit_dash.title">BookOrbit Dash</h2>
-        <div id="bookorbit-dash-loading">
-          <span class="spinner"></span>
-          <span style="display:block;margin-top:.5rem;font-size:.85rem" data-i18n="opds.loading">Nalagam…</span>
+        <div class="bod-tabs" role="tablist">
+          <button type="button" class="bod-tab active" role="tab" data-dtab="overview" data-i18n="bookorbit_dash.tab_overview">Overview</button>
+          <button type="button" class="bod-tab" role="tab" data-dtab="activity" data-i18n="bookorbit_dash.tab_activity">Activity</button>
         </div>
-        <div id="bookorbit-dash-error" class="alert alert-error" hidden></div>
-        <div id="bookorbit-dash-content" hidden>
-          <div class="stats-summary-grid" id="bookorbit-dash-cards"></div>
-          <div class="bookorbit-dash-section" id="bookorbit-dash-reading"></div>
-          <div class="bookorbit-dash-section" id="bookorbit-dash-highlight"></div>
+        <div id="bod-pane-overview">
+          <div id="bookorbit-dash-loading">
+            <span class="spinner"></span>
+            <span style="display:block;margin-top:.5rem;font-size:.85rem" data-i18n="opds.loading">Nalagam…</span>
+          </div>
+          <div id="bookorbit-dash-error" class="alert alert-error" hidden></div>
+          <div id="bookorbit-dash-content" hidden>
+            <div class="stats-summary-grid" id="bookorbit-dash-cards"></div>
+            <div class="bookorbit-dash-section" id="bookorbit-dash-reading"></div>
+            <div class="bookorbit-dash-section" id="bookorbit-dash-highlight"></div>
+          </div>
         </div>
+        <div id="bod-pane-activity" hidden></div>
       </div>
     </div>
 

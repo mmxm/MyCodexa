@@ -1002,6 +1002,119 @@ router.get('/dashboard', async (req, res) => {
   res.json(out);
 });
 
+// ── Activity: all-devices reading calendar, goal trend, rhythm ────────────────────
+// Backed by BookOrbit's user-statistics endpoints. activity-overview does a full 365-day session
+// scan on BookOrbit's side (it caches 5 min itself), so it's also cached here briefly — switching
+// tabs or reopening the panel shouldn't re-run it — and trimmed to just what the Activity tab draws.
+// Everything uses READING seconds: BookOrbit's plain totals also fold in audiobook/TTS listening.
+const ACTIVITY_TTL_MS = 2 * 60 * 1000;
+const activityCache = new Map(); // key -> { at, data }
+
+const isoToUnix = (iso) => { const ms = iso ? new Date(iso).getTime() : NaN; return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
+
+function trimCalendar(cal) {
+  if (!cal) return null;
+  return {
+    year: cal.year,
+    availableYears: Array.isArray(cal.availableYears) ? cal.availableYears : [],
+    days: (cal.days || []).map(d => ({ day: d.day, readingSeconds: Number(d.readingSeconds) || 0, sessionsCount: Number(d.sessionsCount) || 0 })),
+  };
+}
+
+function trimActivity(o) {
+  const reading = (x) => Number(x?.readingSeconds) || 0;
+  const readingPace = (o.pace?.byMedia || []).find(m => m.bucket === 'reading');
+  return {
+    timezone: o.timezone || 'UTC',
+    snapshot: {
+      todaySeconds:        reading(o.snapshot?.today),
+      lastSevenDays:       reading(o.snapshot?.lastSevenDays),
+      previousSevenDays:   reading(o.snapshot?.previousSevenDays),
+      currentStreak:       Number(o.snapshot?.currentStreak) || 0,
+      longestStreak:       Number(o.snapshot?.longestStreak) || 0,
+      completedBooksYtd:   Number(o.snapshot?.completedBooksYtd) || 0,
+    },
+    goal: o.goal ? {
+      year:           o.goal.year,
+      goalBooks:      o.goal.goalBooks ?? null,
+      completedBooks: Number(o.goal.completedBooks) || 0,
+      projectedBooks: Number(o.goal.projectedBooks) || 0,
+      status:         o.goal.status ?? null,
+      points: (o.goal.points || []).map(p => ({ month: p.month, actualCumulative: Number(p.actualCumulative) || 0, targetCumulative: p.targetCumulative ?? null })),
+    } : null,
+    rhythm: {
+      weekdays: (o.rhythm?.weekdays || []).map(w => ({ dayOfWeek: w.dayOfWeek, averageReadingSeconds: Number(w.averageReadingSeconds) || 0 })),
+      hours:    (o.rhythm?.hours || []).map(h => ({ hour: h.hour, readingSeconds: Number(h.readingSeconds) || 0 })),
+      favoriteDayOfWeek: o.rhythm?.favoriteDayOfWeek ?? null,
+      peakHour:          o.rhythm?.peakHour ?? null,
+    },
+    sources: (o.sources?.slices || []).map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0 })),
+    completion: { months: (o.completion?.months || []).map(m => ({ year: m.year, month: m.month, count: Number(m.count) || 0 })) },
+    medianSessionSeconds: readingPace?.medianDurationSeconds ?? o.pace?.medianDurationSeconds ?? null,
+    calendar: trimCalendar(o.calendar),
+  };
+}
+
+async function cachedGet(req, res, ctx, key, path, trim) {
+  const c = activityCache.get(key);
+  if (!req.query.refresh && c && Date.now() - c.at < ACTIVITY_TTL_MS) return res.json(c.data);
+  const r = await bookorbit.api(req.user.id, ctx, 'GET', path);
+  if (!r.ok || !r.data) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  const data = trim(r.data);
+  activityCache.set(key, { at: Date.now(), data });
+  res.json(data);
+}
+
+// GET /api/bookorbit/activity[?refresh=1] — everything the Activity tab draws, in one call.
+router.get('/activity', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  await cachedGet(req, res, ctx, `${req.user.id}:overview`, '/user-statistics/activity-overview', trimActivity);
+});
+
+// GET /api/bookorbit/activity/calendar/:year — another year's calendar (the year switcher).
+router.get('/activity/calendar/:year', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const year = parseInt(req.params.year, 10);
+  if (!Number.isInteger(year) || year < 1970 || year > new Date().getFullYear()) return res.status(400).json({ error: 'error.invalid_date' });
+  await cachedGet(req, res, ctx, `${req.user.id}:cal:${year}`, `/user-statistics/activity-calendar/${year}`, trimCalendar);
+});
+
+// GET /api/bookorbit/activity/day/:day — the reading sessions behind one heatmap cell. Sessions of
+// books that are also in Codexa carry localBookId so the client can link into the reader.
+router.get('/activity/day/:day', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const day = String(req.params.day);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day))) return res.status(400).json({ error: 'error.invalid_date' });
+  const r = await bookorbit.api(req.user.id, ctx, 'GET', `/user-statistics/activity-days/${day}`);
+  if (!r.ok || !r.data) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  const sessions = (r.data.sessions || []).filter(x => x.mediaBucket !== 'listening');
+  const boIds = [...new Set(sessions.map(x => x.bookId).filter(Boolean))];
+  let localByBoId = new Map();
+  if (boIds.length) {
+    const rows = getDb().prepare(
+      `SELECT bo_book_id, book_id FROM bookorbit_sync_state WHERE user_id = ? AND bo_book_id IN (${boIds.map(() => '?').join(',')})`
+    ).all(req.user.id, ...boIds);
+    localByBoId = new Map(rows.map(x => [x.bo_book_id, x.book_id]));
+  }
+  res.json({
+    day,
+    readingSeconds: Number(r.data.totals?.readingSeconds) || 0,
+    sessions: sessions.map(x => ({
+      bookId:               x.bookId,
+      localBookId:          localByBoId.get(x.bookId) || null,
+      bookTitle:            x.bookTitle || null,
+      startedAt:            isoToUnix(x.startedAt),
+      endedAt:              isoToUnix(x.endedAt),
+      durationOnDaySeconds: Number(x.durationOnDaySeconds) || 0,
+      progressDelta:        x.progressDelta ?? null,
+      sourceBucket:         x.sourceBucket || 'bookorbit',
+    })),
+  });
+});
+
 // PUT /api/bookorbit/dashboard/goal — body: { goalBooks: number|null }. null clears the goal.
 router.put('/dashboard/goal', async (req, res) => {
   const ctx = requireContext(req, res);

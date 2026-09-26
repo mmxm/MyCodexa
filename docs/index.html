@@ -347,7 +347,7 @@
 <li><strong>Built-in KOSync-compatible server</strong> — for KOReader devices</li>
 <li><strong>External KOSync server support</strong> — with conflict resolution</li>
 <li><strong>BookOrbit extended sync</strong> — optional two-way sync of highlights, reading sessions, live reading progress, and book status/rating to a self-hosted <a data-section="bookorbit-sync" href="#bookorbit-sync">BookOrbit</a> server</li>
-<li><strong>BookOrbit Dash</strong> — account-wide reading stats panel: streak, editable yearly goal, currently-reading shelf, library overview, and a daily highlight</li>
+<li><strong>BookOrbit Dash</strong> — account-wide reading stats panel: streak, editable yearly goal, currently-reading shelf, library overview, and a daily highlight, plus an Activity tab with an all-devices reading calendar, goal trend and reading rhythm</li>
 <li><strong>Interrupted session recovery banner</strong></li>
 <li><strong>Reading statistics</strong> — time read, pages turned, sessions, books started/finished</li>
 </ul>
@@ -1886,7 +1886,7 @@ staticPasswords:
         (1–5). Open the book info dialog (ℹ button) to set them:
       </p>
 <ul>
-<li><strong>Status</strong> — Want to Read, Reading, Read, or Abandoned.</li>
+<li><strong>Status</strong> — Want to Read, Reading, Re-reading, On Hold, Read, Skimmed, or Abandoned.</li>
 <li><strong>Rating</strong> — click a star to set 1–5; click the same star again to clear it.</li>
 </ul>
 <p>
@@ -3032,13 +3032,28 @@ staticPasswords:
 <table>
 <thead><tr><th>Status value</th><th>Shown as</th></tr></thead>
 <tbody>
-<tr><td>Want to Read</td><td>Blue pill</td></tr>
-<tr><td>Reading</td><td>Green pill</td></tr>
-<tr><td>Read</td><td>Purple pill</td></tr>
-<tr><td>Abandoned</td><td>Grey pill</td></tr>
+<tr><td>Want to Read</td><td>Slate pill</td></tr>
+<tr><td>Reading</td><td>Blue pill</td></tr>
+<tr><td>Re-reading</td><td>Purple pill</td></tr>
+<tr><td>On Hold</td><td>Amber pill</td></tr>
+<tr><td>Read</td><td>Green pill</td></tr>
+<tr><td>Skimmed</td><td>Teal pill</td></tr>
+<tr><td>Abandoned</td><td>Brown pill</td></tr>
 </tbody>
 </table>
 </div>
+<p>
+        Codexa switches a book to <em>Reading</em> and <em>Read</em> automatically at the
+        percentages you choose under Settings → General. <em>Re-reading</em>, <em>On Hold</em> and
+        <em>Skimmed</em> are only ever set by you: finishing an on-hold or re-read book still marks
+        it <em>Read</em>, but <em>Skimmed</em> and <em>Abandoned</em> stay exactly as you set them.
+        <em>On Hold</em> and <em>Skimmed</em> books don't count as "Currently reading"; a
+        <em>Re-reading</em> book does. If BookOrbit refuses a status (for example it only accepts
+        Re-reading for a book you've already completed once), Codexa logs it and keeps the status
+        locally instead of retrying forever. Clearing a status in Codexa resets BookOrbit's copy to
+        unread only when Codexa had synced one, and changing just a rating never touches BookOrbit's
+        status.
+      </p>
 <p>
         The status pill and stars appear on the book card so you can see them at a glance
         without opening the info dialog.
@@ -3090,6 +3105,24 @@ staticPasswords:
 <li><strong>Library overview</strong> — total books, authors, series, and storage used across your whole BookOrbit library.</li>
 <li><strong>Highlight of the day</strong> — a highlight or note from your synced annotations, picked fresh each day.</li>
 </ul>
+<p>
+        The panel has two tabs. <strong>Overview</strong> is the page above. <strong>Activity</strong>
+        loads the first time you open it (it's the heavier of the two) and shows your reading across
+        every device on the BookOrbit account:
+      </p>
+<ul>
+<li><strong>Reading calendar</strong> — a year-long heatmap, one square per day, darker for more reading. Switch years with the arrows; tap or press Enter on a day to list that day's sessions (book, time, duration, device, progress). Books that are also in Codexa link straight into the reader. On a phone the calendar scrolls sideways and starts at the latest weeks.</li>
+<li><strong>Summary cards</strong> — today, the last 7 days (with the change against the 7 before), books finished this year, your median session, favorite weekday and peak hour.</li>
+<li><strong>Reading goal</strong> — books finished against the pace your goal needs, month by month, with whether you're ahead, on pace or behind and a projection to year end (set the goal on the Overview tab).</li>
+<li><strong>Rhythm</strong> — average reading per weekday and per hour of the day. A session counts towards the hour it started in.</li>
+<li><strong>By device and by month</strong> — reading time per device (KOReader, Kobo, BookOrbit web, mobile apps) and books finished per month.</li>
+</ul>
+<p>
+        Only <em>reading</em> time is counted here — audiobook or text-to-speech listening in
+        BookOrbit is left out. The numbers come from BookOrbit's statistics, which it refreshes
+        every few minutes, and Codexa keeps a copy for two minutes, so a session you just finished
+        can take a little while to appear.
+      </p>
 <div class="callout">
 <strong>Why this is different from Codexa's own Reading Statistics</strong>
         The <a data-scroll="lib-stats" data-section="library" href="#lib-stats">Reading Statistics</a>

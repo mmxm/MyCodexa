@@ -75,8 +75,8 @@ Codexa is a self-hosted EPUB and comic book reader with multi-user support, full
 - **Automatic progress saving** — position saved locally and to the server; restored on any device
 - **KOReader sync** — built-in KOSync-compatible server; connect KOReader devices with no extra software
 - **External KOSync server** — also works with a separate KOSync server; conflict-resolution dialog when positions differ
-- **BookOrbit extended sync** — optional two-way sync of highlights, reading sessions, live reading progress, and book status/rating with a self-hosted BookOrbit server
-- **BookOrbit Dash** — a dedicated sidebar panel showing account-wide reading stats from a connected BookOrbit server: current/longest reading streak, an editable yearly reading goal, a currently-reading shelf, library overview (books/authors/series/storage), and a daily highlight pulled from your synced annotations
+- **BookOrbit extended sync** — optional two-way sync of highlights, reading sessions, live reading progress, and book status/rating with a self-hosted BookOrbit server; supports all BookOrbit read statuses (Want to Read, Reading, Re-reading, On Hold, Read, Skimmed, Abandoned)
+- **BookOrbit Dash** — a dedicated sidebar panel showing account-wide reading stats from a connected BookOrbit server: current/longest reading streak, an editable yearly reading goal, a currently-reading shelf, library overview (books/authors/series/storage), and a daily highlight pulled from your synced annotations; its **Activity** tab adds an all-devices reading calendar (click a day for its sessions), monthly goal-trend chart, weekday/hour rhythm, per-device split and books finished per month
 - **Interrupted session recovery** — banner on next visit offers one-tap resume if the app was closed mid-chapter
 
 ### Offline & Mobile

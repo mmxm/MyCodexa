@@ -359,6 +359,10 @@ function initDb() {
     // its own record of when it was actually finished, vs book_completions.completed_at which is
     // just when Codexa's progress crossed the threshold (often the day a KOReader position synced).
     [`ALTER TABLE bookorbit_book_stats ADD COLUMN finished_on TEXT DEFAULT NULL`, 'bookorbit_book_stats.finished_on'],
+    // The read status BookOrbit is known to hold for this book (last one pushed or adopted). Lets
+    // syncBookState tell "the user CLEARED the status" (push 'unread') from "the status was never
+    // set locally" (leave BookOrbit's alone) — see the empty-status branch there.
+    [`ALTER TABLE bookorbit_sync_state ADD COLUMN pushed_status TEXT DEFAULT NULL`, 'bookorbit_sync_state.pushed_status'],
   ];
   for (const [sql, label] of migrations) {
     try {
@@ -522,6 +526,20 @@ function initDb() {
     `);
   } catch (e) {
     console.warn('[db] book_completions backfill:', e.message);
+  }
+
+  // Books synced before pushed_status existed: any non-empty local status was pushed to (or adopted
+  // from) BookOrbit already, so seed it — otherwise clearing that status locally would stop
+  // resetting BookOrbit's copy. Only fills NULLs, so it's a no-op once seeded.
+  try {
+    database.exec(`
+      UPDATE bookorbit_sync_state
+         SET pushed_status = (SELECT b.read_status FROM books b WHERE b.id = bookorbit_sync_state.book_id)
+       WHERE pushed_status IS NULL
+         AND COALESCE((SELECT b.read_status FROM books b WHERE b.id = bookorbit_sync_state.book_id), '') != ''
+    `);
+  } catch (e) {
+    console.warn('[db] pushed_status backfill:', e.message);
   }
 }
 

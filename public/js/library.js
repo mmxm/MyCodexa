@@ -463,7 +463,10 @@ function renderCardBadges(book) {
   const labels = {
     want_to_read: t('library.status_want'),
     reading:      t('library.status_reading'),
+    rereading:    t('library.status_rereading'),
+    on_hold:      t('library.status_on_hold'),
     read:         t('library.status_finished'),
+    skimmed:      t('library.status_skimmed'),
     abandoned:    t('library.status_abandoned'),
   };
   const parts = [];
@@ -753,7 +756,10 @@ export async function openInfoModal(book, startTab = '') {
                 <option value="">${t('library.status_none')}</option>
                 <option value="want_to_read">${t('library.status_want')}</option>
                 <option value="reading">${t('library.status_reading')}</option>
+                <option value="rereading">${t('library.status_rereading')}</option>
+                <option value="on_hold">${t('library.status_on_hold')}</option>
                 <option value="read">${t('library.status_finished')}</option>
+                <option value="skimmed">${t('library.status_skimmed')}</option>
                 <option value="abandoned">${t('library.status_abandoned')}</option>
               </select>
               <button type="button" id="imt-status-menu-btn" class="sort-menu-btn" aria-haspopup="listbox" aria-expanded="false" aria-controls="imt-status-menu-list" title="${escHtml(t('library.status_title'))}">
@@ -1372,7 +1378,7 @@ export async function openInfoModal(book, startTab = '') {
 
       const sections = [];
 
-      if (fullBook.read_status === 'read' && data.nextInSeries) {
+      if ((fullBook.read_status === 'read' || fullBook.read_status === 'skimmed') && data.nextInSeries) {
         sections.push(`
           <div class="imt-section-title">${t('library.related_next_in_series')}</div>
           <div class="imt-related-scroller">${cardHtml(data.nextInSeries)}</div>`);
@@ -1586,9 +1592,11 @@ let _applyFilterTimer = null;
 // makePct()) is a page-fraction that never actually reaches 1.0 for paginated content, so a
 // truly-finished book would otherwise stay stuck here forever (see maybeMarkBookFinished in
 // server/utils/bookCompletion.js, which auto-sets read_status once progress crosses 95%).
+// 'on_hold' (paused) and 'skimmed' (deliberately not read in full) are out too; 'rereading' stays in.
+const NOT_CURRENTLY_READING = ['read', 'abandoned', 'on_hold', 'skimmed'];
 function isCurrentlyReading(b) {
   const p = b.percentage || 0;
-  return p > 0 && p < 1 && b.read_status !== 'read' && b.read_status !== 'abandoned';
+  return p > 0 && p < 1 && !NOT_CURRENTLY_READING.includes(b.read_status);
 }
 
 function applyFilter() {

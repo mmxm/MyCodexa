@@ -70,6 +70,29 @@ router.get('/book-stats/:bookId', async (req, res) => {
   res.json(await bookorbit.getBookStats(req.user.id, bookId));
 });
 
+// GET /api/bookorbit/book-sessions/:bookId?page=&pageSize= — the per-session rows behind those
+// totals, for a LOCAL book (the Reading tab of Codexa's own info dialog). Null (200) when BookOrbit
+// is off / the book isn't mapped; 502 when it's mapped but BookOrbit didn't answer.
+router.get('/book-sessions/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  const out = await bookorbit.getBookSessions(req.user.id, bookId, req.query.page, req.query.pageSize);
+  if (out?.unreachable) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
+// GET /api/bookorbit/books/:boBookId/sessions?page=&pageSize= — same rows keyed by BookOrbit's own
+// id, for the BookOrbit browser's book dialog (works for books never imported into Codexa).
+router.get('/books/:boBookId/sessions', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  if (!Number.isFinite(boBookId)) return res.status(400).json({ error: 'error.bookorbit_unreachable' });
+  const out = await bookorbit.fetchSessionPage(req.user.id, ctx, boBookId, req.query.page, req.query.pageSize);
+  if (!out) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
 // Thin GET proxy for the simple "list everything" endpoints. Forwards `q`/`page`/`size` when
 // present — series and authors are genuinely paginated server-side (default page size 50);
 // libraries/collections/smart-scopes ignore page/size since BookOrbit returns them as a flat,

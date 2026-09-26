@@ -9,6 +9,7 @@ import { t } from './i18n.js';
 import { reloadLibrary, openInfoModal, sanitizeHtml } from './library.js';
 import { reloadShelves } from './sidebar.js';
 import { showPanel } from './router.js';
+import { mountBoSessions } from './bookorbitSessions.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let _initialized  = false;
@@ -750,11 +751,13 @@ async function openBookorbitDetailModal(book) {
       <div class="info-modal-tabs" role="tablist">
         <button class="imt-tab active" data-tab="details" role="tab">${t('library.tab_details')}</button>
         <button class="imt-tab" data-tab="related" role="tab">${t('library.tab_related')}</button>
+        <button class="imt-tab" data-tab="reading" role="tab">${t('library.tab_reading')}</button>
       </div>
 
       <div class="info-modal-tab-content">
         <div class="imt-panel" id="bod-details"><div class="imt-empty" style="padding:1rem 0">${t('opds.loading')}</div></div>
         <div class="imt-panel" id="bod-related" style="display:none"><div id="bod-related-inner"><div class="imt-empty" style="padding:1rem 0">${t('opds.loading')}</div></div></div>
+        <div class="imt-panel" id="bod-reading" style="display:none"><div id="bod-reading-inner"></div></div>
       </div>
     </div>`;
   document.body.appendChild(backdrop);
@@ -792,6 +795,7 @@ async function openBookorbitDetailModal(book) {
 
   // ── Related tab (lazy — same recommendation engine as library.js's own Related tab) ──────────
   let relatedLoaded = false;
+  let readingLoaded = false;
   async function loadRelatedTab() {
     const inner = backdrop.querySelector('#bod-related-inner');
     try {
@@ -824,6 +828,12 @@ async function openBookorbitDetailModal(book) {
       backdrop.querySelectorAll('.imt-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
       backdrop.querySelectorAll('.imt-panel').forEach(p => { p.style.display = p.id === `bod-${id}` ? '' : 'none'; });
       if (id === 'related' && !relatedLoaded) { relatedLoaded = true; loadRelatedTab(); }
+      if (id === 'reading' && !readingLoaded) {
+        readingLoaded = true;
+        // BookOrbit's own per-session rows for this book, from every device on the account.
+        mountBoSessions(backdrop.querySelector('#bod-reading-inner'),
+          p => apiFetch(`/bookorbit/books/${book.boBookId}/sessions?page=${p}`));
+      }
     });
   });
 }

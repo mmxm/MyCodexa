@@ -2,6 +2,7 @@ import { apiFetch } from './api.js';
 import { toast, confirmDialog, setButtonLoading, showProgressToast, initSortMenuFor, resyncSortMenu } from './ui.js';
 import { reloadShelves, getShelves, setActive, updateDownloadedCount, updateNavCounts, setShelfBadge, setBookorbitNavVisible } from './sidebar.js';
 import { t } from './i18n.js';
+import { mountBoSessions } from './bookorbitSessions.js';
 import { showPanel } from './router.js';
 import { openSyncModal, openOpdsBrowserAtFolder } from './opds.js';
 import { renderPdfCoverBlobFromBytes, uploadPdfCover } from './pdf-cover.js';
@@ -1256,7 +1257,7 @@ export async function openInfoModal(book, startTab = '') {
         <div class="imt-section-title" style="margin-top:.75rem">${t('library.reading_bo_title')}</div>
         <div class="imt-reading-summary">${t('library.reading_total_time')}: <strong>${fmtTime(bo.totalSeconds)}</strong> &nbsp;&middot;&nbsp; ${bo.totalSessions} ${t('library.reading_sessions').toLowerCase()}${bo.firstSessionAt ? ` &nbsp;&middot;&nbsp; ${fmtDate(bo.firstSessionAt)}${bo.lastSessionAt && fmtDate(bo.lastSessionAt) !== fmtDate(bo.firstSessionAt) ? ` – ${fmtDate(bo.lastSessionAt)}` : ''}` : ''}</div>
         ${bo.bySource?.length > 1 ? `<div class="imt-reading-summary" style="opacity:.8">${bo.bySource.map(x => `${escHtml(boSourceLabel(x.bucket))}: ${fmtTime(x.totalSeconds)}`).join(' &nbsp;&middot;&nbsp; ')}</div>` : ''}
-        ${bo.stale ? `<div class="imt-empty">${t('library.reading_bo_stale')}</div>` : ''}` : '';
+        ${bo.stale ? `<div class="imt-empty">${t('library.reading_bo_stale')}</div>` : `<div id="imt-bo-sessions"></div>`}` : '';
 
       inner.innerHTML = `
         <div class="imt-section-title">${t('library.reading_bookmarks')}</div>
@@ -1310,6 +1311,10 @@ export async function openInfoModal(book, startTab = '') {
               </div>`).join('')}
           </div>`
           : `<div class="imt-empty">${t('library.reading_no_sessions')}</div>`}`;
+
+      // The per-session rows behind BookOrbit's totals (all devices) — the summary is already above.
+      mountBoSessions(inner.querySelector('#imt-bo-sessions'),
+        p => apiFetch(`/bookorbit/book-sessions/${fullBook.id}?page=${p}`), { summary: false });
 
       inner.addEventListener('click', async e => {
         const btn = e.target.closest('.imt-del-btn');

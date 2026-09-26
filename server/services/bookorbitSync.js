@@ -599,9 +599,7 @@ const STATS_REFRESH_SECS   = 120;        // per-book sync: don't re-fetch a book
 const STATS_BACKFILL_SECS  = 24 * 3600;  // full sweep: refresh finished books' cached totals at most daily
 const STATS_BACKFILL_LIMIT = 25;         // ...and at most this many per sweep (each is one paced API call)
 
-async function fetchSessionStats(userId, ctx, boBookId) {
-  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=1&pageSize=1`);
-  const st = res.ok ? res.data?.stats : null;
+function normalizeSessionStats(st) {
   if (!st) return null;
   const toSecs = (v) => {
     const ms = v ? new Date(v).getTime() : NaN;
@@ -615,6 +613,39 @@ async function fetchSessionStats(userId, ctx, boBookId) {
     bySource: Array.isArray(st.bySource)
       ? st.bySource.map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0, totalSessions: Number(x.totalSessions) || 0 }))
       : [],
+  };
+}
+
+async function fetchSessionStats(userId, ctx, boBookId) {
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=1&pageSize=1`);
+  return res.ok ? normalizeSessionStats(res.data?.stats) : null;
+}
+
+// One page of BookOrbit's per-session rows for a book (newest first) plus the totals block, for the
+// "Reading" session tables. Times stay unix seconds like everywhere else server-side; progress is
+// BookOrbit's own 0-100 percent scale (endProgress) / percentage points (progressDelta). Returns
+// null if BookOrbit doesn't answer.
+async function fetchSessionPage(userId, ctx, boBookId, page = 1, pageSize = 25) {
+  const p  = Math.max(1, parseInt(page, 10) || 1);
+  const ps = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 25));
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=${p}&pageSize=${ps}&sortBy=startedAt&sortDir=desc`);
+  if (!res.ok || !res.data) return null;
+  const toSecs = (v) => { const ms = v ? new Date(v).getTime() : NaN; return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
+  return {
+    items: (Array.isArray(res.data.items) ? res.data.items : []).map(r => ({
+      id:              r.id,
+      startedAt:       toSecs(r.startedAt),
+      endedAt:         toSecs(r.endedAt),
+      durationSeconds: Number(r.durationSeconds) || 0,
+      progressDelta:   r.progressDelta ?? null,
+      endProgress:     r.endProgress ?? null,
+      format:          r.format ?? null,
+      source:          r.source ?? null,
+    })),
+    total:    Number(res.data.total) || 0,
+    page:     Number(res.data.page) || p,
+    pageSize: Number(res.data.pageSize) || ps,
+    stats:    normalizeSessionStats(res.data.stats),
   };
 }
 
@@ -668,6 +699,12 @@ async function backfillFinishedStats(userId, ctx) {
   return fetched;
 }
 
+// The BookOrbit id of a local book, from its sync mapping or stored OPDS link (no network).
+function boBookIdFor(db, userId, bookId, ctx) {
+  const st = db.prepare('SELECT bo_book_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(userId, bookId);
+  return st?.bo_book_id || opdsIdsFor(db, userId, bookId, ctx.origin)?.boBookId || null;
+}
+
 // On-demand, for the book-details Reading tab: live totals for one local book (so they reflect a
 // session that ended a minute ago), falling back to the cached copy if BookOrbit is unreachable.
 // Returns null when BookOrbit isn't enabled or the book isn't mapped to it.
@@ -677,8 +714,7 @@ async function getBookStats(userId, bookId) {
   const db = getDb();
   const book = db.prepare('SELECT file_hash FROM books WHERE user_id = ? AND id = ?').get(userId, bookId);
   if (!book) return null;
-  const st = db.prepare('SELECT bo_book_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(userId, bookId);
-  const boBookId = st?.bo_book_id || opdsIdsFor(db, userId, bookId, ctx.origin)?.boBookId;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
   if (!boBookId) return null;
   const live = await fetchSessionStats(userId, ctx, boBookId);
   if (live) {
@@ -692,6 +728,19 @@ async function getBookStats(userId, bookId) {
     firstSessionAt: c.first_session_at, lastSessionAt: c.last_session_at,
     bySource: JSON.parse(c.by_source || '[]'), stale: true,
   };
+}
+
+// Same, but the per-session rows, for a local book (the BookOrbit browser's own dialog already
+// has the BookOrbit id and calls fetchSessionPage directly). null = not enabled / not mapped;
+// { unreachable: true } = mapped but BookOrbit didn't answer.
+async function getBookSessions(userId, bookId, page, pageSize) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  if (!db.prepare('SELECT 1 FROM books WHERE user_id = ? AND id = ?').get(userId, bookId)) return null;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
+  if (!boBookId) return null;
+  return (await fetchSessionPage(userId, ctx, boBookId, page, pageSize)) || { unreachable: true };
 }
 
 // ── recommendations / series lookups (on-demand, read-only, single book) ─────
@@ -1068,6 +1117,8 @@ module.exports = {
   triggerProgressPush,
   getProgress,
   getBookStats,
+  getBookSessions,
+  fetchSessionPage,
   backfillFinishedStats,
   getLastStatus,
   checkReachable,

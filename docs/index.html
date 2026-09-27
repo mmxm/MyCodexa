@@ -2146,6 +2146,13 @@ staticPasswords:
           earlier offline sessions still sync, and anything that can't be sent yet is retried on the
           next reconnect or app launch.
         </li>
+<li>
+          Reading time itself is tracked the same way: time and pages read while offline are kept
+          on-device and sent once you're back online, so an entire offline reading session — a full
+          book if that's how long you were offline — still counts towards your
+          <a data-scroll="lib-stats" data-section="library" href="#lib-stats">Reading Statistics</a>
+          and, if BookOrbit sync is enabled, still appears in your BookOrbit reading history.
+        </li>
 </ul>
 <p>
         This automatic reconcile is separate from the manual sync tap zones and the confirmation

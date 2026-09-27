@@ -429,7 +429,16 @@ const WORD_HIGHLIGHT_LINGER_MS = 500; // how long the press-highlight lingers af
 let _clearHlTimer = null;
 let _annotToolbarTimer = null; // guards against mouseup firing before dblclick on desktop
 // Reading statistics tracking
-let statsSessionId = null;            // active reading_sessions.id
+// sessionChunkStartTs (local wall-clock seconds; null = not currently tracking a chunk) replaces
+// what used to be a server-assigned reading_sessions.id. It's set purely locally, with no network
+// call — see startStatsSession — so it can never fail to be set the way a server round-trip could.
+// The whole point: nothing about tracking a chunk depends on the server having heard from us yet;
+// a chunk only gets sent to the server once it's already finished (see buildSessionRecord /
+// endStatsSession / endStatsSessionBackground), and if that delivery fails it's queued and retried
+// — never silently dropped. Confirmed live before this fix: opening a book fully offline left the
+// old statsSessionId null with nothing to retry until the next visibilitychange, so a multi-hour
+// continuous offline reading session produced zero recorded time — not queued, just gone.
+let sessionChunkStartTs = null;
 let sessionPageCount = 0;             // page navigation events in current session
 let sessionStartPct = null;           // currentPct snapshot when the session started
 // Continuous-scroll mode never calls goNext/goPrev (see _cxRelocatedHandler below), so without
@@ -1868,11 +1877,10 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     acquireWakeLock();
     scheduleWakeSync();
-    // Rotation on hide (below) always tries to start a fresh session right away, but that start
-    // call isn't guaranteed to finish if the page was actually closing rather than just
-    // backgrounding — re-establish one here if it didn't, so reading after a wake isn't silently
-    // untracked until the next checkpoint.
-    if (currentBook && isReady && !statsSessionId) startStatsSession(currentBook.id);
+    // Belt-and-suspenders: startStatsSession is purely local now (no network call, so it can't
+    // fail to set sessionChunkStartTs the way the old server-assigned id could), but re-establish
+    // one anyway if something upstream left tracking off — cheap and harmless either way.
+    if (currentBook && isReady && !sessionChunkStartTs) startStatsSession(currentBook.id);
     if (navigator.onLine) flushSessionCheckpoints().catch(() => {});
     // Android can reset its "hidden system bars" state on screen-off, requiring
     // MainActivity.onWindowFocusChanged to reassert immersive mode once the screen wakes back
@@ -6257,10 +6265,8 @@ window.addEventListener('online', () => {
   syncOfflineBookmarks(currentBook.id).catch(() => {});
   syncOfflineAnnotations(currentBook.id).catch(() => {});
   flushSessionCheckpoints().catch(() => {});
-  // A session-start or rotate attempted while offline leaves statsSessionId null with no
-  // retry of its own (unlike the checkpoints above) — re-establish one now so reading after
-  // reconnect isn't silently untracked until the next visibilitychange.
-  if (isReady && !statsSessionId) startStatsSession(currentBook.id);
+  // Belt-and-suspenders (see the same line in the visibilitychange→visible handler above).
+  if (isReady && !sessionChunkStartTs) startStatsSession(currentBook.id);
   triggerNetworkRestore('online');
 });
 
@@ -6286,7 +6292,7 @@ function _cxRelocatedHandler(e) {
   // reading activity too, throttled so a rapid burst of scroll ticks doesn't inflate the count
   // far beyond paginated mode's one-tick-per-turn, and so a single momentary/involuntary scroll
   // can't alone satisfy the >=2 "real session" bar this feeds (server/routes/stats.js).
-  if (isContinuousMode() && statsSessionId) {
+  if (isContinuousMode() && sessionChunkStartTs) {
     const now = Date.now();
     if (now - lastContinuousActivityTs >= CONTINUOUS_ACTIVITY_MIN_GAP_MS) {
       lastContinuousActivityTs = now;
@@ -7635,20 +7641,27 @@ window.addEventListener('resize', debounce(() => {
 
 // ── Reading statistics ────────────────────────────────────────────────────────
 
-// Reading-session checkpoint outbox (offline resilience). A rotate/close checkpoint's
-// PATCH can fail simply because the device is offline at that exact moment — unlike
-// bookmarks/annotations/position, this data has no other local copy once statsSessionId
-// is cleared, so a failed checkpoint was previously lost forever, and BookOrbit's
-// uploadSessions() (server/services/bookorbitSync.js) would never see it since it only
-// reads reading_sessions rows that already have an end_ts. Queue it here instead and
-// retry on reconnect, mirroring the bookmarks/annotations queues below.
+// Reading-session outbox (offline resilience). Each finalized chunk (see buildSessionRecord) is
+// already a complete start+end+pages record by the time it reaches here, so unlike the old
+// open-then-close model there's nothing that has to have succeeded earlier for this to be
+// meaningful — every entry is self-contained and safe to keep indefinitely until delivered.
+// client_id lets the server dedupe a chunk that's delivered twice (see endStatsSessionBackground's
+// own comment on why that can happen) instead of double-counting it.
 const SESSION_Q_KEY = 'br_session_q';
 
-function enqueueSessionCheckpoint(id, body) {
+function enqueueSessionRecord(rec) {
   try {
     const q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]');
-    q.push({ id, body });
+    q.push(rec);
     localStorage.setItem(SESSION_Q_KEY, JSON.stringify(q));
+  } catch { /* quota */ }
+}
+
+function dequeueSessionRecord(clientId) {
+  try {
+    const q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]');
+    const next = q.filter(r => r.client_id !== clientId);
+    if (next.length !== q.length) localStorage.setItem(SESSION_Q_KEY, JSON.stringify(next));
   } catch { /* ignore */ }
 }
 
@@ -7657,103 +7670,110 @@ async function flushSessionCheckpoints() {
   try { q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]'); } catch { q = []; }
   if (!q.length) return;
   const remaining = [];
-  for (const item of q) {
+  for (const rec of q) {
     try {
-      await apiFetch(`/stats/session/${item.id}`, {
-        method: 'PATCH',
+      await apiFetch('/stats/session/complete', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(item.body),
+        body: JSON.stringify(rec),
       });
-      log('[stats] flushed queued session checkpoint id:', item.id);
+      log('[stats] flushed queued session chunk for book', rec.book_id, 'pages', rec.pages_nav);
     } catch (e) {
-      warn('[stats] session checkpoint still undeliverable, keeping queued:', e.message);
-      remaining.push(item);
+      warn('[stats] session chunk still undeliverable, keeping queued:', e.message);
+      remaining.push(rec);
     }
   }
   try { localStorage.setItem(SESSION_Q_KEY, JSON.stringify(remaining)); } catch { /* ignore */ }
 }
 
-async function startStatsSession(bookId) {
-  try {
-    const res = await apiFetch('/stats/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ book_id: bookId, start_ts: Math.floor(Date.now() / 1000) }),
-    });
-    statsSessionId = res?.id || null;
-    sessionPageCount = 0;
-    lastContinuousActivityTs = 0;
-    sessionPageCountAtLastCheck = 0;
-    sessionStartPct = currentPct > 0 ? currentPct : null;
-    log('[stats] session started id:', statsSessionId);
-  } catch (e) {
-    warn('[stats] failed to start session:', e.message);
-  }
-}
-
-function endStatsSessionBackground() {
-  if (!statsSessionId) return;
-  const id  = statsSessionId;
-  const pgs = sessionPageCount;
-  const startPct = sessionStartPct;
-  const pct = currentPct > 0 ? currentPct : null;
-  statsSessionId   = null;
+// Purely local — no network call, so unlike the old server-assigned session id this can never
+// fail to be set. The chunk it starts tracking only gets sent to the server once it's finished
+// (see buildSessionRecord + endStatsSession/endStatsSessionBackground below), which is what makes
+// the whole model offline-safe: nothing has to succeed up front for reading to start being
+// tracked. Confirmed live before this fix: opening a book with no connectivity at all left the old
+// statsSessionId null with no retry of its own until the next visibilitychange, so a multi-hour
+// continuous offline reading session recorded zero time — not queued anywhere, just gone.
+function startStatsSession(bookId) {
+  sessionChunkStartTs = Math.floor(Date.now() / 1000);
   sessionPageCount = 0;
   lastContinuousActivityTs = 0;
   sessionPageCountAtLastCheck = 0;
-  sessionStartPct  = null;
+  sessionStartPct = currentPct > 0 ? currentPct : null;
+  log('[stats] tracking chunk started for book', bookId, 'at', sessionChunkStartTs);
+}
+
+// Builds the complete record for the chunk tracked so far, and resets local state for a fresh one
+// — the two are done together so every caller finalizes exactly once per chunk, whether or not the
+// resulting record ever gets delivered.
+function buildAndResetSessionRecord() {
+  if (!sessionChunkStartTs || !currentBook) return null;
+  const rec = {
+    client_id:  `${currentBook.id}:${sessionChunkStartTs}:${Math.random().toString(36).slice(2, 10)}`,
+    book_id:    currentBook.id,
+    start_ts:   sessionChunkStartTs,
+    end_ts:     Math.floor(Date.now() / 1000),
+    pages_nav:  sessionPageCount,
+    start_pct:  sessionStartPct,
+    end_pct:    currentPct > 0 ? currentPct : null,
+  };
+  sessionChunkStartTs = null;
+  sessionPageCount = 0;
+  lastContinuousActivityTs = 0;
+  sessionPageCountAtLastCheck = 0;
+  sessionStartPct = null;
+  return rec;
+}
+
+function endStatsSessionBackground() {
+  const rec = buildAndResetSessionRecord();
+  if (!rec) return;
+  // Queued unconditionally, before even trying the fetch: a keepalive fetch's success can't be
+  // observed on page-unload (same limitation saveProgressBackground's own comment describes for
+  // position saves), so there's no reliable "it failed" signal to hang queuing on here. Delivering
+  // it twice is harmless (client_id dedupes server-side); NOT queuing it and having the keepalive
+  // fetch silently die in a closing tab was the actual old failure mode this replaces.
+  enqueueSessionRecord(rec);
   const token = getToken();
   const headers = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
-  const body = { end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct };
-  fetch(`/api/stats/session/${id}`, {
-    method: 'PATCH',
+  fetch('/api/stats/session/complete', {
+    method: 'POST',
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify(rec),
     keepalive: true,
-  }).catch(() => enqueueSessionCheckpoint(id, body));
+  }).then(() => dequeueSessionRecord(rec.client_id)) // arrived after all — avoid a redundant re-send later
+    .catch(() => {}); // already queued regardless
 }
 
 async function endStatsSession() {
-  if (!statsSessionId) return;
-  const id  = statsSessionId;
-  const pgs = sessionPageCount;
-  const startPct = sessionStartPct;
-  const pct = currentPct > 0 ? currentPct : null;
-  statsSessionId   = null;
-  sessionPageCount = 0;
-  lastContinuousActivityTs = 0;
-  sessionPageCountAtLastCheck = 0;
-  sessionStartPct  = null;
-  const body = { end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct };
+  const rec = buildAndResetSessionRecord();
+  if (!rec) return;
   try {
-    await apiFetch(`/stats/session/${id}`, {
-      method: 'PATCH',
+    await apiFetch('/stats/session/complete', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(rec),
     });
   } catch (e) {
-    warn('[stats] failed to end session, queued for retry:', e.message);
-    enqueueSessionCheckpoint(id, body);
+    warn('[stats] failed to deliver session chunk, queued for retry:', e.message);
+    enqueueSessionRecord(rec);
   }
 }
 
-// Finalizes the current reading_sessions row and immediately opens a new one — a "checkpoint" so
-// a long session isn't entirely lost (for both Codexa's own stats and BookOrbit's reading log,
-// which only ever sees a session once it has an end_ts — see uploadSessions() in
-// bookorbitSync.js) if the app never gets a chance to close cleanly afterward: a killed tab, an
-// e-reader cover closing and cutting wifi, or a crash. Called both automatically (page hidden)
-// and from the manual KOSync push actions.
+// Finalizes the tracked chunk and immediately starts a new one — a "checkpoint" so a long reading
+// stretch isn't entirely lost (for both Codexa's own stats and BookOrbit's reading log, which only
+// ever sees a chunk once it's delivered — see uploadSessions() in bookorbitSync.js) if the app
+// never gets a chance to close cleanly afterward: a killed tab, an e-reader cover closing and
+// cutting wifi, or a crash. Called both automatically (page hidden) and from the manual KOSync
+// push actions. Starting the new chunk is always local-only now, so unlike the old model it can
+// never leave tracking off the way a failed server round-trip used to.
 // `background`: use the keepalive-fetch finalize (endStatsSessionBackground) instead of the
-// normal awaited PATCH — for the visibilitychange→hidden case, where the page may vanish before
-// a regular fetch completes. Starting the new session is always a best-effort, non-keepalive
-// call either way: if the page really is closing, it simply won't finish, which just means
-// tracking resumes at the next successful checkpoint (or the visibilitychange→visible handler
-// below) instead of right now — same failure mode as not rotating at all, no worse.
+// normal awaited POST — for the visibilitychange→hidden case, where the page may vanish before a
+// regular fetch completes.
 function rotateStatsSession({ background = false } = {}) {
-  if (!currentBook || !statsSessionId) return;
+  if (!currentBook || !sessionChunkStartTs) return;
   if (background) endStatsSessionBackground();
   else endStatsSession().catch(() => {});
   startStatsSession(currentBook.id);

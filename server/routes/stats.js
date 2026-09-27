@@ -31,6 +31,32 @@ router.patch('/session/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// POST /api/stats/session/complete — records an already-finished reading-session chunk in one
+// call (start+end+pages together), instead of the open-then-later-close two-step the plain
+// POST/PATCH pair above needs. Exists for offline resilience: the client only ever builds this
+// from a chunk it has ALREADY finished tracking locally (see reader.js's buildSessionRecord /
+// rotateStatsSession) — unlike the old model, the very first network call for a reading session
+// can fail with nothing lost, since there was never anything that HAD to succeed before reading
+// could be tracked at all. The client keeps retrying this same call from a local queue until it
+// lands. client_id makes it safe to deliver the same chunk twice (a keepalive fetch on page-unload
+// whose outcome can't be observed, followed by the same chunk being flushed again later).
+router.post('/session/complete', (req, res) => {
+  const { book_id, client_id, start_ts, end_ts, pages_nav, start_pct, end_pct } = req.body || {};
+  if (!book_id || !start_ts || !end_ts) {
+    return res.status(400).json({ error: 'book_id, start_ts and end_ts are required' });
+  }
+  const db = getDb();
+  const book = db.prepare('SELECT id FROM books WHERE id = ? AND user_id = ?').get(book_id, req.user.id);
+  if (!book) return res.status(404).json({ error: 'Book not found' });
+  const info = db.prepare(`
+    INSERT INTO reading_sessions (user_id, book_id, client_id, start_ts, end_ts, pages_nav, start_pct, end_pct)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (user_id, client_id) DO NOTHING
+  `).run(req.user.id, book.id, client_id || null, start_ts, end_ts, pages_nav || 0, start_pct ?? null, end_pct ?? null);
+  if (info.changes > 0) bookorbit.triggerSync(req.user.id, book.id); // upload the closed session to BookOrbit
+  res.status(201).json({ success: true });
+});
+
 // POST /api/stats/chapter — log a chapter visit
 router.post('/chapter', (req, res) => {
   const { book_id, chapter_href, chapter_title } = req.body || {};

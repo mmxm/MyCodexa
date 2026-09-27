@@ -315,6 +315,14 @@ function initDb() {
     // (see bookorbitSync.uploadSessions).
     [`ALTER TABLE reading_sessions ADD COLUMN end_pct              REAL    DEFAULT NULL`,     'reading_sessions.end_pct'],
     [`ALTER TABLE reading_sessions ADD COLUMN start_pct            REAL    DEFAULT NULL`,     'reading_sessions.start_pct'],
+    // Client-generated id for a session recorded via POST /stats/session/complete (reader.js's
+    // offline-resilient chunk model — see that route's own comment). Lets a chunk be delivered
+    // more than once (a keepalive fetch on page-unload whose outcome can't be observed, followed
+    // by the same chunk being flushed again from the local queue) without double-counting: the
+    // insert is `ON CONFLICT (user_id, client_id) DO NOTHING`. NULL for every session created the
+    // old way (POST /stats/session + PATCH .../:id) — SQLite treats each NULL as distinct in a
+    // UNIQUE index, so those rows are unaffected.
+    [`ALTER TABLE reading_sessions ADD COLUMN client_id             TEXT    DEFAULT NULL`,     'reading_sessions.client_id'],
     // Bookmark sync tracking (create/delete only — BookOrbit's bookmark API has no update route)
     [`ALTER TABLE bookmarks       ADD COLUMN bo_id                 TEXT    DEFAULT ''`,       'bookmarks.bo_id'],
     [`ALTER TABLE bookmarks       ADD COLUMN deleted                INTEGER DEFAULT 0`,       'bookmarks.deleted'],
@@ -418,6 +426,15 @@ function initDb() {
     `);
   } catch (e) {
     console.warn('[db] idx_book_stats_archive_user creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_sessions_client_id
+        ON reading_sessions(user_id, client_id)
+    `);
+  } catch (e) {
+    console.warn('[db] idx_reading_sessions_client_id creation:', e.message);
   }
 
   // A trigger rather than code in each delete route because books get deleted from several

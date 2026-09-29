@@ -6,10 +6,10 @@ const path       = require('path');
 const fs         = require('fs');
 const rateLimit  = require('express-rate-limit');
 const { getDb, DATA_DIR } = require('../db');
+const { removeCoverIfUnused } = require('../utils/covers');
 const { authenticateToken } = require('../middleware/auth');
 
 const BOOKS_DIR  = path.join(DATA_DIR, 'books');
-const COVERS_DIR = path.join(DATA_DIR, 'covers');
 
 const router      = express.Router();
 const SALT_ROUNDS = 12;
@@ -354,9 +354,8 @@ router.delete('/admin/users/:id', authenticateToken, (req, res) => {
   // Remove book files and covers
   for (const book of books) {
     try { fs.unlinkSync(path.join(BOOKS_DIR, String(targetId), book.filename)); } catch { /* gone */ }
-    if (book.cover_path) {
-      try { fs.unlinkSync(path.join(COVERS_DIR, book.cover_path)); } catch { /* gone */ }
-    }
+    // The user's rows are already gone (cascade above), so this only keeps covers other users' copies still use.
+    removeCoverIfUnused(db, book.cover_path);
   }
   // Remove the user's book directory
   try { fs.rmdirSync(path.join(BOOKS_DIR, String(targetId))); } catch { /* gone or non-empty */ }

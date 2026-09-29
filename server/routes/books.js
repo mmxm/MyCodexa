@@ -9,6 +9,7 @@ const { isCbrBuffer, convertCbrToCbz } = require('../utils/cbr');
 const { extractPdfMetadata, isPdfBuffer } = require('../utils/pdf');
 const { PEEK_TTL_SECONDS, peekFilePath, deletePeekRow } = require('../utils/peekCleanup');
 const bookorbit = require('../services/bookorbitSync');
+const { removeCoverIfUnused } = require('../utils/covers');
 const { logCompletion } = require('../utils/completions');
 
 // Aligned with BookOrbit's ReadStatus vocabulary so values sync 1:1.
@@ -478,9 +479,9 @@ async function reextractBookMetadata(book, filePath) {
   const isPdf = book.filename?.endsWith('.pdf') || book.format === 'pdf';
   const isCbz = book.filename?.endsWith('.cbz') || book.format === 'cbz';
 
-  if (!isPdf && book.cover_path) {
-    try { fs.unlinkSync(path.join(COVERS_DIR, book.cover_path)); } catch { /* already gone */ }
-  }
+  // Clears the old cover so a book that no longer has one doesn't keep a stale image — but not when
+  // another book shares the file (the extractor below rewrites the same hash-named file anyway).
+  if (!isPdf && book.cover_path) removeCoverIfUnused(getDb(), book.cover_path, book.id);
 
   const meta = isPdf ? await extractPdfMetadata(filePath, COVERS_DIR, book.file_hash)
     : isCbz ? extractCbzMetadata(filePath, COVERS_DIR, book.file_hash)
@@ -602,13 +603,11 @@ router.delete('/:id', (req, res) => {
   const filePath = path.join(BOOKS_DIR, String(req.user.id), book.filename);
   try { fs.unlinkSync(filePath); } catch { /* already gone */ }
 
-  // Remove cover
-  if (book.cover_path) {
-    try { fs.unlinkSync(path.join(COVERS_DIR, book.cover_path)); } catch { /* already gone */ }
-  }
-
-  // Remove book + its progress rows (CASCADE handles progress)
+  // Remove the book row (CASCADE handles its sessions/bookmarks/annotations; reading_progress is
+  // keyed by content hash and deliberately left alone — see book_completions in db.js), THEN its
+  // cover — only if no other book, e.g. another user's copy of the same file, still uses it.
   db.prepare('DELETE FROM books WHERE id = ?').run(book.id);
+  removeCoverIfUnused(db, book.cover_path);
   res.status(204).end();
 });
 

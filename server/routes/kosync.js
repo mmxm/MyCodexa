@@ -19,6 +19,7 @@ const express = require('express');
 const bcrypt  = require('bcrypt');
 const crypto  = require('crypto');
 const { getDb }             = require('../db');
+const { isRegistrationEnabled } = require('./auth');
 const { authenticateToken } = require('../middleware/auth');
 const { maybeMarkBookFinished } = require('../utils/bookCompletion');
 const bookorbit             = require('../services/bookorbitSync');
@@ -72,6 +73,10 @@ kosyncRouter.post('/users/create', async (req, res) => {
   }
 
   const db = getDb();
+  const hasUsers = !!db.prepare('SELECT 1 FROM users LIMIT 1').get();
+  if (hasUsers && !isRegistrationEnabled(db)) {
+    return res.status(403).json({ error: 'REGISTRATION_DISABLED' });
+  }
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
   if (existing) {
     return res.status(409).json({ error: 'USERNAME_REGISTERED' });
@@ -164,8 +169,14 @@ proxyRouter.use(authenticateToken);
 function getExternalSettings(userId) {
   const db = getDb();
   return db.prepare(
-    'SELECT kosync_url, kosync_username, kosync_password_enc, kosync_internal_enabled FROM user_settings WHERE user_id = ?'
+    'SELECT kosync_url, kosync_username, kosync_password_enc, kosync_internal_enabled, kosync_external_enabled FROM user_settings WHERE user_id = ?'
   ).get(userId);
+}
+
+// Column defaults to 1 (see db.js migration) so existing rows read as enabled unless the user
+// has explicitly flipped the Settings toggle off — treat anything but a literal 0 as enabled.
+function isExternalEnabled(s) {
+  return s?.kosync_external_enabled !== 0;
 }
 
 function isInternalEnabled(userId) {
@@ -227,6 +238,10 @@ proxyRouter.get('/remote/:document', async (req, res) => {
     console.log('[kosync] remote GET: skipped — no kosync_url configured');
     return res.json(null);
   }
+  if (!isExternalEnabled(s)) {
+    console.log('[kosync] remote GET: skipped — external sync disabled in settings');
+    return res.json(null);
+  }
 
   const url = `${s.kosync_url.replace(/\/$/, '')}/syncs/progress/${encodeURIComponent(req.params.document)}`;
   console.log('[kosync] remote GET:', url);
@@ -254,6 +269,10 @@ proxyRouter.put('/remote/:document', async (req, res) => {
   const s = getExternalSettings(req.user.id);
   if (!s?.kosync_url) {
     console.log('[kosync] remote PUT: skipped — no kosync_url configured');
+    return res.json({ skipped: true });
+  }
+  if (!isExternalEnabled(s)) {
+    console.log('[kosync] remote PUT: skipped — external sync disabled in settings');
     return res.json({ skipped: true });
   }
 
@@ -304,9 +323,11 @@ proxyRouter.put('/internal/:document', (req, res) => {
   // This endpoint is hit at every genuine KOSync push point (chapter boundary, manual
   // push, close) regardless of whether the internal KOReader-sync-server feature below
   // is enabled — so it's also the right place to mirror progress into BookOrbit.
+  // `progress` (the xpointer) is forwarded too — see triggerProgressPush's own comment
+  // for why leaving it out was actively breaking other KOReader-protocol clients.
   if (bookorbit.isEnabled(req.user.id)) {
     const bookId = findBookIdForDocument(req.user.id, req.params.document);
-    if (bookId != null) bookorbit.triggerProgressPush(req.user.id, bookId, pct);
+    if (bookId != null) bookorbit.triggerProgressPush(req.user.id, bookId, pct, progress);
   }
 
   if (!isInternalEnabled(req.user.id)) return res.json({ skipped: true });

@@ -1,13 +1,30 @@
 ﻿import { apiFetch, requireAuth, getToken } from './api.js';
-import { toast, initSortMenuFor, resyncSortMenu } from './ui.js';
+import { toast, initSortMenuFor, resyncSortMenu, syncStatusBarAppearance } from './ui.js';
 import { t, initI18n, applyTranslations, getCurrentLang } from './i18n.js';
 import { isBookDownloaded, downloadBook, fetchOfflineBookFile, getBookMeta, saveBookMeta, removeBook } from './offline.js';
 import { queueProgress, clearProgress, flushProgressOutbox } from './progress-outbox.js';
 import { log, warn } from './logger.js';
+import { stripImageWhiteBackgrounds } from './img-bg-fix.js';
+import { createComicViewer } from './comic-viewer.js';
+import { renderPdfCoverBlob, uploadPdfCover } from './pdf-cover.js';
 
-const READER_BUILD = 'br-v89-cxreader-only';
+const READER_BUILD = 'br-v107-kosync-dialog-arrow';
 const _i18nReady = initI18n();
 log('[codexa] reader build', READER_BUILD);
+
+// initI18n() reveals the page (visibility:hidden → '', set by the inline script in <head>) as
+// soon as locale strings are ready — usually off a cached locale, faster than reader.html's
+// safe-area probe settling. That showed --sat as an unsettled/wrong value for a beat, then
+// visibly snapped once the probe finished — the "screen jump" right after opening a book.
+// Re-hide immediately if insets aren't settled yet, and reveal again once they are; if they
+// already were, this costs one harmless same-tick hide+reveal, imperceptible to the user.
+_i18nReady.then(() => {
+  if (!window.__insetsReadyPromise) return; // script blocked/absent — don't get stuck hidden
+  document.documentElement.style.visibility = 'hidden';
+  window.__insetsReadyPromise.then(() => {
+    document.documentElement.style.visibility = '';
+  });
+});
 
 // Module-level detection (mirrors init()'s _legacyWebView) so module-scope code can guard
 // features that break Chrome 83 Android WebView.
@@ -70,6 +87,38 @@ function mixHex(h1, h2, t) {
   const b = Math.round(p(h1.slice(5,7)) + (p(h2.slice(5,7))-p(h1.slice(5,7)))*t);
   return '#'+r.toString(16).padStart(2,'0')+g.toString(16).padStart(2,'0')+b.toString(16).padStart(2,'0');
 }
+// ── Color conversions (shared by openColorPicker) ──────────────────────────────
+function clamp255(n) { return Math.max(0, Math.min(255, Math.round(n))); }
+function hexToRgbObj(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function rgbObjToHex({ r, g, b }) {
+  return '#' + [r, g, b].map(c => clamp255(c).toString(16).padStart(2, '0')).join('');
+}
+// h: 0-360, s/v: 0-1 → {r,g,b} 0-255
+function hsvToRgbObj(h, s, v) {
+  const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+  let [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+                : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  return { r: clamp255((r + m) * 255), g: clamp255((g + m) * 255), b: clamp255((b + m) * 255) };
+}
+// {r,g,b} 0-255 → { h: 0-360, s/v: 0-1 }
+function rgbObjToHsv({ r, g, b }) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+  }
+  if (h < 0) h += 360;
+  return { h, s: max === 0 ? 0 : d / max, v: max };
+}
+
 function deriveCustomPalette(bg, text) {
   const isDark = hexLuminance(bg) < 0.4;
   const shadowA = isDark ? 0.4 : 0.1;
@@ -242,6 +291,7 @@ const DEFAULT_PREFS = {
   autoHideHeader: true,
   keepScreenOn:   true,
   eink:           false,        // strip all colors for e-ink displays
+  pdfPaperInversion: false,     // remap only pure black/white pixels in rendered PDF pages
   paraIndent:     true,         // paragraph text-indent (first line)
   paraIndentSize: 10,           // indent size when paraIndent=true (em × 10, so 10 = 1.0em)
   paraSpacing:    0,            // extra bottom margin between paragraphs (em × 10, so 0–30)
@@ -258,6 +308,7 @@ const DEFAULT_PREFS = {
   hyphenLang:     '',           // empty = keep book's own lang attr; else override e.g. 'en'
   bionicReading:  false,        // emphasize word prefixes for easier scanning
   pageGapShadow:  false,        // show center-spine box-shadow in two-page mode
+  settingsNoBlur: false,        // don't dim/blur the book behind the settings panel (live style preview)
   dictionaries:   [],           // enabled dict IDs in priority order; null = all disabled; empty = use all
   dictionaryOrder: [],          // all dict IDs in user's display order (including disabled ones)
   edgePadding:    { top: 0, bottom: 0, left: 0, right: 0 },   // px inset for curved screens
@@ -294,6 +345,30 @@ let _cxViewerPaddingSet = false; // true after the first post-render inset measu
 let _cxTouchNavIframe = null; // iframe that currently has touch-nav handlers attached
 let currentBook  = null;
 let prefs        = loadPrefs();
+// Pure global baseline, captured once here — BEFORE loadBookPrefs() (called later, once book
+// metadata loads) layers this book's own per-book overrides onto `prefs`. saveBookPrefs()
+// diffs against THIS, not a fresh loadPrefs() re-read, which would otherwise be comparing a
+// per-book value against itself: persistPrefs() writes the live `prefs` (which by then may
+// already BE this book's override) into the same global br_reader_prefs blob before calling
+// saveBookPrefs, so a live re-read there always looked "unchanged from global" and the
+// override silently never got recorded — confirmed live (a spread-mode / Continuous choice
+// never survived closing and reopening the same book).
+const _globalPrefsSnapshot = { ...prefs };
+// Which reader_presets row (if any) is currently selected. This is a UI selection, not a
+// "still matches exactly" flag: it stays set through further edits (so Update/Rename/Delete
+// remain available) and only changes when the user applies a different preset, saves a new
+// one, or deletes the selected one. null = nothing selected ("Custom").
+// Deliberately per-device (localStorage), NOT synced to the server: presets themselves are
+// shared across devices, but which one each device is currently using is not — e.g. an
+// e-ink device and a phone can each stay on their own preset instead of the last device to
+// switch overwriting every other device's choice.
+let activePresetId = loadActivePresetId();
+// The active preset's own updated_at as of the last time it was actually applied to prefs —
+// lets loadPresetsList() tell "this preset was edited elsewhere, refresh" apart from "nothing
+// changed", so it only reapplies (and so only overwrites whatever live, unsaved edits this
+// session has made) when the preset genuinely has newer content. See loadPresetsList()'s own
+// comment for the bug this fixes.
+let activePresetAppliedAt = loadActivePresetAppliedAt();
 let currentCfi   = '';
 let currentPct        = 0;
 let lastKnownGoodPct  = 0;
@@ -318,6 +393,10 @@ let fontFaceCSS  = '';
 // Search state
 let searchAbort = { aborted: false };
 let preSearchCfi = null;      // position before first result jump
+// makeCfi() only ever encodes the chapter (spine index), never a page within it — so the
+// "back" restore also needs the exact in-chapter page captured separately, or it always
+// lands back on page 1 of the chapter instead of where the user actually was.
+let preSearchPage = null;
 // Two-phase search navigation state:
 //   phase 'first'  – navigated to chapter href, waiting for relocated to re-nav to exact CFI
 //   phase 'second' – navigated to exact CFI, waiting for relocated to mark highlights
@@ -326,6 +405,8 @@ let bionicWordCache = new Map();      // per-word split cache
 let bookmarksCache = [];              // loaded bookmarks for current book
 let preBookmarkCfi = null;            // position before a bookmark jump (for back/accept)
 let preAnnotationCfi = null;          // position before an annotation jump (for back/accept)
+let preBookmarkPage = null;           // in-chapter page companion to preBookmarkCfi (see preSearchPage)
+let preAnnotationPage = null;         // in-chapter page companion to preAnnotationCfi (see preSearchPage)
 
 // Clear both bookmark and annotation pre-jump states + hide their buttons.
 // Called before starting a new bookmark/annotation jump so at most one pair of
@@ -333,6 +414,8 @@ let preAnnotationCfi = null;          // position before an annotation jump (for
 function _clearNavPreJumps() {
   preBookmarkCfi  = null;
   preAnnotationCfi = null;
+  preBookmarkPage  = null;
+  preAnnotationPage = null;
   if (bookmarkBackBtn)    { bookmarkBackBtn.style.display    = 'none'; }
   if (bookmarkAcceptBtn)  { bookmarkAcceptBtn.style.display  = 'none'; }
   if (annotationBackBtn)  { annotationBackBtn.style.display  = 'none'; }
@@ -346,9 +429,35 @@ const WORD_HIGHLIGHT_LINGER_MS = 500; // how long the press-highlight lingers af
 let _clearHlTimer = null;
 let _annotToolbarTimer = null; // guards against mouseup firing before dblclick on desktop
 // Reading statistics tracking
-let statsSessionId = null;            // active reading_sessions.id
+// sessionChunkStartTs (local wall-clock seconds; null = not currently tracking a chunk) replaces
+// what used to be a server-assigned reading_sessions.id. It's set purely locally, with no network
+// call — see startStatsSession — so it can never fail to be set the way a server round-trip could.
+// The whole point: nothing about tracking a chunk depends on the server having heard from us yet;
+// a chunk only gets sent to the server once it's already finished (see buildSessionRecord /
+// endStatsSession / endStatsSessionBackground), and if that delivery fails it's queued and retried
+// — never silently dropped. Confirmed live before this fix: opening a book fully offline left the
+// old statsSessionId null with nothing to retry until the next visibilitychange, so a multi-hour
+// continuous offline reading session produced zero recorded time — not queued, just gone.
+let sessionChunkStartTs = null;
 let sessionPageCount = 0;             // page navigation events in current session
 let sessionStartPct = null;           // currentPct snapshot when the session started
+// Continuous-scroll mode never calls goNext/goPrev (see _cxRelocatedHandler below), so without
+// this, sessionPageCount would stay 0 all session long for a continuous-scroll reader — wrongly
+// flagging genuinely active reading as idle once session rotation starts filtering by pages_nav.
+// Throttled by CONTINUOUS_ACTIVITY_MIN_GAP_MS rather than counted on every cx-relocated firing,
+// since a continuous scroll fires that event on every rAF-throttled scroll tick (up to ~60/sec)
+// — uncapped, a single momentary/involuntary scroll blip could trivially satisfy the >=2 bar the
+// same idle-filtering this is meant to feed relies on elsewhere.
+let lastContinuousActivityTs = 0;
+const CONTINUOUS_ACTIVITY_MIN_GAP_MS = 5000;
+// sessionPageCount snapshotted at the last periodic-sync tick (see startPeriodicSync) — lets that
+// heartbeat tell "nothing happened this interval" (idle: rotate, isolating the idle stretch into
+// its own low-activity chunk the REAL_SESSION filter excludes) apart from "still reading" (leave
+// the session alone). Rotating unconditionally on every tick was tried first and confirmed live
+// to fragment one real continuous reading sitting into several small sessions instead — e.g. a
+// single ~10-minute, 8-page sitting came out as "3 sessions" purely from blind timer rotation
+// with real activity spanning right across each rotation boundary.
+let sessionPageCountAtLastCheck = 0;
 
 // ── Fork sync policy (juliefuller fork; extends upstream thehijacker/codexa) ──
 // Upstream syncs KOReader progress only on chapter boundaries and book close.
@@ -367,10 +476,21 @@ let sessionStartPct = null;           // currentPct snapshot when the session st
 //   bestKnownRemotePct — never push backwards unless user confirms manual sync (forced)
 const SYNC_DEBOUNCE_MS   = 60000;    // inactivity debounce — resets on every page turn
 const SYNC_INTERVAL_MS   = 240000;   // 4-minute heartbeat — always fires regardless of activity
+// Continuous mode only: a fast scroll can cross many spine items a second (especially in a
+// comic, where each image IS a spine item) — throttles remote (KOSync/BookOrbit) pushes to at
+// most once per this interval instead of once per crossing, which spammed the server with
+// dozens of pushes in a couple of seconds (confirmed live). See _cxRelocatedHandler.
+const CONTINUOUS_REMOTE_PUSH_MS = 3000;
+let _continuousRemotePushTs = 0;
 let syncDebounceTimer  = null;
 let syncIntervalTimer  = null;
 let lastSyncedCfi      = '';           // CFI at last successful remote push — used to skip duplicate syncs
 let bestKnownRemotePct = 0;            // high-water mark from all sources — kosync is never pushed below this
+// Spine index the above high-water mark was derived from, when known — kept in lockstep with
+// bestKnownRemotePct everywhere it's updated, so the backwards-push guard can compare chapters
+// first (see compareKosyncPosition) instead of trusting cross-engine percentages alone. null
+// whenever the source of the current bestKnownRemotePct had no parseable xpointer/CFI.
+let bestKnownRemoteSpineIdx = null;
 let _kosyncPushFailures    = 0;        // consecutive remote push failures for current book
 let _kosyncWarnedThisSession = false;  // only warn once per book load
 let _bookorbitWarnedThisSession = false; // only warn once per book load (automatic pushes)
@@ -395,7 +515,24 @@ const RENDITION_BOTTOM_RESERVE = 40;
 const readerLayout   = document.querySelector('.reader-layout');
 const loadingOverlay = document.getElementById('loading-overlay');
 const loadingMsg     = document.getElementById('loading-msg');
+const loadingCancelBtn = document.getElementById('loading-cancel-btn');
+// Cancelling never calls AbortController.abort() on the in-flight fetch — passing a signal to
+// fetch() is known to hang indefinitely on some old WebView builds (see the NOTE in api.js).
+// Navigating away is a safe, native way to give up on it instead: the browser tears down any
+// pending request for this document as part of unloading it, no matter how old the WebView is.
+loadingCancelBtn?.addEventListener('click', () => { window.location.href = libraryReturnUrl; });
 const epubViewer     = document.getElementById('epub-viewer');
+// Immersive comic (CBZ/PDF) gesture/zoom controller — see comic-viewer.js's own header comment
+// for why it owns no DOM listeners of its own; reader.js's existing handlers below call into
+// it, gated on isImmersivePageMode(). PDF pages render into the same full-bleed canvas/img
+// wrap as CBZ (see cxreader/index.js's _renderPdfItem), so this one seam carries the whole
+// chrome/gesture/zoom system over to PDF for free.
+const comicViewer = createComicViewer({ hostEl: epubViewer });
+function isImmersivePageMode() { return !!(_cxReader?._isCbz || _cxReader?._isPdf); }
+// "Continuous" spread mode — single column, free-scrolling instead of paginated. Applies to
+// EPUB (via cxreader/scroll-paginator.js) and to CBZ (stacked full-width images, see
+// _renderCbzContinuous in cxreader/index.js) alike, driven by the same prefs.spread value.
+function isContinuousMode() { return prefs.spread === 'continuous'; }
 const bookTitleEl    = document.getElementById('book-title');
 const chapterTitleEl = document.getElementById('chapter-title');
 const progressFillEl      = document.getElementById('progress-fill');
@@ -442,40 +579,50 @@ const annotationAcceptBtn = document.getElementById('btn-annotation-accept');
 
 // ── Prefs ─────────────────────────────────────────────────────────────────────
 // Keys that are stored per-book (content appearance).  All others are global.
-const PER_BOOK_KEYS = ['fontSize','fontFamily','lineHeight','letterSpacing','margin','theme','overrideStyles','paraIndent','paraIndentSize','paraSpacing','dictionaries','dictionaryOrder','bionicReading','skipOpenProgressCheck','skipSaveOnClose'];
+// 'spread' (One page / Two pages / Continuous) is per-book, not global — some books (mostly
+// comics) suit Continuous, others read better paginated, so switching it for one book
+// shouldn't carry over to the next one, same reasoning as margin/theme already being per-book.
+const PER_BOOK_KEYS = ['fontSize','fontFamily','lineHeight','letterSpacing','margin','theme','overrideStyles','paraIndent','paraIndentSize','paraSpacing','dictionaries','dictionaryOrder','bionicReading','skipOpenProgressCheck','skipSaveOnClose','spread'];
+
+// Deep-merge a saved prefs object onto DEFAULT_PREFS (missing keys/nested keys fall
+// back to defaults). Shared by loadPrefs() (source: localStorage) and the server pull
+// in init() (source: GET /api/settings) so the merge rules can't drift between the two.
+function mergePrefsWithDefaults(saved) {
+  const sb = saved.statusBar || {};
+  const legacyBtnPx = typeof saved.headerButtonSize === 'number' ? saved.headerButtonSize : null;
+  const btnBase = window.matchMedia('(max-width: 640px)').matches ? 44 : 36;
+  return {
+    ...DEFAULT_PREFS,
+    ...saved,
+    headerButtonScalePct: saved.headerButtonScalePct ?? (
+      legacyBtnPx != null && legacyBtnPx > 0
+        ? Math.min(225, Math.max(75, Math.round(legacyBtnPx / btnBase * 100)))
+        : DEFAULT_PREFS.headerButtonScalePct
+    ),
+    edgePadding: { ...DEFAULT_PREFS.edgePadding, ...(saved.edgePadding || {}) },
+    statusBar: {
+      ...DEFAULT_STATUS_BAR,
+      ...sb,
+      positions:       {
+        ...DEFAULT_STATUS_BAR.positions,
+        // On mobile with no saved br slot, show battery + connection by default.
+        ...(!('br' in (sb.positions || {})) && window.matchMedia('(max-width: 640px)').matches
+            ? { br: ['battery', 'online'] } : {}),
+        ...sb.positions,
+      },
+      showIcons:       { ...DEFAULT_STATUS_BAR.showIcons,       ...sb.showIcons },
+      bookProgressBar: { ...DEFAULT_STATUS_BAR.bookProgressBar, ...sb.bookProgressBar },
+      chapProgressBar: { ...DEFAULT_STATUS_BAR.chapProgressBar, ...sb.chapProgressBar },
+      clockFormat:     sb.clockFormat || DEFAULT_STATUS_BAR.clockFormat,
+    },
+  };
+}
 
 function loadPrefs() {
   try {
     const s = localStorage.getItem('br_reader_prefs');
     const saved = s ? JSON.parse(s) : {};
-    const sb = saved.statusBar || {};
-    const legacyBtnPx = typeof saved.headerButtonSize === 'number' ? saved.headerButtonSize : null;
-    const btnBase = window.matchMedia('(max-width: 640px)').matches ? 44 : 36;
-    const merged = {
-      ...DEFAULT_PREFS,
-      ...saved,
-      headerButtonScalePct: saved.headerButtonScalePct ?? (
-        legacyBtnPx != null && legacyBtnPx > 0
-          ? Math.min(225, Math.max(75, Math.round(legacyBtnPx / btnBase * 100)))
-          : DEFAULT_PREFS.headerButtonScalePct
-      ),
-      edgePadding: { ...DEFAULT_PREFS.edgePadding, ...(saved.edgePadding || {}) },
-      statusBar: {
-        ...DEFAULT_STATUS_BAR,
-        ...sb,
-        positions:       {
-          ...DEFAULT_STATUS_BAR.positions,
-          // On mobile with no saved br slot, show battery + connection by default.
-          ...(!('br' in (sb.positions || {})) && window.matchMedia('(max-width: 640px)').matches
-              ? { br: ['battery', 'online'] } : {}),
-          ...sb.positions,
-        },
-        showIcons:       { ...DEFAULT_STATUS_BAR.showIcons,       ...sb.showIcons },
-        bookProgressBar: { ...DEFAULT_STATUS_BAR.bookProgressBar, ...sb.bookProgressBar },
-        chapProgressBar: { ...DEFAULT_STATUS_BAR.chapProgressBar, ...sb.chapProgressBar },
-        clockFormat:     sb.clockFormat || DEFAULT_STATUS_BAR.clockFormat,
-      },
-    };
+    const merged = mergePrefsWithDefaults(saved);
     if (localStorage.getItem('br_library_theme') === 'eink') merged.eink = true;
     return merged;
   } catch { return { ...DEFAULT_PREFS, statusBar: { ...DEFAULT_STATUS_BAR } }; }
@@ -505,9 +652,11 @@ function loadBookPrefs(bookId) {
 function saveBookPrefs(bookId) {
   if (!bookId) return;
   try {
-    const global = loadPrefs();
+    // NOT loadPrefs() — see _globalPrefsSnapshot's own comment for why a live re-read here
+    // always failed to detect an override (persistPrefs writes the live, possibly
+    // already-book-specific `prefs` into the same global blob this would be re-reading).
     const overrides = {};
-    PER_BOOK_KEYS.forEach(k => { if (prefs[k] !== global[k]) overrides[k] = prefs[k]; });
+    PER_BOOK_KEYS.forEach(k => { if (prefs[k] !== _globalPrefsSnapshot[k]) overrides[k] = prefs[k]; });
     const all = JSON.parse(localStorage.getItem('br_book_prefs') || '{}');
     if (Object.keys(overrides).length) all[bookId] = overrides;
     else delete all[bookId];
@@ -543,12 +692,301 @@ function persistPrefs() {
   // The per-book layer is stored separately in br_book_prefs; on load, loadBookPrefs() re-applies
   // the overrides so global prefs naturally reflect the last used values for each book context.
   localStorage.setItem('br_reader_prefs', JSON.stringify(prefs));
+  localStorage.setItem('br_active_preset_id', JSON.stringify(activePresetId));
+  localStorage.setItem('br_active_preset_applied_at', JSON.stringify(activePresetAppliedAt));
   // Also track per-book overrides when a book is open
   if (currentBook?.id) saveBookPrefs(currentBook.id);
+  renderPresetsUi();
   apiFetch('/settings', {
     method: 'PUT',
     body: JSON.stringify({ reader_prefs: prefs }),
   }).catch(() => {});
+}
+
+// ── Reader-settings presets ────────────────────────────────────────────────────
+// Named snapshots of prefs (minus dictionary selection, which has its own global
+// sync + per-book-language-default logic), synced via the backend so the same list
+// is available on every device — see server/routes/settings.js.
+let presetsList = []; // [{id, name, prefs, updated_at}], cached in memory once fetched
+// True only after a presets API call has actually succeeded. Drives whether
+// Save/Update/Rename/Delete are offered — navigator.onLine/_isOnline is NOT enough here:
+// it only reflects whether a network interface is up, so "connected to WiFi but the
+// server is unreachable" (server down, wrong network, etc.) still reports online:true
+// and would let the user attempt — and fail — a save. This flag reflects the real thing.
+let _presetsReachable = false;
+
+function loadActivePresetId() {
+  try {
+    const raw = localStorage.getItem('br_active_preset_id');
+    return raw != null ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function loadActivePresetAppliedAt() {
+  try {
+    const raw = localStorage.getItem('br_active_preset_applied_at');
+    return raw != null ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function loadPresetsList() {
+  try {
+    presetsList = await apiFetch('/settings/presets');
+    _presetsReachable = true;
+  } catch {
+    _presetsReachable = false;
+    renderPresetsUi();
+    return presetsList;
+  }
+  // This device remembers it was using a preset — refresh to the latest saved version if it
+  // was edited from another device since applying it here, so this device stays consistent
+  // with that preset rather than a possibly-stale local copy of its content. Gated on
+  // updated_at actually having moved on: this runs on every book open (initSettingsUi →
+  // loadPresetsList), and reapplying unconditionally — as this used to — meant any live,
+  // unsaved edit (e.g. a status-bar layout tweak never explicitly re-saved into the preset)
+  // silently reverted the moment a different book was opened. Confirmed live as the cause of
+  // exactly that.
+  if (activePresetId != null) {
+    const preset = presetsList.find(p => p.id === activePresetId);
+    if (preset) {
+      // applyPreset() renders the presets UI itself (via persistPrefs()); when skipping it,
+      // do so here instead so a rename/addition elsewhere still shows up.
+      if (preset.updated_at !== activePresetAppliedAt) applyPreset(activePresetId);
+      else renderPresetsUi();
+    } else {
+      activePresetId = null; activePresetAppliedAt = null; persistPrefs(); // preset was deleted elsewhere
+    }
+  } else {
+    renderPresetsUi();
+  }
+  return presetsList;
+}
+
+function currentPrefsForPreset() {
+  const { dictionaries, dictionaryOrder, dictionaryMeta, ...rest } = prefs;
+  return rest;
+}
+
+async function saveCurrentAsPreset(name) {
+  const preset = await apiFetch('/settings/presets', {
+    method: 'POST',
+    body: JSON.stringify({ name, prefs: currentPrefsForPreset() }),
+  });
+  presetsList.push(preset);
+  activePresetId = preset.id;
+  activePresetAppliedAt = preset.updated_at ?? null; // prefs === preset content right now
+  persistPrefs();
+  return preset;
+}
+
+async function updatePreset(id) {
+  const preset = await apiFetch(`/settings/presets/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ prefs: currentPrefsForPreset() }),
+  });
+  const i = presetsList.findIndex(p => p.id === id);
+  if (i !== -1) presetsList[i] = preset;
+  // prefs === preset content right now (we just saved them into it) — record that so the
+  // next loadPresetsList() doesn't see its own bumped updated_at as "changed elsewhere".
+  if (id === activePresetId) activePresetAppliedAt = preset.updated_at ?? null;
+  renderPresetsUi();
+  return preset;
+}
+
+async function renamePreset(id, name) {
+  const preset = await apiFetch(`/settings/presets/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name }),
+  });
+  const i = presetsList.findIndex(p => p.id === id);
+  if (i !== -1) presetsList[i] = preset;
+  renderPresetsUi();
+  return preset;
+}
+
+async function deletePreset(id) {
+  await apiFetch(`/settings/presets/${id}`, { method: 'DELETE' });
+  presetsList = presetsList.filter(p => p.id !== id);
+  if (activePresetId === id) {
+    activePresetId = null;
+    activePresetAppliedAt = null;
+    persistPrefs();
+  } else {
+    renderPresetsUi();
+  }
+}
+
+// Apply a saved preset's settings onto the live prefs. Deliberately leaves this book's
+// per-book overrides (br_book_prefs) untouched — "Reset for this book"
+// (#btn-reset-book-prefs, see clearBookPrefs()) is the existing, explicit way to clear
+// those if the user wants the preset to fully take over a book with its own overrides.
+function applyPreset(id) {
+  const preset = presetsList.find(p => p.id === id);
+  if (!preset) return;
+  activePresetAppliedAt = preset.updated_at ?? null;
+  const { dictionaries, dictionaryOrder, dictionaryMeta, ...rest } = preset.prefs;
+
+  // bionicReading rewrites the chapter DOM at render time (word-prefix spans); like its own
+  // settings-panel toggle (see 'bionic-reading-toggle' handler), changing it only takes
+  // effect after a reload — detect that up front so we reload the same way the toggle does,
+  // instead of silently leaving the old rendering in place until the user notices and reloads.
+  const bionicChanging = 'bionicReading' in rest && !!rest.bionicReading !== !!prefs.bionicReading;
+
+  Object.assign(prefs, rest);
+  activePresetId = id;
+
+  if (bionicChanging) {
+    persistPrefs();
+    saveBionicReloadState();
+    location.reload();
+    return;
+  }
+
+  applyUiTheme();
+  // Sync column-layout state (two-column on/off, inter-column gap, continuous) from the
+  // preset's spread/margin BEFORE repaginating, so the single reapplyStyles() call below
+  // already paginates with the preset's layout in effect — otherwise it silently keeps
+  // whatever single/dual-page/continuous state the reader was in before the preset was
+  // applied. Set directly rather than via setLayout() to avoid re-paginating twice (once
+  // here, once in reapplyStyles) — _initPaginator's own self-correction (cxreader/index.js)
+  // still swaps the paginator class if continuous changed here.
+  if (_cxReader) {
+    _cxReader._twoColumn  = cxWantsTwoCol();
+    _cxReader._columnGap  = prefs.margin * 2;
+    _cxReader._continuous = isContinuousMode();
+    _cxReader.setPdfPaperInversion(prefs.pdfPaperInversion);
+  }
+  applyComicMargin();
+  reapplyStyles();
+  // Every other setting category has its own dedicated "apply" function, normally invoked
+  // only by that setting's own control in the settings panel. A preset can change all of them
+  // at once, so re-run each here too — otherwise they silently keep whatever value was in
+  // effect before the preset switch until the next full reload.
+  applyStatusBarStyles();
+  renderStatusSlots();
+  applyEdgePadding();
+  applyNavZones();
+  applyHeaderButtonSize();
+  applyHeaderBtnVisibility();
+  applyFloatNavBtn();
+  applyPageShadow();
+  applyAutoHide();
+  updateBookmarkBadge();
+  updateAnnotationBadge();
+  if (prefs.keepScreenOn) acquireWakeLock(); else releaseWakeLock();
+  applyVolumeKeyMode(prefs.volumeKeysEnabled);
+  void applyPortraitLock(prefs.lockPortrait);
+  syncSettingsUi();
+  persistPrefs();
+}
+
+// Render the preset list + active/"Custom" state into the Theme tab (#presets-list,
+// #btn-preset-update/rename/delete, #preset-custom-label). No-op before the settings
+// panel exists in the DOM (it always does — reader.html is static markup — but this
+// is also called from async callbacks that may resolve unusually early or late).
+function renderPresetsUi() {
+  const listEl = document.getElementById('presets-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  presetsList.forEach(p => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'preset-chip' + (p.id === activePresetId ? ' active' : '');
+    btn.textContent = p.name;
+    btn.addEventListener('click', () => applyPreset(p.id));
+    listEl.appendChild(btn);
+  });
+  document.getElementById('preset-custom-label')?.classList.toggle('hidden', activePresetId != null);
+  const hasActive = activePresetId != null;
+  document.getElementById('btn-preset-update')?.classList.toggle('hidden', !hasActive);
+  document.getElementById('btn-preset-rename')?.classList.toggle('hidden', !hasActive);
+  document.getElementById('btn-preset-delete')?.classList.toggle('hidden', !hasActive);
+
+  // Save/Update/Rename/Delete all need a server round trip (Save needs the server-assigned
+  // id back; the others must not silently no-op) — disable them until we've actually
+  // confirmed the presets API is reachable, rather than let the user hit a failed-request
+  // toast. Applying a preset stays enabled: it's a local merge of already-fetched data,
+  // degrading the same way any other settings change already does.
+  const disabled = !_presetsReachable;
+  for (const id of ['btn-preset-save', 'btn-preset-update', 'btn-preset-rename', 'btn-preset-delete']) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = disabled;
+    btn.title = disabled ? t('reader.preset_offline_hint') : '';
+  }
+}
+
+// Small text-input modal, matching the style of the existing shelf-rename modal
+// (library.js) — this codebase doesn't use native prompt()/confirm() anywhere.
+function presetNamePrompt(title, defaultValue = '') {
+  return new Promise(resolve => {
+    // Snapshot the safe-area vars before the input below is focused and opens the on-screen
+    // keyboard. On some mobile browsers, the keyboard show/hide cycle leaves a fresh
+    // env(safe-area-inset-*) re-probe reporting 0 for a while afterward (timing varies by
+    // device — a single delayed re-probe wasn't reliable), collapsing the status bar under
+    // the notch/camera cutout. Restoring these known-good values verbatim, instead of
+    // trusting a fresh measurement, sidesteps that unreliability entirely.
+    const root = document.documentElement;
+    const savedSat = root.style.getPropertyValue('--sat');
+    const savedSab = root.style.getPropertyValue('--sab');
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:340px">
+        <h2>${title}</h2>
+        <div class="form-group">
+          <input type="text" id="preset-name-input" maxlength="60" autofocus />
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="preset-name-cancel">${t('common.cancel')}</button>
+          <button class="btn btn-primary"   id="preset-name-save">${t('common.save')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+    const input = backdrop.querySelector('#preset-name-input');
+    input.value = defaultValue; // set as a property, not interpolated into the HTML string
+    const close = value => {
+      backdrop.remove();
+      resolve(value);
+      const restore = () => {
+        if (savedSat) root.style.setProperty('--sat', savedSat);
+        if (savedSab) root.style.setProperty('--sab', savedSab);
+        reapplyStyles();
+      };
+      // Several passes at increasing delays — keyboard-dismiss timing varies a lot across
+      // devices/browsers, so no single delay is reliable (matches the multi-probe settle
+      // strategy reader.html's own safe-area bootstrap already uses for the same reason).
+      [50, 300, 700, 1200].forEach(ms => setTimeout(restore, ms));
+    };
+    backdrop.querySelector('#preset-name-cancel').addEventListener('click', () => close(null));
+    backdrop.querySelector('#preset-name-save').addEventListener('click', () => close(input.value.trim() || null));
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') close(input.value.trim() || null); });
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) close(null); });
+    input.focus();
+    input.select();
+  });
+}
+
+// Small confirm modal, mirroring kosyncConfirm() below.
+function presetConfirm(msg) {
+  return new Promise(resolve => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" style="max-width:340px">
+        <p style="margin-bottom:1.5rem">${msg}</p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="preset-confirm-cancel">${t('common.cancel')}</button>
+          <button class="btn btn-primary"   id="preset-confirm-ok">${t('common.confirm')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+    const close = ok => { backdrop.remove(); resolve(ok); };
+    backdrop.querySelector('#preset-confirm-cancel').addEventListener('click', () => close(false));
+    backdrop.querySelector('#preset-confirm-ok').addEventListener('click',     () => close(true));
+    backdrop.addEventListener('click', e => { if (e.target === backdrop) close(false); });
+  });
 }
 
 function readBionicReloadState() {
@@ -610,6 +1048,66 @@ function spineIndexFromCfi(cfi) {
   if (!Number.isFinite(n)) return null;
   const idx = Math.floor(n / 2) - 1;
   return idx >= 0 ? idx : null;
+}
+
+// Parses a KOReader-style xpointer's leading /body/DocFragment[N] into Codexa's own 0-based
+// spine index — the exact inverse of koReaderXPointer()'s own N = currentSpineIndex + 1
+// generation (see that function). Returns null when the string isn't in that shape.
+function spineIndexFromXPointer(xpointer) {
+  const m = /^\/body\/DocFragment\[(\d+)\]/.exec(String(xpointer || ''));
+  return m ? parseInt(m[1], 10) - 1 : null;
+}
+
+// Compares a remote position against a local one, preferring chapter (spine index) over raw
+// percentage whenever both sides resolve to one. Percentage alone is unreliable across a
+// chapter boundary in a book with many short chapters — different KOReader-family engines
+// (crengine, Codexa's own byte-weighted one) don't measure "percent through the book" the
+// same way, so a whole chapter of real progress can be smaller than this comparison's own
+// tolerance (confirmed via a real report: a 152-chapter book where being one chapter ahead
+// was under 1%, well inside the existing "same position" threshold — Codexa then read that
+// gap as "no difference" and, worse, went on to push its own older position over the
+// genuinely newer remote one). A strictly later chapter is trusted as forward progress
+// regardless of what the percentages say; the finer, less reliable percentage comparison only
+// kicks in once both sides already agree on the chapter (or neither has a known spine index).
+// Returns 1 if remote is ahead, -1 if remote is behind, 0 if they're the same position.
+// Takes spine indices directly (nullable) — used as-is by the push-side high-water-mark
+// guards, which already track both sides as plain spine indices (see bestKnownRemoteSpineIdx).
+function compareChapterPositions(remoteIdx, remotePct, localIdx, localPct, tolerance) {
+  if (remoteIdx != null && typeof localIdx === 'number' && remoteIdx !== localIdx) {
+    return remoteIdx > localIdx ? 1 : -1;
+  }
+  const diff = (remotePct || 0) - (localPct || 0);
+  if (Math.abs(diff) <= tolerance) return 0;
+  return diff > 0 ? 1 : -1;
+}
+
+// Same as compareChapterPositions(), but takes the remote's raw KOSync xpointer string
+// instead of an already-parsed spine index — the shape every pull/restore path actually has
+// on hand (a live KOSync response), unlike the push-side guards above.
+function compareKosyncPosition(remotePct, remoteXPointer, localPct, localSpineIdx, tolerance) {
+  return compareChapterPositions(spineIndexFromXPointer(remoteXPointer), remotePct, localSpineIdx, localPct, tolerance);
+}
+
+// Navigates to a synced position, preferring the xpointer's chapter over percentage whenever
+// it resolves. goToPct()/seekToPercent() walk CODEXA'S OWN content-weighted percentage scale —
+// confirmed live (a real KOReader device) that this can land on a *different* chapter than the
+// one its own xpointer actually named, i.e. detection can correctly say "remote is ahead" and
+// the jump still ends up somewhere else. goToSpineItem() sidesteps the cross-engine percentage
+// mismatch entirely by going straight to the chapter the xpointer names — the same call the
+// search feature already uses for exact-location jumps, so it's a well-exercised path, not new
+// surface area. Lands on page 1 of that chapter (no percentage refinement within it, same
+// cross-engine reasoning); falls back to the previous percentage-only behaviour when the
+// remote has no parseable xpointer at all (e.g. some KOSync-compatible servers report
+// percentage only).
+async function navigateToSyncedPosition(percentage, xpointer) {
+  if (!_cxReader) return;
+  const spineIdx = spineIndexFromXPointer(xpointer);
+  if (spineIdx != null) {
+    await _cxReader.goToSpineItem(spineIdx);
+  } else if (percentage != null) {
+    await _cxReader.goToPct(percentage);
+    _cxReader.seekToPercent(percentage);
+  }
 }
 
 function bionicFocusLength(len) {
@@ -788,8 +1286,111 @@ function fontStyleFromFilename(f) {
   return (l.includes('italic') || l.includes('oblique')) ? 'italic' : 'normal';
 }
 
+let _fontBlobUrls = [];
+
+// Fetch a custom font file's raw bytes, network first, falling back to the Service
+// Worker's persistent font cache (BOOKS_CACHE in sw.js) read directly via the Cache
+// Storage API. Reading the cache here — once, from the top-level page — instead of
+// relying on a plain fetch() being intercepted by the SW matters because CXReader
+// renders each chapter into a fresh sandboxed blob: iframe, and whether such an
+// iframe's own fetches are actually routed through the controlling Service Worker is
+// inconsistent across WebView versions/chapters (observed: works for the first couple
+// of chapters offline, then silently stops). Resolving bytes up front sidesteps that.
+async function fetchFontBytes(filename) {
+  try {
+    const res = await fetch(`/user-fonts/${encodeURIComponent(filename)}`);
+    if (res.ok) return await res.arrayBuffer();
+  } catch { /* offline or network error — fall through to cache */ }
+  try {
+    if ('caches' in window) {
+      const cache = await caches.open('codexa-books-v2');
+      const cached = await cache.match(`/user-fonts/${encodeURIComponent(filename)}`);
+      if (cached) return await cached.arrayBuffer();
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function _setFontFaceStyle(css) {
+  fontFaceCSS = css;
+  let hostStyle = document.getElementById('_custom-font-faces');
+  if (!hostStyle) {
+    hostStyle = document.createElement('style');
+    hostStyle.id = '_custom-font-faces';
+    document.head.appendChild(hostStyle);
+  }
+  hostStyle.textContent = fontFaceCSS;
+}
+
+// Builds fontFaceCSS immediately, referencing each font by its live network URL —
+// no bytes are fetched by JS here, so this resolves synchronously fast and the
+// browser applies the font itself as soon as it paints text with it (exactly how
+// this worked before offline support was added). Kept as the initial/online path
+// so opening a book online is never delayed by the (slower) blob upgrade below.
+function _buildLiveFontCss(families) {
+  const cssLines = [];
+  for (const [family, ffiles] of Object.entries(families)) {
+    ffiles.forEach(f => {
+      // No format() hint: it's inferred from the file extension, but renamed/repackaged
+      // fonts often have an extension that doesn't match their actual sfnt data, and a
+      // wrong format() makes browsers silently drop the whole @font-face (the font then
+      // never applies and falls back to Georgia). Omitting it lets the engine sniff the
+      // bytes. Absolute origin URL so it also resolves inside CXReader's blob: iframe,
+      // whose document origin can be opaque on Android WebView.
+      cssLines.push(`@font-face {
+  font-family: "${family}";
+  src: url("${location.origin}/user-fonts/${encodeURIComponent(f)}");
+  font-weight: ${fontWeightFromFilename(f)};
+  font-style: ${fontStyleFromFilename(f)};
+}`);
+    });
+    customFonts.push({ label: family, value: `"${family}", Georgia, serif` });
+  }
+  return cssLines.join('\n');
+}
+
+// Re-resolves every custom font's bytes (network first, cache fallback) into blob:
+// URLs and swaps fontFaceCSS to reference those instead of the live network path.
+// Runs in the background, AFTER the fast live-URL CSS above is already showing the
+// right font, so it never delays the initial paint. It exists because each chapter
+// is rendered into a fresh sandboxed blob: iframe, and whether such an iframe's own
+// fetch() for an @font-face src is actually routed through the controlling Service
+// Worker is inconsistent across WebView versions/chapters (observed: works for the
+// first couple of chapters offline, then silently reverts to the default font).
+// Resolving bytes once here and handing every chapter a local blob: URL sidesteps
+// that entirely, including for chapters rendered fully offline.
+async function _upgradeFontsToBlobs(families) {
+  const cssLines = [];
+  const newCustomFonts = [];
+  for (const [family, ffiles] of Object.entries(families)) {
+    const results = await Promise.all(ffiles.map(async f => ({ f, bytes: await fetchFontBytes(f) })));
+    let hasFace = false;
+    for (const { f, bytes } of results) {
+      if (!bytes) continue; // neither network nor cache had it — skip this face
+      hasFace = true;
+      const blobUrl = URL.createObjectURL(new Blob([bytes]));
+      _fontBlobUrls.push(blobUrl);
+      cssLines.push(`@font-face {
+  font-family: "${family}";
+  src: url("${blobUrl}");
+  font-weight: ${fontWeightFromFilename(f)};
+  font-style: ${fontStyleFromFilename(f)};
+}`);
+    }
+    if (hasFace) newCustomFonts.push({ label: family, value: `"${family}", Georgia, serif` });
+  }
+  if (!cssLines.length) return; // nothing resolved — keep the live-URL CSS as-is
+  customFonts = newCustomFonts;
+  customFonts.sort((a, b) => a.label.localeCompare(b.label));
+  _setFontFaceStyle(cssLines.join('\n'));
+  if (_cxReader) reapplyStyles();
+  populateFontSelect();
+}
+
 async function loadCustomFonts() {
   customFonts = [];
+  _fontBlobUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch {} });
+  _fontBlobUrls = [];
   let files;
   try {
     files = await apiFetch('/fonts', { timeout: 8000 });
@@ -806,43 +1407,9 @@ async function loadCustomFonts() {
       if (!families[fam]) families[fam] = [];
       families[fam].push(f);
     });
-    const cssLines = [];
-    Object.entries(families).forEach(([family, ffiles]) => {
-      ffiles.forEach(f => {
-        // No format() hint: it's inferred from the file extension, but renamed/repackaged
-        // fonts often have an extension that doesn't match their actual sfnt data, and a
-        // wrong format() makes browsers silently drop the whole @font-face (the font then
-        // never applies and falls back to Georgia). Omitting it lets the engine sniff the
-        // bytes. Absolute origin URL so it also resolves inside CXReader's blob: iframe,
-        // whose document origin can be opaque on Android WebView.
-        cssLines.push(`@font-face {
-  font-family: "${family}";
-  src: url("${location.origin}/user-fonts/${encodeURIComponent(f)}");
-  font-weight: ${fontWeightFromFilename(f)};
-  font-style: ${fontStyleFromFilename(f)};
-}`);
-      });
-      customFonts.push({ label: family, value: `"${family}", Georgia, serif` });
-    });
-    fontFaceCSS = cssLines.join('\n');
+    _setFontFaceStyle(_buildLiveFontCss(families));
     customFonts.sort((a, b) => a.label.localeCompare(b.label));
-    let hostStyle = document.getElementById('_custom-font-faces');
-    if (!hostStyle) {
-      hostStyle = document.createElement('style');
-      hostStyle.id = '_custom-font-faces';
-      document.head.appendChild(hostStyle);
-    }
-    hostStyle.textContent = fontFaceCSS;
-    // Proactively fetch every custom font's bytes (not just whichever one is active), so the
-    // SW's network-first/cache-fallback handler for /user-fonts/ (public/sw.js) warms its cache
-    // for all of them. @font-face only triggers a fetch when text is actually painted with it —
-    // a font picked in Settings but never yet rendered on this device (or one whose cache got
-    // wiped by an app-update CACHE_VERSION bump) would otherwise stay uncached until the next
-    // time it's used online, and silently fall back to the default font offline in the meantime
-    // (a failed @font-face fetch just drops that font-face, no error surfaces).
-    if (navigator.onLine) {
-      files.forEach(f => { fetch(`/user-fonts/${encodeURIComponent(f)}`).catch(() => {}); });
-    }
+    _upgradeFontsToBlobs(families).catch(() => {});
   } catch (err) {
     warn('[reader] Custom fonts not loaded:', err.message);
   }
@@ -906,7 +1473,20 @@ h1, h2, h3, h4, h5, h6 {
 /* cx-fonts-end */
 html {
   background: ${theme.bg} !important;
+  /* Thin, theme-coloured scrollbar — only actually visible in Continuous mode (paginated
+     modes are overflow:hidden, so this is harmless dead weight there). Firefox's standard
+     scrollbar-color/-width; WebKit/Blink's own ::-webkit-scrollbar-* pseudo-elements, since
+     there's no unprefixed equivalent yet. */
+  scrollbar-width: thin;
+  scrollbar-color: ${hexToRgba(theme.text, 0.35)} transparent;
 }
+html::-webkit-scrollbar { width: 8px; }
+html::-webkit-scrollbar-track { background: transparent; }
+html::-webkit-scrollbar-thumb {
+  background: ${hexToRgba(theme.text, 0.35)};
+  border-radius: 4px;
+}
+html::-webkit-scrollbar-thumb:hover { background: ${hexToRgba(theme.text, 0.55)}; }
 body {
   background:     ${theme.bg} !important;
   color:          ${theme.text} !important;
@@ -940,7 +1520,7 @@ ${_supportsWhere
   ? ':where(p) { margin-top: 0; margin-bottom: 0.3em; }'
   : 'p { margin-top: 0; margin-bottom: 0.3em; }'}
 ${fontOverrides}
-img:not(.codexa-dropcap-img) {
+img:not(.codexa-dropcap-img):not(a img) {
   max-width:   100% !important;
   max-height:  75vh !important;
   width:       auto !important;
@@ -949,6 +1529,15 @@ img:not(.codexa-dropcap-img) {
   display:     block !important;
   margin-left: auto !important;
   margin-right: auto !important;
+  mix-blend-mode: multiply !important;
+}
+/* Images wrapped in a link (footnote/note markers, inline icons) are almost always meant
+   to sit inline with the surrounding text, sized by the book's own CSS — unlike standalone
+   illustrations, don't force them to display:block or override their width/height. */
+a img:not(.codexa-dropcap-img) {
+  max-width:  100% !important;
+  max-height: 75vh !important;
+  object-fit: contain !important;
   mix-blend-mode: multiply !important;
 }
 figure { background: transparent !important; background-color: transparent !important; }
@@ -1085,6 +1674,11 @@ function fixDropCaps(doc) {
   });
 }
 
+// White-background image detection/knockout itself lives in img-bg-fix.js (imported
+// above) — it's shared with cxreader/renderer.js, which needs to run it BEFORE the
+// chapter's e-ink CSS is baked into the initial HTML. See the big comment at the top of
+// that file for why.
+
 function injectIntoContents(contents) {
   if (!contents?.document) return;
   const doc = contents.document;
@@ -1109,6 +1703,16 @@ function injectIntoContents(contents) {
     }
     doc.documentElement.lang = prefs.hyphenLang;
   }
+  // stripImageWhiteBackgrounds runs before #br-custom-styles is (re)built below, so that
+  // on any chapter NOT already handled by ChapterRenderer's own pre-render pass (see the
+  // big comment at the top of img-bg-fix.js) it still sees the book's own CSS rather than
+  // our e-ink `body * { background-image: none !important }` reset. In practice the
+  // renderer's pre-render pass already does the real work for e-ink chapters (via the
+  // dataset.brImgBgFixed guard, this call becomes a no-op for those) — this call is what
+  // handles non-e-ink themes, and is a safety net for any chapter that reaches here
+  // without having gone through the renderer's pass.
+  stripImageWhiteBackgrounds(doc, prefs.eink);
+
   let el = doc.getElementById('br-custom-styles');
   const newCss = buildEpubCss();
   if (!el) {
@@ -1273,11 +1877,20 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     acquireWakeLock();
     scheduleWakeSync();
-    // Rotation on hide (below) always tries to start a fresh session right away, but that start
-    // call isn't guaranteed to finish if the page was actually closing rather than just
-    // backgrounding — re-establish one here if it didn't, so reading after a wake isn't silently
-    // untracked until the next checkpoint.
-    if (currentBook && isReady && !statsSessionId) startStatsSession(currentBook.id);
+    // Belt-and-suspenders: startStatsSession is purely local now (no network call, so it can't
+    // fail to set sessionChunkStartTs the way the old server-assigned id could), but re-establish
+    // one anyway if something upstream left tracking off — cheap and harmless either way.
+    if (currentBook && isReady && !sessionChunkStartTs) startStatsSession(currentBook.id);
+    if (navigator.onLine) flushSessionCheckpoints().catch(() => {});
+    // Android can reset its "hidden system bars" state on screen-off, requiring
+    // MainActivity.onWindowFocusChanged to reassert immersive mode once the screen wakes back
+    // up (see Android/.../MainActivity.kt) — while that's settling, the top/bottom safe-area
+    // inset can end up stale or wrong. Re-probe a couple of times to catch the value once the
+    // bars have actually finished re-hiding, same margin as the post-activation probe in init().
+    if (isAndroidApp() && window.__applyInsets) {
+      setTimeout(() => window.__applyInsets(false), 400);
+      setTimeout(() => window.__applyInsets(true), 900);
+    }
   }
   if (document.visibilityState === 'hidden') {
     writeInterruptedSession();
@@ -1326,8 +1939,14 @@ function applyUiTheme() {
     document.documentElement.style.setProperty('--reader-header-border',      text);
     document.documentElement.style.setProperty('--reader-header-text',        text);
     document.documentElement.style.setProperty('--reader-header-text-muted',  text);
-    if (safeAreaFill) safeAreaFill.style.background = bg;
+    // Comics are always black letterboxed regardless of theme (see the .comic-mode #epub-viewer
+    // rule in reader.css) — safe-area-fill is a separate element outside .reader-layout (for
+    // the translucent-header-over-notch case), so it needs the same override applied directly
+    // here rather than via that CSS rule, or the notch/camera-hole strip stays theme-coloured
+    // even with a comic open. Confirmed live on a phone with a top safe area.
+    if (safeAreaFill) safeAreaFill.style.background = isImmersivePageMode() ? '#000' : bg;
     epubViewer.style.background = bg;
+    syncStatusBarAppearance(bg);
   } else {
     document.documentElement.removeAttribute('data-reader-eink');
     // Apply full reader-theme palette to all shell UI (panels, sidebars, inputs …)
@@ -1357,8 +1976,12 @@ function applyUiTheme() {
     document.documentElement.style.setProperty('--reader-header-text',        theme.text);
     document.documentElement.style.setProperty('--reader-header-text-muted',  headerMuted);
     // Safe-area fill: solid (opaque) page colour so the translucent header doesn't leak through
-    if (safeAreaFill) safeAreaFill.style.background = theme.bg;
+    // — except for comics, which are always black letterboxed regardless of theme (see the
+    // .comic-mode #epub-viewer rule in reader.css); safe-area-fill sits outside .reader-layout
+    // so it needs the same override applied directly here too.
+    if (safeAreaFill) safeAreaFill.style.background = isImmersivePageMode() ? '#000' : theme.bg;
     epubViewer.style.background = theme.bg;
+    syncStatusBarAppearance(ui.bg);
   }
   applyPageShadow();
   // Tag body with current theme name so CSS can target per-theme overrides.
@@ -1419,6 +2042,37 @@ function attachIframeKeyboard(contents) {
   }, { passive: true });
 }
 
+// Word-boundary detection shared by long-press / right-click / double-click "look up this
+// word". CJK scripts (Chinese, Japanese) don't separate words with spaces, so simply expanding
+// through consecutive Unicode letters (as the fallback below does) swallows an entire
+// punctuation-delimited clause as "one word" instead of stopping at a real word boundary.
+// Intl.Segmenter's dictionary-based word breaking (supported on Android/Chrome and Safari 14.1+)
+// gives real boundaries for those scripts; everything else (Latin, Korean — already
+// space-delimited) keeps using the cheaper regex walk, unchanged.
+let _cjkSegmenter = null;
+const CJK_NO_SPACE_RE = /[\u3400-\u9fff\u3040-\u30ff\uf900-\ufaff]/; // Han ideographs + Hiragana/Katakana
+
+function _resolveWordBounds(text, offset) {
+  const ch = text[offset] ?? text[offset - 1];
+  if (ch && CJK_NO_SPACE_RE.test(ch) && typeof Intl?.Segmenter === 'function') {
+    try {
+      _cjkSegmenter ||= new Intl.Segmenter(undefined, { granularity: 'word' });
+      for (const s of _cjkSegmenter.segment(text)) {
+        const end = s.index + s.segment.length;
+        if (offset >= s.index && offset < end) {
+          // isWordLike is false for punctuation/whitespace segments — treat like landing
+          // on punctuation with the regex walk below (empty word, no lookup).
+          return s.isWordLike ? { start: s.index, end } : { start: offset, end: offset };
+        }
+      }
+    } catch { /* fall through to the generic boundary walk below */ }
+  }
+  let s = offset, e = offset;
+  while (s > 0 && /[\p{L}\p{N}'’\-]/u.test(text[s - 1])) s--;
+  while (e < text.length && /[\p{L}\p{N}'’\-]/u.test(text[e])) e++;
+  return { start: s, end: e };
+}
+
 // Inject long-press (mobile) and right-click (desktop) dictionary lookup
 // into each epub.js iframe page. Uses postMessage to ask the host to show the popup.
 function attachIframeDictionary(contents) {
@@ -1426,12 +2080,18 @@ function attachIframeDictionary(contents) {
   const doc = contents.document;
   const win = contents.window;
   const coarsePointer = !!win.matchMedia?.('(pointer: coarse)')?.matches;
-  let pressTimer = null, pressX = 0, pressY = 0, selectionTimer = null, lastSelectionWord = '', lastSelectionTs = 0;
+  let pressTimer = null, pressX = 0, pressY = 0;
 
   // iOS: suppress native callout and text-selection takeover inside epub iframes.
   if (isIOS) {
     const iosStyle = doc.createElement('style');
-    iosStyle.textContent = '* { -webkit-touch-callout: none !important; -webkit-user-select: none !important; user-select: none !important; }';
+    // -webkit-tap-highlight-color also needs killing here: the outer app disables it globally
+    // (reader.css/main.css), but that CSS never reaches this iframe's own document. Without it,
+    // WebKit falls back to its default translucent grey/blue "tap flash" on whichever ancestor
+    // owns the touch listeners that fire our long-press timer below (effectively the whole
+    // page here) — it washes the entire visible page a different shade the instant a long-press
+    // is held, on top of (and unrelated to) our own small <mark> word highlight.
+    iosStyle.textContent = '* { -webkit-touch-callout: none !important; -webkit-user-select: none !important; user-select: none !important; -webkit-tap-highlight-color: transparent !important; }';
     (doc.head || doc.documentElement).appendChild(iosStyle);
   }
 
@@ -1453,9 +2113,7 @@ function attachIframeDictionary(contents) {
     }
     if (!node || node.nodeType !== 3) return '';
     const text = node.textContent;
-    let s = offset, e = offset;
-    while (s > 0 && /[\p{L}\p{N}'\u2019\-]/u.test(text[s - 1])) s--;
-    while (e < text.length && /[\p{L}\p{N}'\u2019\-]/u.test(text[e])) e++;
+    const { start: s, end: e } = _resolveWordBounds(text, offset);
     return text.slice(s, e).replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
   }
 
@@ -1477,9 +2135,7 @@ function attachIframeDictionary(contents) {
     }
     if (!node || node.nodeType !== 3) return null;
     const text = node.textContent;
-    let s = offset, e = offset;
-    while (s > 0 && /[\p{L}\p{N}'\u2019\-]/u.test(text[s - 1])) s--;
-    while (e < text.length && /[\p{L}\p{N}'\u2019\-]/u.test(text[e])) e++;
+    const { start: s, end: e } = _resolveWordBounds(text, offset);
     const word = text.slice(s, e).replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
     if (!word) return null;
     try {
@@ -1490,40 +2146,60 @@ function attachIframeDictionary(contents) {
     } catch { return null; }
   }
 
-  function triggerSelectionLookup() {
-    const sel = win.getSelection?.();
-    const raw = (sel?.toString() || '').trim();
-    if (!raw) return;
-    const word = raw.split(/\s+/)[0].replace(/^['\u2019\-]+|['\u2019\-]+$/g, '').trim();
-    if (!word) return;
-    const now = Date.now();
-    if (word === lastSelectionWord && now - lastSelectionTs < 900) return;
-    lastSelectionWord = word;
-    lastSelectionTs = now;
-    window.parent.postMessage({ type: 'dict-lookup', word }, '*');
-  }
-
   doc.addEventListener('touchstart', (e) => {
+    // iOS: the iosStyle block above (user-select/touch-callout: none) only suppresses the
+    // *outcome* of WebKit's native long-press-to-select gesture, not the gesture recognizer
+    // itself — it still runs on every touch-and-hold, racing our own 450ms timer below. Most
+    // of the time the CSS wins and nothing shows, but the race is genuinely unreliable: it can
+    // also partially win (grabbing some native selection range, painted with the browser's
+    // default ::selection background across the whole visible page — the "whole background
+    // tints" report) or fully win (the native Copy/Select All/Translate callout). Android is
+    // deliberately left alone here (see the !isIOS branch below — its native long-press IS the
+    // selection mechanism this app relies on there), but iOS gets no benefit from that gesture
+    // at all since it never reaches the OS UI cleanly, so killing it outright with an explicit
+    // preventDefault() is more reliable than the CSS alone. Nothing else on this document needs
+    // the default touchstart behavior: CXReader pagination is `html{overflow:hidden}` + JS
+    // transforms (no native scroll to preserve), and preventDefault() on touchstart doesn't
+    // suppress the synthetic click taps/nav-zones/footnotes rely on (only touchend would).
+    if (isIOS && e.cancelable) e.preventDefault();
     const t = e.touches[0];
     pressX = t.clientX;
     pressY = t.clientY;
     pressTimer = setTimeout(() => {
       pressTimer = null;
       suppressNextTap = true;
+
+      // Long-press on an existing highlight/annotation → open its edit sheet instead of
+      // starting a new selection, on every platform.
+      const pointEl = doc.elementFromPoint(pressX, pressY);
+      const existingMark = pointEl?.closest?.('mark[data-annot-id]');
+      if (existingMark) {
+        const annotId = parseInt(existingMark.dataset.annotId);
+        if (!isNaN(annotId)) window.parent.postMessage({ type: 'annotation-click', id: annotId }, '*');
+        return;
+      }
+
+      if (!isIOS) {
+        // Android/other touch platforms keep native text selection enabled (see the
+        // contextmenu/dblclick handlers below and attachIframeAnnotation), so let the OS's
+        // own long-press-to-select run its course here instead of guessing a word/compound
+        // boundary ourselves — it's the same engine desktop double-click uses, gets CJK
+        // compound boundaries right (which our own Intl.Segmenter-based guess sometimes
+        // doesn't), and stays draggable to extend/shrink afterward. We never preventDefault()
+        // here, so there's nothing to hand back. attachIframeAnnotation's selectionchange/
+        // touchend listeners (same doc) pick up the settled — and any later re-adjusted —
+        // selection and open the bottom toolbar. Nothing here fires a dictionary lookup
+        // automatically; only that toolbar's explicit dict button (and desktop's
+        // dblclick/right-click below) do.
+        return;
+      }
+
+      // iOS disables native selection entirely (see the iosStyle block above), so there's no
+      // OS gesture to defer to — build the selection ourselves from the tapped word/compound
+      // boundary (same Intl.Segmenter-aware lookup getWordAtPoint above uses).
       const result = getWordRangeAtPoint(pressX, pressY);
       if (!result) return;
       const { word, range } = result;
-      // If the tapped word is inside an existing annotation mark, open its edit sheet
-      const _tappedNode = range.commonAncestorContainer;
-      const _existingMark = (_tappedNode.nodeType === 3 ? _tappedNode.parentElement : _tappedNode)
-        ?.closest?.('mark[data-annot-id]');
-      if (_existingMark) {
-        const _annotId = parseInt(_existingMark.dataset.annotId);
-        if (!isNaN(_annotId)) {
-          window.parent.postMessage({ type: 'annotation-click', id: _annotId }, '*');
-          return;
-        }
-      }
       win.getSelection?.()?.removeAllRanges?.();
       let cfiRange = '';
       if (prefs.bionicReading) {
@@ -1545,7 +2221,7 @@ function attachIframeDictionary(contents) {
         window.parent.postMessage({ type: 'dict-lookup', word }, '*');
       }
     }, 450);
-  }, { passive: true });
+  }, { passive: false });
 
   doc.addEventListener('touchmove', (e) => {
     if (Math.abs(e.touches[0].clientX - pressX) > 18 || Math.abs(e.touches[0].clientY - pressY) > 18) {
@@ -1559,27 +2235,20 @@ function attachIframeDictionary(contents) {
 
   doc.addEventListener('touchcancel', () => { clearTimeout(pressTimer); pressTimer = null; }, { passive: true });
 
-  if (coarsePointer && !isIOS) {
-    // Fire dict lookup on pointer release, not during drag. selectionchange fires continuously
-    // while the user drags to select text (triggering lookup mid-drag); mouseup/touchend only
-    // fires when the user stops, which is the moment they expect the lookup.
-    const _onSelEnd = () => {
-      clearTimeout(selectionTimer);
-      selectionTimer = setTimeout(triggerSelectionLookup, 120);
-    };
-    doc.addEventListener('mouseup', _onSelEnd);
-    doc.addEventListener('touchend', _onSelEnd, { passive: true });
-  }
-
-  doc.addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    const sel     = win.getSelection?.();
-    const selText = sel?.toString().trim();
-    const word    = selText ? selText.split(/\s+/)[0] : getWordAtPoint(e.clientX, e.clientY);
-    if (word) window.parent.postMessage({ type: 'dict-lookup', word }, '*');
-  });
-
   if (!coarsePointer) {
+    // contextmenu (right-click) is desktop-only: Android/mobile browsers also fire this
+    // event once a long-press finishes selecting text (their equivalent of a right-click),
+    // which — now that long-press is left to run native selection, see touchstart above —
+    // made every touch selection auto-trigger a dictionary lookup here. Left gated to a real
+    // right-click, matching the dblclick gate right below.
+    doc.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const sel     = win.getSelection?.();
+      const selText = sel?.toString().trim();
+      const word    = selText ? selText.split(/\s+/)[0] : getWordAtPoint(e.clientX, e.clientY);
+      if (word) window.parent.postMessage({ type: 'dict-lookup', word }, '*');
+    });
+
     doc.addEventListener('dblclick', (e) => {
       // Skip if the mouse button is still held — user is double-click-dragging to extend a
       // selection, not looking up a word. Let mouseup → annotation toolbar handle that case.
@@ -1766,9 +2435,27 @@ function attachIframeAnnotation(contents) {
   function onSelectionEnd(e) {
     if (e?.button !== undefined && e.button !== 0) return; // ignore right/middle clicks
     const sel = doc.getSelection();
-    if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) {
+      // Selection was cleared — e.g. the user tapped elsewhere in the book to dismiss it
+      // (a plain tap collapses any active selection on its own). Close the toolbar to match,
+      // instead of leaving it stranded open with nothing selected underneath it.
+      //
+      // iOS is excluded: its long-press flow (attachIframeDictionary's isIOS branch) never
+      // populates a real window Selection at all — it force-disables user-select and instead
+      // builds its own <mark> highlight from a synthetic Range, so doc.getSelection() here is
+      // permanently collapsed. Without this guard, the very next touchend after opening the
+      // toolbar (including the long-press gesture's own finger-lift) would immediately fire
+      // this branch and close the toolbar a moment after it appeared — text looked "selected"
+      // for an instant, then deselected itself. Dismissal-by-tapping-elsewhere is already
+      // covered on iOS by the full-screen #annot-backdrop overlay (it sits above the iframe
+      // whenever the toolbar is open), so skipping this message there loses nothing.
+      if (!isIOS) window.parent.postMessage({ type: 'annotation-deselect' }, '*');
+      return;
+    }
     const text = sel.toString().trim();
-    if (text.length < 2) return;
+    // A single character is a real, complete word for CJK scripts (e.g. "书" = book) — only
+    // reject a genuinely empty selection, not a short one.
+    if (!text) return;
     let cfiRange;
     if (prefs.bionicReading) {
       cfiRange = cfiFromBionicRange(sel.getRangeAt(0), doc, contents);
@@ -1783,6 +2470,12 @@ function attachIframeAnnotation(contents) {
   }
   doc.addEventListener('mouseup', onSelectionEnd);
   doc.addEventListener('touchend', () => setTimeout(() => onSelectionEnd(), 50));
+  // Keep the toolbar's underlying cfiRange/text in sync while the user keeps adjusting a
+  // selection via native drag handles after it first settles — handle drags are native OS
+  // UI, not synthetic DOM touch events, so touchend above never fires for them, but the
+  // Selection object (and this event) still updates. onSelectionEnd's own debounce coalesces
+  // the bursts of change events a drag produces into one update.
+  doc.addEventListener('selectionchange', () => onSelectionEnd());
 }
 
 // Generate a CFI compatible with the non-bionic DOM, even when bionic is currently active.
@@ -2165,6 +2858,7 @@ function renderAnnotationList() {
       _clearNavPreJumps();
       if (currentCfi) {
         preAnnotationCfi = currentCfi;
+        preAnnotationPage = currentChapPage;
         annotationBackBtn.style.display   = '';
         annotationAcceptBtn.style.display = '';
       }
@@ -2247,6 +2941,15 @@ function estimateChapPages(spineIndex) {
 
 // Estimated book pages
 function estimateBookTotal() {
+  // CBZ/PDF: every spine item IS one real page (no reflow, no estimation needed) — the weight-
+  // calibration estimate below is built for EPUB's reflowable text, where a chapter's real page
+  // count genuinely isn't known until it's actually paginated. Applying that same estimator to
+  // a CBZ/PDF's uniform (weight=1) spine compounded badly: one visited "chapter" (one page)
+  // getting its real pageCount cached — for continuous mode, misread from the scroll paginator's
+  // whole-document scrollHeight/viewportHeight ratio, not an actual per-page count — then got
+  // applied as the per-weight-unit ratio across every other page too, inflating the total by
+  // roughly that same factor (confirmed live: a 220-page comic showing 25520 "book pages").
+  if (isImmersivePageMode()) return Math.max(1, _cxReader?.spine?.length || 1);
   const len = _cxReader?.spine?.length || 1;
   let total = 0;
   for (let i = 0; i < len; i++) total += estimateChapPages(i);
@@ -2254,6 +2957,9 @@ function estimateBookTotal() {
 }
 
 function estimateBookPage() {
+  // See estimateBookTotal — currentSpineIndex already IS the real 0-based page number for
+  // CBZ/PDF, no accumulation needed.
+  if (isImmersivePageMode()) return currentSpineIndex + 1;
   let pages = 0;
   for (let i = 0; i < currentSpineIndex; i++) pages += estimateChapPages(i);
   return pages + currentChapPage;
@@ -2277,16 +2983,15 @@ function computeStatValue(id) {
     }
     case 'pagesLeftChap': {
       if (currentChapTotal <= 0) return '';
-      // Single-page: count the current page itself, so the last page reads "1 left"
-      //   and earlier pages count down (page 1 of a 2-page chapter shows 2).
-      // Two-page: the left page is already read; count the visible right page and
-      //   beyond. A lone left-only last spread (endPage===0) still gets +1 to show 1.
-      const _bonus = currentIsTwoPage ? (currentEndPage === 0 ? 1 : 0) : 1;
-      return String(Math.max(1, currentChapTotal - currentChapPage + _bonus));
+      // The last page of the chapter reads "0 left" (not floored to 1 — reversed per explicit
+      // request; the old "never show 0" convention made the last page look like there was
+      // still a page to go, and disagreed with pagesLeftBook, which never had that floor).
+      // Two-page: the left page is already read, so only the visible right page and beyond
+      // count — unaffected by this change, that case was already bonus-free.
+      return String(Math.max(0, currentChapTotal - currentChapPage));
     }
     case 'pagesLeftBook': {
-      const _tpBonus = currentIsTwoPage && currentEndPage === 0 ? 1 : 0;
-      return String(Math.max(0, estimateBookPagesLeft() + _tpBonus));
+      return String(Math.max(0, estimateBookPagesLeft()));
     }
     case 'pctChapter':
       return currentChapTotal > 0 ? Math.round((currentChapPage / currentChapTotal) * 100) + '%' : '';
@@ -2294,14 +2999,11 @@ function computeStatValue(id) {
       return Math.round(currentPct * 100) + '%';
     case 'timeLeftChap': {
       if (currentChapTotal <= 0) return formatEta(0);
-      // Mirror pagesLeftChap: single-page counts the current page, two-page counts
-      // from the left page (with the lone last-spread +1).
-      const _bonus = currentIsTwoPage ? (currentEndPage === 0 ? 1 : 0) : 1;
-      return formatEta(Math.max(1, currentChapTotal - currentChapPage + _bonus));
+      // Mirrors pagesLeftChap — see its comment.
+      return formatEta(Math.max(0, currentChapTotal - currentChapPage));
     }
     case 'timeLeftBook': {
-      const _tpBonus = currentIsTwoPage && currentEndPage === 0 ? 1 : 0;
-      return formatEta(Math.max(0, estimateBookPagesLeft() + _tpBonus));
+      return formatEta(Math.max(0, estimateBookPagesLeft()));
     }
     case 'currentTime': {
       const now = new Date();
@@ -2510,13 +3212,25 @@ function applyHeaderBtnVisibility() {
     if (el) el.style.display = visible ? '' : 'none';
   };
   const hasAnnotations = annotationsCache.length > 0;
-  const isCbz = !!_cxReader?._isCbz;
+  // Applies to both CBZ and PDF — neither has a text layer, so dictionary/annotations/search
+  // (which all need selectable text) stay disabled for both, same as the plan's stated scope.
+  const isCbz = isImmersivePageMode();
   set('btn-annotations',  !isCbz && (prefs.headerBtnAnnotations || hasAnnotations));
   set('btn-search',       !isCbz && prefs.headerBtnSearch);
   set('btn-jump-pct',     prefs.headerBtnPercentage);
   set('btn-sync',         prefs.headerBtnSync);
   set('btn-sleep-timer',  prefs.headerBtnSleepTimer);
   set('btn-fullscreen',   prefs.headerBtnFullscreen);
+}
+
+// Comic/PDF continuous mode honoring the reader's margin setting (see .cx-cbz-continuous-wrap
+// in reader.css). Paginated comic pages already respect the viewport naturally (object-fit:
+// contain shrinks/centers to fit both dimensions); continuous mode stacks full-width images
+// with nothing constraining width, which looks fine on a phone but stretches uncomfortably wide
+// on a large desktop monitor — margin (already a familiar per-book setting for EPUB) reins that
+// back in, with 0px preserving the original edge-to-edge behavior.
+function applyComicMargin() {
+  document.documentElement.style.setProperty('--cx-comic-margin', prefs.margin + 'px');
 }
 
 // Apply CSS vars for edge inset (curved phone screens)
@@ -2529,12 +3243,19 @@ function applyEdgePadding() {
   root.style.setProperty('--edge-pad-left',   p.left   + 'px');
   // For CXReader: re-measure how much the status bars overlap the viewer (their position
   // shifts when edge-pad vars change), then re-apply the iframe inset and repaginate.
-  if (_cxReader) {
-    setTimeout(() => {
-      _cxMeasureViewerInset();
-      _cxReader.reapplyCss(buildEpubCss());
-    }, 30);
-  }
+  _cxRemeasureAndRepaginate();
+}
+
+// Re-measure the space #sb-top/#sb-bottom reserve and repaginate the open book. Call after
+// any change that can alter their rendered height (edge padding, status bar font size,
+// separators, item layout) — otherwise book content keeps the stale inset from the last
+// measurement (taken once, the first time a chapter renders) until a full reload.
+function _cxRemeasureAndRepaginate() {
+  if (!_cxReader) return;
+  setTimeout(() => {
+    _cxMeasureViewerInset();
+    _cxReader.reapplyCss(buildEpubCss());
+  }, 30);
 }
 
 // Apply CSS variables for status bar font/size/style
@@ -2572,6 +3293,8 @@ function applyStatusBarStyles() {
 
   // Progress bars
   applyProgressBarLayout();
+
+  _cxRemeasureAndRepaginate();
 }
 
 function applyProgressBarLayout() {
@@ -2639,24 +3362,43 @@ function buildChapterMarkers() {
   const cxSpine    = _cxReader?._book?.spine;
   const spineTotal = cxSpine?.length || 1;
 
-  topLevel.forEach(({ href }, i) => {
+  // Resolve each entry's spine index once, up front — several entries can share one index (a
+  // book that packs many chapters as anchors inside one shared physical file rather than one
+  // file per chapter; see resolveActiveTocEntry). Without this, every one of them collapsed
+  // onto the exact same marker position (the file's own boundary), confirmed live as a book
+  // with ~30 such chapters showing no distinguishable markers for any of them beyond that one
+  // shared tick. Anchor precision isn't available here (that needs the chapter actually
+  // rendered — see pageForAnchor — which markers, built once up front for the whole book,
+  // can't afford for every chapter), so entries sharing a file are spread evenly across that
+  // file's own pct span instead — an approximation, but far better than one shared tick.
+  const idxOf = ({ href }) => {
+    if (!cxSpine?.length) return -1;
+    const hrefLow  = (href || '').split('#')[0].toLowerCase();
+    const hrefFile = hrefLow.split('/').pop();
+    return cxSpine.findIndex(s => {
+      // Prefer absPath (fully resolved) for matching; fall back to raw href
+      const sh = (s.absPath || s.href || '').split('#')[0].toLowerCase();
+      return sh === hrefLow || sh.split('/').pop() === hrefFile;
+    });
+  };
+  const idxs = topLevel.map(idxOf);
+  const groups = new Map(); // spine idx -> topLevel positions sharing it, in document order
+  idxs.forEach((idx, i) => {
+    if (idx <= 0) return;
+    if (!groups.has(idx)) groups.set(idx, []);
+    groups.get(idx).push(i);
+  });
+
+  topLevel.forEach((_, i) => {
     if (i === 0) return; // first chapter starts at 0% — no marker needed
-    const hrefBase = (href || '').split('#')[0];
-    let pct = null;
-
-    // Spine-index ratio from the CXReader spine.
-    if (cxSpine?.length) {
-      const hrefLow  = hrefBase.toLowerCase();
-      const hrefFile = hrefLow.split('/').pop();
-      const idx = cxSpine.findIndex(s => {
-        // Prefer absPath (fully resolved) for matching; fall back to raw href
-        const sh = (s.absPath || s.href || '').split('#')[0].toLowerCase();
-        return sh === hrefLow || sh.split('/').pop() === hrefFile;
-      });
-      if (idx > 0) pct = idx / spineTotal;
-    }
-
-    if (pct == null || pct <= 0.001 || pct >= 0.999) return;
+    const idx = idxs[i];
+    if (idx <= 0) return;
+    const group = groups.get(idx) || [i];
+    const k = group.indexOf(i);
+    const spanStart = idx / spineTotal;
+    const spanEnd   = (idx + 1) / spineTotal;
+    const pct = spanStart + (k / group.length) * (spanEnd - spanStart);
+    if (pct <= 0.001 || pct >= 0.999) return;
     const marker = document.createElement('div');
     marker.className = 'sb-chap-marker';
     marker.style.left = (pct * 100).toFixed(2) + '%';
@@ -2716,9 +3458,15 @@ function applyAutoHide() {
   }
 }
 
-// Show header when mouse enters the thin sensor zone at very top of page
+// Show header when mouse enters the thin sensor zone at very top of page. Comic mode always
+// wants this on desktop (chrome is forced-hidden there regardless of the user's own
+// autoHideHeader preference), so it's an extra condition here rather than folded into
+// prefs.autoHideHeader — but touch does NOT get this in comic mode: mobile reveals chrome
+// exclusively via the up/down swipe cycle in handleTouchEnd (comicSwipeChrome) now, not by
+// tapping an edge sensor band, which was too easy to trigger by accident with no easy tap-
+// based way back out. touchstart/touchend/click below are unchanged EPUB-only behaviour.
 document.getElementById('header-sensor').addEventListener('mouseenter', () => {
-  if (!prefs.autoHideHeader || _sensorCooldown) return;
+  if ((!prefs.autoHideHeader && !isImmersivePageMode()) || _sensorCooldown) return;
   revealHeader();
 });
 document.getElementById('header-sensor').addEventListener('touchstart', () => {
@@ -2738,6 +3486,47 @@ document.getElementById('header-sensor').addEventListener('click', () => {
     revealHeader();
   }
 });
+
+// Comic-mode-only, DESKTOP hover: bottom-edge hover reveals the STATUS BARS (top + bottom
+// overlay text), independent of the toolbar's own header-peek — deliberately a separate
+// class (bars-peek) so hovering top vs bottom reveals only the chrome that edge visually
+// belongs to, rather than one hover showing everything at both ends of the screen. No touch
+// listeners here at all (see the header-sensor comment above) — mobile uses comicSwipeChrome.
+function revealComicBars() { readerLayout.classList.add('bars-peek'); }
+function hideComicBars()   { readerLayout.classList.remove('bars-peek'); }
+document.getElementById('footer-sensor').addEventListener('mouseenter', () => {
+  if (!isImmersivePageMode()) return;
+  revealComicBars();
+});
+// Unlike the header (which stays open while the mouse hovers the revealed header element
+// itself, via .reader-header's own mouseenter/mouseleave below), the status bars have no
+// interactive surface to hover (pointer-events:none, matching their non-comic behaviour) —
+// so simply leaving the thin sensor strip hides them again, matching "move mouse back up
+// outside the bottom place and it hides".
+document.getElementById('footer-sensor').addEventListener('mouseleave', () => {
+  if (!isImmersivePageMode()) return;
+  hideComicBars();
+});
+
+// Mobile-only vertical swipe cycle for comic-mode chrome: HEADER — HIDDEN — BARS, one step
+// per swipe, entirely independent of prefs.autoHideHeader (see handleTouchEnd, which calls
+// this). Swipe down always moves one step toward HEADER, swipe up always moves one step
+// toward BARS — so from any state there's always exactly one gesture that gets you back to
+// HIDDEN, unlike the previous tap-to-toggle scheme (too easy to trigger by an incidental tap,
+// with no reliable way back out).
+function _comicChromeState() {
+  if (readerLayout.classList.contains('header-peek')) return 0;
+  if (readerLayout.classList.contains('bars-peek'))   return 2;
+  return 1;
+}
+function _setComicChromeState(state) {
+  readerLayout.classList.toggle('header-peek', state === 0);
+  readerLayout.classList.toggle('bars-peek',   state === 2);
+}
+function comicSwipeChrome(dir) { // 'down' → toward header (0), 'up' → toward bars (2)
+  const state = _comicChromeState();
+  _setComicChromeState(dir === 'down' ? Math.max(0, state - 1) : Math.min(2, state + 1));
+}
 
 // Capture-phase guard: swallow any click that lands on the header within
 // HEADER_REVEAL_GUARD_MS of a reveal, so the tap-to-show gesture never
@@ -2781,16 +3570,37 @@ function buildTocRecursive(toc, depth, fragment) {
         const [hrefBase, anchor] = (item.href || '').split('#');
         // Resolve via spine — findSpineItemForHref handles path-prefix mismatches
         const spineItem = findSpineItemForHref(hrefBase);
-        // For chapter-level entries (depth <= 1), use spineItem.href without anchor so
-        // epub.js navigates to the start of the chapter file. display(spineIndex) would
-        // restore the last-cached position (which can be mid-chapter from a previous visit),
-        // while display(href) without a fragment always goes to the beginning.
-        // Sub-section entries (depth > 1) keep their anchors for precise positioning.
+        // Keep the anchor regardless of depth — CXReader's goToHref resolves a fragment to the
+        // exact page of that element (see cxreader/index.js's goToSpineItem anchor-jump), it
+        // doesn't just land on the chapter's first page, so there's no reason to drop it for top-level
+        // entries. This used to be depth-gated (a leftover from the old epub.js engine, where a
+        // bare display(href) reliably went to page 1 but a fragment could resurrect a stale
+        // cached location) — but for a book that packs several chapters as anchors inside one
+        // shared spine file, dropping the anchor at depth<=1 meant every one of those chapters'
+        // TOC entries landed on page 1 of that shared file, confirmed live as "chapter 30 opens
+        // the file, chapter 34 opens the same file, chapter 50 opens back to chapter 34" — all
+        // three names for the one physical page CXReader could actually reach without it.
         const displayTarget = spineItem?.index != null
-          ? (anchor && depth > 1 ? `${spineItem.href}#${anchor}` : spineItem.href)
+          ? (anchor ? `${spineItem.href}#${anchor}` : spineItem.href)
           : item.href;
         log(`[nav] TOC | depth=${depth} anchor="${anchor||''}" target=${JSON.stringify(displayTarget)}`);
-        if (_cxReader) await _cxReader.goToHref(displayTarget || item.href);
+        if (_cxReader) {
+          // Hard-hide (no transition — must be instant, not faded) while the target chapter
+          // renders and, for a mid-file anchor, jumps to its real page. TOC clicks don't go
+          // through the regular page-turn fade (_pageExit/_pageEnter), and that fade wouldn't
+          // fully cover this anyway — it only masks part of the render, which is unnoticeable
+          // for an ordinary forward page-turn (the visible interim state already IS page 1, the
+          // destination) but not here: a mid-file anchor's interim state (the file's own natural
+          // top, mid-render) is NOT the destination, so any visibility during the render shows
+          // the wrong page. Confirmed live: clicking a mid-file TOC chapter briefly flashed the
+          // file's own top before landing on the right page.
+          epubViewer.style.visibility = 'hidden';
+          try {
+            await _cxReader.goToHref(displayTarget || item.href);
+          } finally {
+            epubViewer.style.visibility = '';
+          }
+        }
       }, 80);
     });
 
@@ -2816,19 +3626,95 @@ function buildToc(toc) {
   });
 }
 
+// Strip _split_NNN suffix — epub.js splits large chapters but TOC only lists _split_000
+function _tocNormBase(h) {
+  return (h || '').split('#')[0].replace(/_split_\d+(\.\w+)$/, '$1').toLowerCase().split('/').pop();
+}
+
+// Same as _tocNormBase but keeps the _split_NNN suffix intact — see resolveActiveTocEntry for
+// why an exact match here must always be tried and preferred first, before ever falling back to
+// the suffix-stripped fuzzy version above.
+function _tocExactBase(h) {
+  return (h || '').split('#')[0].toLowerCase().split('/').pop();
+}
+
+// Resolve which TOC entry is "active" for spine href at page curPage, AND the page range (in
+// the current paginator's own page units) it actually spans within the file — the anchor's own
+// page through just before the next entry's anchor, or the end of the file if it's the last
+// one there. Shared by updateActiveTocItem (which entry to highlight) and _cxRelocatedHandler
+// (which scopes "pages left in chapter" to this virtual sub-chapter instead of the whole
+// physical file — see that call site's own comment for why).
+//
+// Several TOC entries can share one physical spine file — a book that packs many chapters as
+// anchors inside a couple of shared HTML files rather than one file per chapter (see
+// cxreader/index.js's goToSpineItem anchor-jump for why that's navigable at all now). Returns
+// null only when NOTHING matches this href by filename at all (falls back to _cxRangeActiveToc).
+function resolveActiveTocEntry(href, curPage, fileTotalPages) {
+  if (!href || !tocFlatItems.length) return null;
+  // Try an EXACT filename match (suffix included) first. Some Calibre-split books name every
+  // individual chapter file "Book_split_NNN.htm" with its OWN dedicated TOC entry — a 1:1
+  // mapping the suffix-stripped fuzzy match below actively breaks: stripping "_split_NNN" makes
+  // every chapter in the book collapse to the SAME normalized base, so every relocate matched
+  // every TOC entry at once, and — with none of them carrying page-distinguishing anchors — the
+  // tie-break below always settled on the last entry in the book, regardless of which chapter was
+  // actually open (confirmed live on two such books: TOC always highlighted the final chapter).
+  // An exact match means this href IS one specific TOC entry's own file, so it's unambiguously
+  // correct and needs no further disambiguation at all.
+  const exactBase = _tocExactBase(href);
+  const exactMatches = tocFlatItems.filter(item => _tocExactBase(item.href) === exactBase);
+  if (exactMatches.length === 1) return { winner: exactMatches[0], startPage: 1, endPage: fileTotalPages };
+
+  const base = _tocNormBase(href);
+  // CBZ/PDF spine hrefs ("page-N") need an EXACT match — the substring fuzzy-match below exists
+  // to tolerate EPUB filename variants (e.g. a resolved path vs. a raw href), but on page-N it's
+  // actively wrong: "page-1" is a substring of "page-10"/"page-100"/... and vice versa, so on a
+  // real multi-page PDF it lit up every TOC entry whose page number shared a numeric prefix with
+  // the current page — confirmed live.
+  const isPageHref = /^page-\d+$/.test(base);
+  // Falls back to the suffix-stripped fuzzy match only when the exact pass found nothing (the
+  // ORIGINAL case this function was built for: one logical chapter runtime-split into several
+  // physical files, with only the first one's filename actually listed in the TOC) or found
+  // several (several real anchors legitimately sharing one physical file) — exactMatches.length
+  // === 1 already returned above, so this only runs for 0 or 2+.
+  const matches = exactMatches.length ? exactMatches : tocFlatItems.filter(item => {
+    const ib = _tocNormBase(item.href);
+    return isPageHref ? base === ib : !!(base && ib && (base === ib || base.includes(ib) || ib.includes(base)));
+  });
+  if (!matches.length) return null;
+  if (matches.length === 1 || !_cxReader?.pageForAnchor) {
+    return { winner: matches[0], startPage: 1, endPage: fileTotalPages };
+  }
+  // Resolve each match's own start page — a bare entry with no fragment at all means "the
+  // start of the file" (page 1). Sorted ascending by page, shallower-first on a tie so the
+  // scan below can prefer the deeper (more specific) one when it reaches that tie.
+  const resolved = matches
+    .map(m => ({ item: m, page: (m.href || '').split('#')[1] ? _cxReader.pageForAnchor(m.href.split('#')[1]) : 1 }))
+    .filter(r => r.page != null)
+    .sort((a, b) => a.page - b.page || a.item.depth - b.item.depth);
+  if (!resolved.length) return { winner: matches[0], startPage: 1, endPage: fileTotalPages };
+
+  // Pick the entry whose page is the closest at-or-before curPage. A depth-0 "container" entry
+  // with no anchor of its own is hardcoded to page 1, which makes it a permanently-valid
+  // candidate at every page of the file — without the depth tie-break below it would win over
+  // an anchored child sitting on that very same first page forever (confirmed live: a book's
+  // first sub-chapter, starting right at its file's top with no anchor of its own to distinguish
+  // it, stayed stuck showing its PARENT entry as active through the whole sub-chapter).
+  let winner = resolved[0];
+  for (const r of resolved) {
+    if (r.page > curPage) break; // ascending order — nothing further can still qualify
+    if (r.page > winner.page || (r.page === winner.page && r.item.depth >= winner.item.depth)) winner = r;
+  }
+  const next = resolved[resolved.indexOf(winner) + 1];
+  return { winner: winner.item, startPage: winner.page, endPage: next ? next.page - 1 : fileTotalPages };
+}
+
 function updateActiveTocItem(href) {
   if (!href) return;
-  // Strip _split_NNN suffix — epub.js splits large chapters but TOC only lists _split_000
-  const norm  = h => (h || '').split('#')[0].replace(/_split_\d+(\.\w+)$/, '$1').toLowerCase();
-  const base  = norm(href).split('/').pop();
-  let anyActive = false;
-  tocFlatItems.forEach(({ href: ih, button }) => {
-    const ib     = norm(ih || '').split('/').pop();
-    const active = !!(base && ib && (base === ib || base.includes(ib) || ib.includes(base)));
-    button.classList.toggle('active', active);
-    if (active) anyActive = true;
-  });
-  if (!anyActive) {
+  const curPage  = _cxReader?._paginator?.currentPage ?? 1;
+  const total    = _cxReader?._paginator?.pageCount ?? curPage;
+  const resolved = resolveActiveTocEntry(href, curPage, total);
+  tocFlatItems.forEach(item => item.button.classList.toggle('active', !!resolved && item === resolved.winner));
+  if (!resolved) {
     // CXReader range fallback: activate the last TOC entry whose spine index ≤ currentSpineIndex
     if (_cxReader) {
       const rangeItem = _cxRangeActiveToc();
@@ -2839,9 +3725,15 @@ function updateActiveTocItem(href) {
         return;
       }
     }
-    warn('[toc-debug] NO MATCH for spine href:', href,
-      '| base:', base,
-      '\nTOC hrefs:', tocFlatItems.map(t => t.href).join(' | '));
+    // Only worth a warning when there WAS a TOC to match against — a book with none at all
+    // (any CBZ, most PDFs, an EPUB with no nav/ncx) hits this on every single relocate, which
+    // is expected/harmless, not a diagnostic. Confirmed live: this was spamming console.warn on
+    // every page turn of an entirely TOC-less comic.
+    if (tocFlatItems.length) {
+      warn('[toc-debug] NO MATCH for spine href:', href,
+        '| base:', _tocNormBase(href),
+        '\nTOC hrefs:', tocFlatItems.map(t => t.href).join(' | '));
+    }
   }
 }
 
@@ -2909,7 +3801,15 @@ function _cxRangeActiveToc() {
   let bestIdx = -1;
   for (const item of tocFlatItems) {
     const si = _cxTocToSpineIdx(item.href);
-    if (si >= 0 && si <= currentSpineIndex && si > bestIdx) {
+    // >= (not >): several TOC entries can resolve to the SAME spine index — anchors into one
+    // shared file (see resolveActiveTocEntry above) — and when the fallback here is needed
+    // (an untitled spine item further along with no TOC entry of its own at all, e.g. a chapter
+    // an EPUB producer split across an extra physical file mid-story), the LAST of those tied
+    // entries in document order is the more specific/more recent one and should win, not
+    // whichever happened to be listed first. Confirmed live: a book whose last real chapter
+    // ("Črna orhideja") shared its spine index with an earlier sub-chapter of the same file
+    // fell back to that earlier one instead once the untitled continuation file was reached.
+    if (si >= 0 && si <= currentSpineIndex && si >= bestIdx) {
       bestIdx = si;
       best = item;
     }
@@ -2979,6 +3879,7 @@ function openToc() {
 
   tocSidebar.classList.add('open');
   settingsPanel.classList.remove('open');
+  closeColorPicker();
   panelBackdrop.classList.add('visible');
   if (prefs.autoHideHeader) forceHideAutoHeader();
   // Fallback recenter after slide-in in case TOC updates while opening.
@@ -3001,6 +3902,7 @@ function openSettings() {
   settingsPanel.classList.add('open');
   tocSidebar.classList.remove('open');
   bookmarksSidebar.classList.remove('open');
+  closeColorPicker();
   panelBackdrop.classList.add('visible');
   if (prefs.autoHideHeader) forceHideAutoHeader();
   activateSettingsTab(localStorage.getItem('settingsTab') || 'theme');
@@ -3010,6 +3912,7 @@ function openBookmarks() {
   bookmarksSidebar.classList.add('open');
   tocSidebar.classList.remove('open');
   settingsPanel.classList.remove('open');
+  closeColorPicker();
   panelBackdrop.classList.add('visible');
   if (prefs.autoHideHeader) forceHideAutoHeader();
 }
@@ -3048,14 +3951,40 @@ function closePanels() {
   closeFontPicker();
   const activeEl = document.activeElement;
   const searchHadFocus = !!activeEl && searchSidebar.contains(activeEl);
+  const searchWasOpen  = searchSidebar.classList.contains('open');
   tocSidebar.classList.remove('open');
   settingsPanel.classList.remove('open');
   searchSidebar.classList.remove('open');
   bookmarksSidebar.classList.remove('open');
   document.getElementById('annotations-sidebar')?.classList.remove('open');
+  closeColorPicker();
   panelBackdrop.classList.remove('visible');
   closeJumpPanel();
   if (searchHadFocus && typeof activeEl.blur === 'function') activeEl.blur();
+  if (searchWasOpen) {
+    clearInterval(_searchSafeAreaTimer);
+    _searchSafeAreaTimer = null;
+    // Restore the safe-area vars snapshotted in openSearch() — several passes at increasing
+    // delays, since keyboard-dismiss timing varies a lot across devices/browsers (same
+    // multi-probe strategy presetNamePrompt() uses for the same reason). Covers the settle
+    // window right after the live guard above stops.
+    // Only call reapplyStyles() (full CSS rebuild + full CXReader re-paginate) when a var
+    // actually needed correcting — same "did it really change" guard _reassertSearchSafeArea
+    // already uses for its own 150ms ticks. Without it, all 4 of these fire unconditionally on
+    // EVERY search-result jump (jumpToSearchResultCX calls closePanels() first thing), each
+    // one doing a full-chapter onBeforePaginate + re-measure + a fresh _scheduleFontReflow
+    // round — a burst of main-thread work landing right as the reader shows the result page,
+    // long enough in practice to make touch input get dropped.
+    const root = document.documentElement;
+    const restore = () => {
+      const satChanged = !!_searchSat && root.style.getPropertyValue('--sat') !== _searchSat;
+      const sabChanged = !!_searchSab && root.style.getPropertyValue('--sab') !== _searchSab;
+      if (satChanged) root.style.setProperty('--sat', _searchSat);
+      if (sabChanged) root.style.setProperty('--sab', _searchSab);
+      if (satChanged || sabChanged) reapplyStyles();
+    };
+    [50, 300, 700, 1200].forEach(ms => setTimeout(restore, ms));
+  }
   if (prefs.autoHideHeader) forceHideAutoHeader();
 }
 
@@ -3128,12 +4057,35 @@ async function toggleFullscreen() {
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
+let _searchSat = '', _searchSab = ''; // snapshot before focusing searchInput opens the keyboard
+let _searchSafeAreaTimer = null;
+
+// Some Android browsers/WebViews rewrite --sat/--sab (or a resize handler reacting to the
+// on-screen keyboard does) as soon as the keyboard opens — not only after search closes, but
+// live, for as long as it's open, visibly collapsing both the search panel's own header and the
+// dimmed reader pane behind it under the camera cutout. Even dismissing just the keyboard (its
+// own hide button, search input still focused) doesn't fix it back up. Rather than chase exactly
+// which resize/probe is responsible, keep reasserting the known-good snapshot for as long as the
+// search panel stays open — cheap and self-correcting regardless of the cause.
+function _reassertSearchSafeArea() {
+  const root = document.documentElement;
+  if (_searchSat && root.style.getPropertyValue('--sat') !== _searchSat) root.style.setProperty('--sat', _searchSat);
+  if (_searchSab && root.style.getPropertyValue('--sab') !== _searchSab) root.style.setProperty('--sab', _searchSab);
+}
+
 function openSearch() {
   searchSidebar.classList.add('open');
   tocSidebar.classList.remove('open');
   settingsPanel.classList.remove('open');
+  closeColorPicker();
   panelBackdrop.classList.add('visible');
   if (prefs.autoHideHeader) forceHideAutoHeader();
+  // Snapshot safe-area vars before focusing opens the on-screen keyboard.
+  const root = document.documentElement;
+  _searchSat = root.style.getPropertyValue('--sat');
+  _searchSab = root.style.getPropertyValue('--sab');
+  clearInterval(_searchSafeAreaTimer);
+  _searchSafeAreaTimer = setInterval(_reassertSearchSafeArea, 150);
   setTimeout(() => searchInput.focus(), 280);
 }
 
@@ -3222,6 +4174,7 @@ async function jumpToSearchResultCX(spineIdx, textOffset, query) {
   if (!_cxReader) return;
   if (!preSearchCfi && currentCfi) {
     preSearchCfi = currentCfi;
+    preSearchPage = currentChapPage;
     searchBackBtn.style.display   = '';
     searchAcceptBtn.style.display = '';
   }
@@ -3378,7 +4331,7 @@ async function renderDictSettings() {
   const rawLang  = (_cxReader && _cxReader._book?.metadata?.language) || currentBook?.language;
   const bookLang = normalizeBookLang(rawLang);
   const defaultIds = bookLang
-    ? (dicts.filter(d => (prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang).map(d => d.id))
+    ? (dicts.filter(d => normalizeBookLang(prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang).map(d => d.id))
     : [];
   const defaultEnabledIds = defaultIds.length ? defaultIds : allIds;
   // enabled set: null = none; [] = default (book-language match, or all); [...] = explicit list
@@ -3494,7 +4447,7 @@ async function showDictPopup(word) {
     const allIds   = dicts.map(d => d.id);
     if (bookLang) {
       const matched = dicts
-        .filter(d => (prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang)
+        .filter(d => normalizeBookLang(prefs.dictionaryMeta?.[d.id]?.lang_from ?? d.lang_from) === bookLang)
         .map(d => d.id);
       enabled = matched.length ? matched : allIds; // fallback to all if no tagged match
     } else {
@@ -3513,9 +4466,24 @@ async function showDictPopup(word) {
   }
 
   try {
-    const data = await apiFetch(`/dictionary/lookup?word=${encodeURIComponent(word)}&dicts=${enabled.join(',')}`);
+    let data = await apiFetch(`/dictionary/lookup?word=${encodeURIComponent(word)}&dicts=${enabled.join(',')}`);
+    let displayWord = word;
+    // Multi-word selections are looked up as a single phrase first (some dictionaries do
+    // have idiom/compound-term entries, e.g. "rat snake") \u2014 only fall back to just the
+    // first word if the phrase itself has no entry in any enabled dictionary. The fallback
+    // is silent (no flash of "not found" in between); the header only switches to the
+    // fallback word once we know it actually found something.
+    const firstWord = word.trim().split(/\s+/)[0].replace(/^[''-]+|[''-]+$/g, '').trim();
+    if (!data.results.length && firstWord && firstWord !== word) {
+      const fallback = await apiFetch(`/dictionary/lookup?word=${encodeURIComponent(firstWord)}&dicts=${enabled.join(',')}`);
+      if (fallback.results.length) {
+        data = fallback;
+        displayWord = firstWord;
+        wordEl.textContent = displayWord;
+      }
+    }
     if (!data.results.length) {
-      resultsEl.innerHTML = `<div class="dict-empty">${t('reader.dict_not_found', { word: esc(word) })}</div>`;
+      resultsEl.innerHTML = `<div class="dict-empty">${t('reader.dict_not_found', { word: esc(displayWord) })}</div>`;
     } else {
       resultsEl.innerHTML = data.results.map((r, i) => {
         // HTML type: render as HTML but strip any <script>/<style> for safety.
@@ -3535,7 +4503,7 @@ async function showDictPopup(word) {
         return `${i > 0 ? '<hr class="dict-hr">' : ''}
           <div class="dict-result">
             <div class="dict-result-source">
-              ${esc(r.dictName)}${r.matchedForm && r.matchedForm !== word.toLowerCase() ? ` <span class="dict-matched-form">\u2192 ${esc(r.word)}</span>` : ''}
+              ${esc(r.dictName)}${r.matchedForm && r.matchedForm !== displayWord.toLowerCase() ? ` <span class="dict-matched-form">\u2192 ${esc(r.word)}</span>` : ''}
             </div>
             ${defHtml}
           </div>`;
@@ -3580,6 +4548,14 @@ window.addEventListener('message', (e) => {
   if (e.data?.type === 'annotation-click') {
     const a = annotationsCache.find(x => x.id === e.data.id);
     if (a) showAnnotationEditSheet(a);
+  }
+  if (e.data?.type === 'annotation-deselect') {
+    // Only act if the plain selection toolbar is actually showing — the note editor and
+    // dict popup flows close it (keepHighlight) while deliberately keeping _pendingAnnotation
+    // alive for when they're done, and this must not clobber that.
+    if (document.getElementById('annot-toolbar')?.classList.contains('open')) {
+      closeAnnotationToolbar();
+    }
   }
 });
 
@@ -3732,6 +4708,7 @@ function syncSettingsUi() {
   document.getElementById('autohide-header-toggle').checked  = prefs.autoHideHeader;
   document.getElementById('keep-screen-on-toggle').checked   = prefs.keepScreenOn;
   document.getElementById('eink-toggle').checked             = prefs.eink;
+  document.getElementById('pdf-paper-inversion-toggle').checked = prefs.pdfPaperInversion;
   const openCheckEl = document.getElementById('skip-open-progress-toggle');
   if (openCheckEl) openCheckEl.checked = prefs.skipOpenProgressCheck;
   const saveOnCloseEl = document.getElementById('skip-save-on-close-toggle');
@@ -3740,10 +4717,10 @@ function syncSettingsUi() {
     b.classList.toggle('active', b.dataset.theme === prefs.theme));
   const customPickersEl = document.getElementById('custom-color-pickers');
   if (customPickersEl) customPickersEl.style.display = prefs.theme === 'custom' ? '' : 'none';
-  const customBgEl   = document.getElementById('custom-bg-color');
-  const customTextEl = document.getElementById('custom-text-color');
-  if (customBgEl)   customBgEl.value   = prefs.customBg   || '#000000';
-  if (customTextEl) customTextEl.value = prefs.customText || '#c8b89a';
+  const customBgSwatch   = document.getElementById('custom-bg-color-swatch');
+  const customTextSwatch = document.getElementById('custom-text-color-swatch');
+  if (customBgSwatch)   customBgSwatch.style.background   = prefs.customBg   || '#000000';
+  if (customTextSwatch) customTextSwatch.style.background = prefs.customText || '#c8b89a';
   document.querySelectorAll('.spread-btn[data-spread]').forEach(b =>
     b.classList.toggle('active', b.dataset.spread === prefs.spread));
   document.querySelectorAll('.page-anim-btn').forEach(b =>
@@ -3815,6 +4792,15 @@ function syncSettingsUi() {
   if (bionicEl) bionicEl.checked = prefs.bionicReading;
   const pgShadowEl = document.getElementById('page-gap-shadow-toggle');
   if (pgShadowEl) pgShadowEl.checked = prefs.pageGapShadow;
+  const noBlurEl = document.getElementById('settings-no-blur-toggle');
+  if (noBlurEl) {
+    noBlurEl.checked = prefs.settingsNoBlur;
+    // E-ink mode already forces the no-dim backdrop (see reader.css) — the toggle would do
+    // nothing, so lock it rather than let it look interactive.
+    noBlurEl.disabled = !!prefs.eink;
+    document.getElementById('setting-row-settings-no-blur')?.classList.toggle('setting-disabled', !!prefs.eink);
+  }
+  document.body.classList.toggle('settings-no-blur', !!prefs.settingsNoBlur);
   const fnbEl = document.getElementById('float-nav-btn-toggle');
   if (fnbEl) fnbEl.checked = prefs.floatNavBtn;
   const fnbOpEl = document.getElementById('float-nav-btn-opacity-slider');
@@ -3886,14 +4872,21 @@ function renderStatusSlots() {
     sbBl.innerHTML = [leftVal,  blOther].filter(Boolean).join('  |  ');
     sbBc.innerHTML = bcSlot;
     sbBr.innerHTML = [brOther, rightVal].filter(Boolean).join('  |  ');
-    sbBottom.classList.toggle('two-page-no-center', !bcSlot);
   } else {
     sbBottom.classList.remove('two-page');
-    sbBottom.classList.remove('two-page-no-center');
     sbBl.innerHTML = computeSlot(pos.bl);
     sbBc.innerHTML = computeSlot(pos.bc);
     sbBr.innerHTML = computeSlot(pos.br);
   }
+
+  // An empty slot (nothing assigned there, or everything assigned to it currently has no
+  // value) collapses to zero width instead of still reserving its 1/3 share — the remaining
+  // non-empty slot(s) in that bar (still flex:1, see reader.css) then expand to fill the
+  // freed space. Without this, a lone center item (e.g. book+chapter title) was stuck
+  // truncating inside 1/3 of the bar even with the other two-thirds sitting empty.
+  [[sbTl, sbTc, sbTr], [sbBl, sbBc, sbBr]].forEach(slots => {
+    slots.forEach(el => el.classList.toggle('sb-slot-empty', !el.innerHTML));
+  });
 }
 
 function renderSbItems() {
@@ -3942,12 +4935,14 @@ function renderSbItems() {
       if (newPos !== 'off') prefs.statusBar.positions[newPos].push(id);
       persistPrefs();
       renderStatusSlots();
+      _cxRemeasureAndRepaginate();
     });
 
     row.querySelector('.sb-icon-chk').addEventListener('change', (e) => {
       prefs.statusBar.showIcons[id] = e.target.checked;
       persistPrefs();
       renderStatusSlots();
+      _cxRemeasureAndRepaginate();
     });
 
     container.appendChild(row);
@@ -4186,9 +5181,148 @@ function initSliderButtons() {
   });
 }
 
+// ── Custom color picker (SV square + hue slider + hex/RGB inputs) ──────────────
+// Docked in the same slot/width as #settings-panel (see reader.css) instead of a
+// centered modal, and shares its #panel-backdrop rather than a modal-backdrop of its
+// own — so it automatically inherits "remove book blur when settings are open" (and
+// e-ink's always-no-blur), which is the whole point of opening this from settings: the
+// book should keep updating live, visibly, while a color is being picked.
+// Replaces native <input type="color"> everywhere: Android's system picker starts at
+// HSV(0,0,0) instead of the current colour (a known WebView quirk, confirmed via a real
+// user report) and has no hex/RGB text entry at all, unlike desktop Chrome's built-in
+// one — this makes custom-theme color editing identical, and correct, on every platform
+// instead of depending on whatever the OS/browser happens to ship.
+// The panel markup is static (reader.html) and reused across opens — unlike the old
+// modal-backdrop version, which built/discarded fresh DOM each time — so all wiring
+// happens once via initColorPickerPanel(); _cpSession (null when closed) is what makes
+// the shared listeners live or inert.
+let _cpSession = null; // { h, s, v, startHex, onChange } while the panel is open
+
+function _cpEls() {
+  return {
+    panel:     document.getElementById('color-picker-panel'),
+    title:     document.getElementById('cp-title'),
+    svSquare:  document.getElementById('cp-sv-square'),
+    svThumb:   document.getElementById('cp-sv-thumb'),
+    hueSlider: document.getElementById('cp-hue-slider'),
+    hueThumb:  document.getElementById('cp-hue-thumb'),
+    preview:   document.getElementById('cp-preview'),
+    hexInput:  document.getElementById('cp-hex-input'),
+    rInput:    document.getElementById('cp-r-input'),
+    gInput:    document.getElementById('cp-g-input'),
+    bInput:    document.getElementById('cp-b-input'),
+  };
+}
+
+// h/s/v (in _cpSession) is the single source of truth while dragging the square/hue
+// slider. `sourceEl` (the field the user is actively typing in, if any) is left alone
+// so a half-typed hex like "#1a2" isn't reformatted out from under the caret.
+function _cpRender(sourceEl) {
+  if (!_cpSession) return;
+  const els = _cpEls();
+  const { h, s, v } = _cpSession;
+  const rgb = hsvToRgbObj(h, s, v);
+  const hex = rgbObjToHex(rgb);
+  els.svSquare.style.backgroundColor = `hsl(${h},100%,50%)`;
+  els.svThumb.style.left = (s * 100) + '%';
+  els.svThumb.style.top  = ((1 - v) * 100) + '%';
+  els.hueThumb.style.left = (h / 360 * 100) + '%';
+  els.preview.style.background = hex;
+  if (sourceEl !== els.hexInput) els.hexInput.value = hex;
+  if (sourceEl !== els.rInput) els.rInput.value = rgb.r;
+  if (sourceEl !== els.gInput) els.gInput.value = rgb.g;
+  if (sourceEl !== els.bInput) els.bInput.value = rgb.b;
+  [els.hexInput, els.rInput, els.gInput, els.bInput].forEach(el => el.classList.remove('cp-invalid'));
+  _cpSession.onChange(hex);
+}
+
+function _cpSetFromPointer(el, clientX, clientY, isHue) {
+  if (!_cpSession) return;
+  const rect = el.getBoundingClientRect();
+  const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  if (isHue) {
+    _cpSession.h = x * 360;
+  } else {
+    const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    _cpSession.s = x; _cpSession.v = 1 - y;
+  }
+  _cpRender();
+}
+
+// Closes without reverting — the last live-previewed color stays applied, same as the
+// old native <input type="color"> (which had no cancel concept at all). Used both by
+// "Confirm" and by every other panel-opening path (openToc/openSettings/etc. and
+// closePanels()) that implicitly dismisses whatever else was open. Explicit Cancel/✕
+// revert first (see initColorPickerPanel) and then call this.
+function closeColorPicker() {
+  document.getElementById('color-picker-panel')?.classList.remove('open');
+  _cpSession = null;
+}
+
+function openColorPicker(initialHex, title, onChange) {
+  const els = _cpEls();
+  if (!els.panel) return;
+  const startHex = rgbObjToHex(hexToRgbObj(initialHex) || { r: 0, g: 0, b: 0 });
+  _cpSession = { ...rgbObjToHsv(hexToRgbObj(startHex)), startHex, onChange };
+  els.title.textContent = title;
+  panelBackdrop.classList.add('visible');
+  els.panel.classList.add('open');
+  _cpRender();
+}
+
+// Wired once — the static panel markup (reader.html) is reused across every open, so
+// listeners must not be re-attached per call. Call from initSettingsUi().
+function initColorPickerPanel() {
+  const els = _cpEls();
+  if (!els.panel) return;
+
+  function wireDrag(el, isHue) {
+    let dragging = false;
+    el.addEventListener('pointerdown', e => {
+      if (!_cpSession) return;
+      dragging = true;
+      el.setPointerCapture(e.pointerId);
+      _cpSetFromPointer(el, e.clientX, e.clientY, isHue);
+    });
+    el.addEventListener('pointermove', e => { if (dragging) _cpSetFromPointer(el, e.clientX, e.clientY, isHue); });
+    el.addEventListener('pointerup',     () => { dragging = false; });
+    el.addEventListener('pointercancel', () => { dragging = false; });
+  }
+  wireDrag(els.svSquare, false);
+  wireDrag(els.hueSlider, true);
+
+  els.hexInput.addEventListener('input', () => {
+    if (!_cpSession) return;
+    const rgb = hexToRgbObj(els.hexInput.value);
+    if (!rgb) { els.hexInput.classList.add('cp-invalid'); return; }
+    Object.assign(_cpSession, rgbObjToHsv(rgb));
+    _cpRender(els.hexInput);
+  });
+  [[els.rInput, 'r'], [els.gInput, 'g'], [els.bInput, 'b']].forEach(([el, key]) => {
+    el.addEventListener('input', () => {
+      if (!_cpSession) return;
+      const n = parseInt(el.value, 10);
+      if (!Number.isFinite(n) || n < 0 || n > 255) { el.classList.add('cp-invalid'); return; }
+      const rgb = hsvToRgbObj(_cpSession.h, _cpSession.s, _cpSession.v);
+      rgb[key] = n;
+      Object.assign(_cpSession, rgbObjToHsv(rgb));
+      _cpRender(el);
+    });
+  });
+
+  const revertAndClose = () => {
+    if (_cpSession) _cpSession.onChange(_cpSession.startHex);
+    closeColorPicker();
+  };
+  document.getElementById('cp-cancel')?.addEventListener('click', revertAndClose);
+  document.getElementById('cp-close')?.addEventListener('click', revertAndClose);
+  document.getElementById('cp-done')?.addEventListener('click', closeColorPicker);
+}
+
 function initSettingsUi() {
   populateFontSelect();
   populateSbFontSelect();
+  initColorPickerPanel();
 
   document.getElementById('btn-reset-book-prefs')?.addEventListener('click', () => {
     if (!currentBook?.id) return;
@@ -4202,6 +5336,53 @@ function initSettingsUi() {
     applyPageShadow();
     updateBookPrefsIndicator();
   });
+
+  // A write failing mid-session (server unreachable while the browser still thinks it's
+  // online — see _presetsReachable) means don't wait for the next online/offline event to
+  // disable further attempts; react to the failure itself.
+  const onPresetActionFailed = err => {
+    _presetsReachable = false;
+    renderPresetsUi();
+    toast.error(t('common.err_prefix') + err.message);
+  };
+  document.getElementById('btn-preset-save')?.addEventListener('click', async () => {
+    // Belt-and-suspenders: don't rely on the button's disabled attribute alone — some
+    // WebViews (see _legacyWebView elsewhere in this file) still fire click/touchend on a
+    // disabled button. This is the guard that actually matters.
+    if (!_presetsReachable) return;
+    const name = await presetNamePrompt(t('reader.preset_save_title'));
+    if (!name) return;
+    try {
+      await saveCurrentAsPreset(name);
+      toast.success(t('reader.preset_saved'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-update')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    try {
+      await updatePreset(activePresetId);
+      toast.success(t('reader.preset_updated'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-rename')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    const current = presetsList.find(p => p.id === activePresetId);
+    const name = await presetNamePrompt(t('reader.preset_rename_title'), current?.name || '');
+    if (!name) return;
+    try {
+      await renamePreset(activePresetId, name);
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  document.getElementById('btn-preset-delete')?.addEventListener('click', async () => {
+    if (!_presetsReachable || activePresetId == null) return;
+    const current = presetsList.find(p => p.id === activePresetId);
+    if (!await presetConfirm(t('reader.preset_delete_confirm', { name: sbEsc(current?.name || '') }))) return;
+    try {
+      await deletePreset(activePresetId);
+      toast.success(t('reader.preset_deleted'));
+    } catch (err) { onPresetActionFailed(err); }
+  });
+  loadPresetsList();
 
   document.getElementById('font-size-slider').addEventListener('input', (e) => {
     prefs.fontSize = parseInt(e.target.value);
@@ -4217,8 +5398,11 @@ function initSettingsUi() {
     prefs.margin = parseInt(e.target.value);
     document.getElementById('margin-value').textContent = prefs.margin + 'px';
     // CXReader two-column mode: update the inter-column gap before re-applying CSS so
-    // _initPaginator uses the new gap (it's set via setLayout, not derived from CSS).
-    if (_cxReader) _cxReader.setLayout({ columnGap: prefs.margin * 2 });
+    // _initPaginator uses the new gap (it's set directly, not derived from CSS). Setting
+    // it here rather than via setLayout() avoids re-paginating twice (once with the old
+    // margin CSS, again a moment later inside reapplyStyles with the new CSS).
+    if (_cxReader) _cxReader._columnGap = prefs.margin * 2;
+    applyComicMargin();
     reapplyStyles();
     persistPrefs();
   });
@@ -4238,7 +5422,13 @@ function initSettingsUi() {
 
   document.getElementById('eink-toggle').addEventListener('change', (e) => {
     prefs.eink = e.target.checked;
-    applyUiTheme(); reapplyStyles(); persistPrefs();
+    applyUiTheme(); reapplyStyles(); syncSettingsUi(); persistPrefs();
+  });
+
+  document.getElementById('pdf-paper-inversion-toggle').addEventListener('change', (e) => {
+    prefs.pdfPaperInversion = e.target.checked;
+    _cxReader?.setPdfPaperInversion(prefs.pdfPaperInversion);
+    persistPrefs();
   });
 
   // Paragraph options
@@ -4364,6 +5554,11 @@ function initSettingsUi() {
     prefs.pageGapShadow = e.target.checked;
     applyPageShadow(); persistPrefs();
   });
+  document.getElementById('settings-no-blur-toggle')?.addEventListener('change', (e) => {
+    prefs.settingsNoBlur = e.target.checked;
+    document.body.classList.toggle('settings-no-blur', prefs.settingsNoBlur);
+    persistPrefs();
+  });
   document.getElementById('page-turn-drag-toggle')?.addEventListener('change', (e) => {
     prefs.pageTurnDrag = e.target.checked;
     persistPrefs();
@@ -4454,17 +5649,26 @@ function initSettingsUi() {
       applyUiTheme(); reapplyStyles(); syncSettingsUi(); persistPrefs();
     });
   });
-  document.getElementById('custom-bg-color')?.addEventListener('input', e => {
-    prefs.customBg = e.target.value;
-    applyUiTheme(); reapplyStyles(); persistPrefs();
+  document.getElementById('custom-bg-color-btn')?.addEventListener('click', () => {
+    const swatch = document.getElementById('custom-bg-color-swatch');
+    openColorPicker(prefs.customBg || '#000000', t('reader.custom_bg'), hex => {
+      prefs.customBg = hex;
+      if (swatch) swatch.style.background = hex;
+      applyUiTheme(); reapplyStyles(); persistPrefs();
+    });
   });
-  document.getElementById('custom-text-color')?.addEventListener('input', e => {
-    prefs.customText = e.target.value;
-    applyUiTheme(); reapplyStyles(); persistPrefs();
+  document.getElementById('custom-text-color-btn')?.addEventListener('click', () => {
+    const swatch = document.getElementById('custom-text-color-swatch');
+    openColorPicker(prefs.customText || '#c8b89a', t('reader.custom_text'), hex => {
+      prefs.customText = hex;
+      if (swatch) swatch.style.background = hex;
+      applyUiTheme(); reapplyStyles(); persistPrefs();
+    });
   });
   document.querySelectorAll('.spread-btn[data-spread]').forEach(btn => {
     btn.addEventListener('click', async () => {
       prefs.spread = btn.dataset.spread;
+      readerLayout.classList.toggle('continuous', isContinuousMode());
       syncSettingsUi(); persistPrefs();
       if (_cxReader) _cxSyncLayout();   // re-paginate CXReader in place
     });
@@ -4481,6 +5685,7 @@ function initSettingsUi() {
   initStatusBarSettings();
   applyStatusBarStyles();
   applyEdgePadding();
+  applyComicMargin();
   applyNavZones();
   applyHeaderButtonSize();
   applyHeaderBtnVisibility();
@@ -4567,10 +5772,33 @@ async function fetchInternalProgress(docKey) {
   catch { return null; }
 }
 
+// BookOrbit-native progress pull — independent of kosync_url (the generic external KOSync
+// server setting). Without this, a user relying on BookOrbit alone for cross-device sync (no
+// external kosync_url configured) has a push path (triggerProgressPush, fired unconditionally
+// on every KOSync-internal write) but no pull path at all: fetchRemoteProgress() above quietly
+// no-ops with "no kosync_url configured" and there is nothing else to fall back to. Server-side
+// this reads BookOrbit's own reading_progress row (server/services/bookorbitSync.js's
+// getProgress()), which BookOrbit itself keeps merged with whatever any KOReader-protocol
+// client (Xteink X4 included) last pushed it — so it's a reasonable stand-in for the same
+// cross-device signal, reached through the BookOrbit account login instead.
+async function fetchBookorbitProgress() {
+  if (!currentBook?.id) return null;
+  try { return await apiFetch(`/bookorbit/progress/${currentBook.id}`); }
+  catch { return null; }
+}
+
 async function pushRemoteProgress(docKey, xpointer, pct) {
   try {
     const r = await apiFetch(`/kosync/remote/${encodeURIComponent(docKey)}`, {
       method: 'PUT',
+      // keepalive: this fires synchronously off a page turn (chapter-boundary push, see
+      // _cxRelocatedHandler), not just on close — without it, a device that suspends JS
+      // right after the turn (screen sleep, e-ink cover close) can drop the request in
+      // flight, leaving the server's stored position a page short of where the user
+      // actually was. saveProgressBackground already used keepalive for the close path;
+      // this extends the same protection to the immediate mid-session push. Payload here
+      // is a few dozen bytes, nowhere near keepalive's ~64KB body limit.
+      keepalive: true,
       body: JSON.stringify({
         document:   docKey,
         progress:   xpointer,
@@ -4600,6 +5828,7 @@ function pushInternalProgress(docKey, xpointer, pct, force = false) {
   const qs = force ? '?force=1' : '';
   return apiFetch(`/kosync/internal/${encodeURIComponent(docKey)}${qs}`, {
     method: 'PUT',
+    keepalive: true, // see pushRemoteProgress's comment — same mid-session-suspend risk
     body: JSON.stringify({ progress: xpointer, percentage: pct, device: 'Codexa', device_id: 'codexa-web' }),
   }).catch(() => {});
 }
@@ -4639,6 +5868,9 @@ function initOnlineStatus() {
   const refresh = () => {
     _isOnline = navigator.onLine;
     updateStatusBar();
+    // Re-verify actual reachability rather than trust the browser's online flag alone
+    // (see _presetsReachable) — this also calls renderPresetsUi() once it settles.
+    loadPresetsList();
   };
   window.addEventListener('online',  refresh);
   window.addEventListener('offline', refresh);
@@ -4663,6 +5895,23 @@ function startPeriodicSync() {
     if (!isReady || !currentBook) return;
     log('[kosync] periodic local save (4 min)');
     void saveProgress({ allowRemote: false });
+    // Only rotate the stats session if NOTHING happened since the last tick — isolates a genuinely
+    // idle stretch (book left open and foregrounded, nobody actually reading) into its own
+    // low-activity chunk that the REAL_SESSION filter (server/routes/stats.js) then excludes,
+    // without fragmenting a real continuous reading sitting into several small sessions. A session
+    // previously only closed on tab-hide/close/manual-sync, so idle time sitting inside an
+    // otherwise-open session racked up wall-clock "reading" time uncapped — confirmed live: a
+    // single 56-minute, 10-page-turn session inflated a "most read" stat for a book that was
+    // mostly just sitting open. Rotating unconditionally on every tick was tried first and also
+    // confirmed live to overcorrect: it fragmented one real ~10-minute, 8-page sitting into "3
+    // sessions" purely from blind timer rotation, since real activity happened to straddle two
+    // rotation boundaries.
+    if (sessionPageCount === sessionPageCountAtLastCheck) {
+      rotateStatsSession();
+      sessionPageCountAtLastCheck = 0; // fresh session just (re)started
+    } else {
+      sessionPageCountAtLastCheck = sessionPageCount;
+    }
   }, SYNC_INTERVAL_MS);
 }
 
@@ -4692,8 +5941,11 @@ async function saveProgress({ forceRemote = false, allowRemote = true, inSession
   const alreadySynced = !forced && cfi !== '' && cfi === lastSyncedCfi;
   const shouldPushRemote = !alreadySynced && pct > 0 && (inSession || !prefs.skipSaveOnClose) && (forceRemote || (allowRemote && posChanged));
   // Never push to cross-device kosync if it would overwrite a higher known position.
-  // `forced` (manual sync with user confirmation) is allowed to push backwards.
-  const wouldGoBackwards = !forced && pct < bestKnownRemotePct - 0.005;
+  // `forced` (manual sync with user confirmation) is allowed to push backwards. Chapter-first
+  // (see compareChapterPositions): a plain percentage comparison here is what let Codexa push
+  // an older chapter over a genuinely newer one from another device in the reported bug —
+  // their percentage scales didn't agree closely enough for the raw pct gap to look real.
+  const wouldGoBackwards = !forced && compareChapterPositions(bestKnownRemoteSpineIdx, bestKnownRemotePct, currentSpineIndex, pct, 0.005) > 0;
   const shouldPushKosync = shouldPushRemote && !wouldGoBackwards;
   if (wouldGoBackwards && shouldPushRemote) {
     log('[kosync] saveProgress: skipping kosync push — would go backwards:', Math.round(pct * 100) + '% < known best ' + Math.round(bestKnownRemotePct * 100) + '%');
@@ -4706,6 +5958,7 @@ async function saveProgress({ forceRemote = false, allowRemote = true, inSession
   const saves = [
     apiFetch(`/progress/${currentBook.file_hash}`, {
       method: 'PUT',
+      keepalive: true, // see pushRemoteProgress's comment — same mid-session-suspend risk
       body: JSON.stringify(progressPayload),
     }).then(() => {
       if (pct > 0) {
@@ -4727,6 +5980,7 @@ async function saveProgress({ forceRemote = false, allowRemote = true, inSession
   if (shouldPushKosync) {
     lastSyncedCfi = cfi; // record what we just synced
     bestKnownRemotePct = pct; // update high-water mark (may go down if user confirmed backwards)
+    bestKnownRemoteSpineIdx = currentSpineIndex; // this push is our own live position — always exact
     checkBookorbitStatus();
   }
 }
@@ -4763,10 +6017,13 @@ function saveProgressBackground({ inSession = false } = {}) {
   }
   // Push to KOSync on close whenever position moved (chapter changed OR within-chapter pct changed).
   // Periodic/debounced saves intentionally skip KOSync; close is the designated sync point.
-  if (pct > 0 && !prefs.skipSaveOnClose && (posChanged || pctChanged) && pct >= bestKnownRemotePct - 0.005) {
+  // Chapter-first guard — see compareChapterPositions's own comment for why raw percentage
+  // alone isn't reliable enough to gate this on.
+  if (pct > 0 && !prefs.skipSaveOnClose && (posChanged || pctChanged) &&
+      compareChapterPositions(bestKnownRemoteSpineIdx, bestKnownRemotePct, currentSpineIndex, pct, 0.005) <= 0) {
     fetch(`/api/kosync/remote/${encodeURIComponent(docKey)}`,   opts({ document: docKey, progress: xp, percentage: pct, device: 'Codexa', device_id: 'codexa-web' })).catch(() => {});
     fetch(`/api/kosync/internal/${encodeURIComponent(docKey)}`, opts({ progress: xp, percentage: pct, device: 'Codexa', device_id: 'codexa-web' })).catch(() => {});
-    if (pct > bestKnownRemotePct) bestKnownRemotePct = pct;
+    if (pct > bestKnownRemotePct) { bestKnownRemotePct = pct; bestKnownRemoteSpineIdx = currentSpineIndex; }
   }
 }
 
@@ -4780,7 +6037,12 @@ function showSyncDialog(best, localPct, localTime) {
     const fmtTs  = (ts) => ts ? new Date(ts * 1000).toLocaleString(getCurrentLang()) : t('reader.sync_dlg_unknown_time');
     const rDate  = fmtTs(best.timestamp);
     const lDate  = fmtTs(localTime);
-    const rNewer = (best.percentage || 0) >= localPct; // show the forward position as the highlight
+    // Chapter-first (see compareKosyncPosition) — matches whatever comparison actually decided
+    // to show this dialog in the first place. A raw percentage compare here (the old rNewer)
+    // could mark "This reader" as ahead by its own higher-but-different-scale percentage even
+    // while the dialog was correctly offering to jump to the remote's later chapter — visibly
+    // contradicting the Jump button right next to it (confirmed via a live screenshot).
+    const rNewer = compareKosyncPosition(best.percentage, best.progress, localPct, currentSpineIndex, 0.01) >= 0; // show the forward position as the highlight
     backdrop.innerHTML = `
       <div class="modal" role="dialog" aria-modal="true" style="max-width:460px">
         <h3 style="margin:0 0 .5rem;font-size:1rem;font-weight:600">${t('reader.sync_dlg_title')}</h3>
@@ -4825,19 +6087,29 @@ function showSyncDialog(best, localPct, localTime) {
 async function syncOnOpen(localProgress) {
   const docKey = externalDocKey();
   log('[kosync] syncOnOpen docKey:', docKey);
-  const [extResult, intResult] = await Promise.allSettled([
+  const [extResult, intResult, boResult] = await Promise.allSettled([
     fetchRemoteProgress(docKey),
     fetchInternalProgress(docKey),
+    fetchBookorbitProgress(),
   ]);
   const ext = extResult.status === 'fulfilled' ? extResult.value : null;
   const int = intResult.status === 'fulfilled' ? intResult.value : null;
-  log('[kosync] remote:', ext, 'internal:', int);
+  const bo  = boResult.status  === 'fulfilled' ? boResult.value  : null;
+  log('[kosync] remote:', ext, 'internal:', int, 'bookorbit:', bo);
 
-  // Pick the freshest remote source
+  // Pick the freshest remote source. A source is usable if it has a numeric percentage —
+  // that's all the percentage-based jump below actually needs; .progress (a KOReader
+  // xpointer string) is only an optional precision refinement, so a percentage-only
+  // response (progress:null, as returned by some KOSync-compatible servers) must not be
+  // discarded outright. `bo` (BookOrbit-native, see fetchBookorbitProgress) is checked
+  // alongside ext/int rather than only when kosync_url is unset — BookOrbit's own row can
+  // legitimately be the freshest of the three regardless.
+  const hasPosition = r => r && typeof r.percentage === 'number';
   let best = null;
-  if (ext?.progress) best = ext;
-  if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
-  if (!best?.progress) {
+  if (hasPosition(ext)) best = ext;
+  if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  if (hasPosition(bo)  && (!best || (bo.timestamp  || 0) > (best.timestamp || 0))) best = bo;
+  if (!hasPosition(best)) {
     log('[kosync] no remote progress found');
     return null;
   }
@@ -4845,7 +6117,7 @@ async function syncOnOpen(localProgress) {
   // Cache the precise xpointer so we can push it back unchanged when on the same chapter.
   // This prevents overwriting KOReader's /body/DocFragment[N]/body/div/p[M]/text().K
   // with a coarser chapter-start xpointer.
-  if (best.progress.startsWith('/body/DocFragment[')) {
+  if (best.progress && best.progress.startsWith('/body/DocFragment[')) {
     lastKnownXPointer = best.progress;
   }
 
@@ -4854,10 +6126,15 @@ async function syncOnOpen(localProgress) {
   const bestTime  = best.timestamp             || 0;
   log('[kosync] best:', best.device, Math.round((best.percentage||0)*100)+'%', 'ts:', bestTime, 'localTime:', localTime);
 
-  // Always advance the high-water mark; ensures we never push backwards later
+  // Always advance the high-water mark; ensures we never push backwards later. Paired spine
+  // index follows whichever side (local vs remote) actually won the max() below — see
+  // bestKnownRemoteSpineIdx's own comment.
   const remoteHighWater = Math.max(localPct, best.percentage || 0);
   if (remoteHighWater > bestKnownRemotePct) {
     bestKnownRemotePct = remoteHighWater;
+    bestKnownRemoteSpineIdx = (best.percentage || 0) >= localPct
+      ? spineIndexFromXPointer(best.progress)
+      : currentSpineIndex;
     log('[kosync] bestKnownRemotePct →', Math.round(bestKnownRemotePct * 100) + '%');
   }
 
@@ -4873,19 +6150,22 @@ async function syncOnOpen(localProgress) {
   const xpointerMatch = !!(localXPointer && best.progress && localXPointer === best.progress);
   log('[kosync] xpointerMatch:', xpointerMatch, 'local:', localXPointer, 'remote:', best.progress);
 
-  const pctDiffers = Math.abs((best.percentage || 0) - localPct) > 0.01;
+  // Chapter-first comparison (see compareKosyncPosition) — a plain percentage gap was too
+  // easily lost in the noise between engines on a book with many short chapters, which is
+  // exactly what let a real one-chapter gap read as "no difference" in a live report.
+  const cmp = compareKosyncPosition(best.percentage, best.progress, localPct, currentSpineIndex, 0.01);
   // Never silently jump backwards — only prompt when the remote is ahead.
   // If remote is behind local, it means we already synced more recently from this
   // device (e.g. the hide-beacon fired but localProgress hasn't updated yet).
-  const remoteIsAhead = (best.percentage || 0) > localPct + 0.005;
+  const remoteIsAhead = cmp > 0;
   // Exception: if the remote was saved MORE RECENTLY than our local progress (e.g.
   // user deliberately pushed KOSync backwards to re-read a chapter), honour it even
   // when it is behind.  Require >60 s gap to avoid spurious prompts from normal
-  // concurrent saves, and >0.5 % difference so trivial floating-point drift is ignored.
+  // concurrent saves, and a real position difference so trivial drift is ignored.
   const remoteIsNewerAndDiffers =
     bestTime > localTime + 60 &&
-    Math.abs((best.percentage || 0) - localPct) > 0.005;
-  if (!xpointerMatch && ((pctDiffers && remoteIsAhead) || remoteIsNewerAndDiffers)) {
+    compareKosyncPosition(best.percentage, best.progress, localPct, currentSpineIndex, 0.005) !== 0;
+  if (!xpointerMatch && (remoteIsAhead || remoteIsNewerAndDiffers)) {
     const doSync = await showSyncDialog(best, localPct, localTime);
     if (doSync) return { percentage: best.percentage, progress: best.progress };
   }
@@ -4902,21 +6182,32 @@ async function networkRestoreSync() {
   if (!currentBook || !isReady) return;
   try {
     const docKey = externalDocKey();
-    const [extResult, intResult] = await Promise.allSettled([
+    const [extResult, intResult, boResult] = await Promise.allSettled([
       fetchRemoteProgress(docKey),
       fetchInternalProgress(docKey),
+      fetchBookorbitProgress(),
     ]);
     const ext = extResult.status === 'fulfilled' ? extResult.value : null;
     const int = intResult.status === 'fulfilled' ? intResult.value : null;
+    const bo  = boResult.status  === 'fulfilled' ? boResult.value  : null;
+    const hasPosition = r => r && typeof r.percentage === 'number';
     let best = null;
-    if (ext?.progress) best = ext;
-    if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
-    if (!best?.progress) { log('[kosync] networkRestoreSync: no remote progress found'); return; }
+    if (hasPosition(ext)) best = ext;
+    if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+    if (hasPosition(bo)  && (!best || (bo.timestamp  || 0) > (best.timestamp || 0))) best = bo;
+    if (!hasPosition(best)) { log('[kosync] networkRestoreSync: no remote progress found'); return; }
 
     const remotePct = best.percentage || 0;
-    if (remotePct > bestKnownRemotePct) bestKnownRemotePct = remotePct;
+    if (remotePct > bestKnownRemotePct) {
+      bestKnownRemotePct = remotePct;
+      bestKnownRemoteSpineIdx = spineIndexFromXPointer(best.progress);
+    }
 
-    if (remotePct <= currentPct + 0.005) {
+    // Chapter-first (see compareKosyncPosition) — this path is fully automatic/silent, so a
+    // false "we're ahead" here (the old plain-percentage check, on a book with many short
+    // chapters) meant it never pulled a genuinely newer remote position at all, not just a
+    // wrong toast.
+    if (compareKosyncPosition(remotePct, best.progress, currentPct, currentSpineIndex, 0.005) <= 0) {
       // We're ahead or tied — nothing to pull. flushProgressOutbox (called by the trigger
       // below, before this runs) already pushed anything queued while genuinely offline;
       // the normal saveProgress high-water logic covers the rest. Equal case: no-op.
@@ -4925,12 +6216,9 @@ async function networkRestoreSync() {
     }
 
     log('[kosync] networkRestoreSync: auto-pulling remote position', Math.round(remotePct * 100) + '%');
-    if (best.progress.startsWith('/body/DocFragment[')) lastKnownXPointer = best.progress;
-    if (_cxReader) {
-      await _cxReader.goToPct(remotePct);
-      _cxReader.seekToPercent(remotePct);
-      currentCfi = _cxReader.makeCfi();
-    }
+    if (best.progress && best.progress.startsWith('/body/DocFragment[')) lastKnownXPointer = best.progress;
+    await navigateToSyncedPosition(remotePct, best.progress);
+    if (_cxReader) currentCfi = _cxReader.makeCfi();
     currentPct = remotePct;
     lastSyncedCfi = currentCfi;
     toast.success(t('reader.kosync_auto_pull_done', { pct: Math.round(remotePct * 100) }));
@@ -4976,6 +6264,9 @@ window.addEventListener('online', () => {
   if (!currentBook) return;
   syncOfflineBookmarks(currentBook.id).catch(() => {});
   syncOfflineAnnotations(currentBook.id).catch(() => {});
+  flushSessionCheckpoints().catch(() => {});
+  // Belt-and-suspenders (see the same line in the visibilitychange→visible handler above).
+  if (isReady && !sessionChunkStartTs) startStatsSession(currentBook.id);
   triggerNetworkRestore('online');
 });
 
@@ -4992,12 +6283,27 @@ function cxWantsTwoCol() {
 // Push the current column-mode decision into the live CXReader (re-paginates if needed).
 function _cxSyncLayout() {
   if (!_cxReader) return;
-  _cxReader.setLayout({ twoColumn: cxWantsTwoCol(), columnGap: prefs.margin * 2 });
+  _cxReader.setLayout({ twoColumn: cxWantsTwoCol(), columnGap: prefs.margin * 2, continuous: isContinuousMode() });
 }
 
 function _cxRelocatedHandler(e) {
+  // Continuous-scroll mode's position updates fire this same event on every scroll tick instead
+  // of going through goNext/goPrev (see those functions' own sessionPageCount++) — count it as
+  // reading activity too, throttled so a rapid burst of scroll ticks doesn't inflate the count
+  // far beyond paginated mode's one-tick-per-turn, and so a single momentary/involuntary scroll
+  // can't alone satisfy the >=2 "real session" bar this feeds (server/routes/stats.js).
+  if (isContinuousMode() && sessionChunkStartTs) {
+    const now = Date.now();
+    if (now - lastContinuousActivityTs >= CONTINUOUS_ACTIVITY_MIN_GAP_MS) {
+      lastContinuousActivityTs = now;
+      sessionPageCount++;
+    }
+  }
   if (pendingNavDirection) _pageEnter(pendingNavDirection);
   pendingNavDirection = null;
+  // Comic pages always render at full-bleed fit-to-screen zoom on arrival — reset any
+  // zoom/pan left over from the previous page.
+  if (isImmersivePageMode()) comicViewer.reset();
   const oldSpineIndex = currentSpineIndex;
   const { spineIndex, href, page, pageCount, endPage, twoColumn } = e.detail;
   currentSpineIndex = spineIndex;
@@ -5017,40 +6323,84 @@ function _cxRelocatedHandler(e) {
   }
   // Feed the chapter page-count cache so bookPage / timeLeftBook estimates improve over time
   if (pageCount > 0) chapPageCache[spineIndex] = pageCount;
+  // Scope currentChapPage/currentChapTotal/currentEndPage to the virtual TOC sub-chapter
+  // (its own anchor through just before the next TOC entry's anchor) instead of the whole
+  // physical spine file — same reason updateActiveTocItem() below needs to pick just ONE TOC
+  // entry active: a book that packs several chapters into one file otherwise always showed the
+  // WHOLE file's page count as "pages left in chapter", no matter which of its sub-chapters was
+  // actually open (confirmed live). chapPageCache above is deliberately left alone — it drives
+  // the whole-BOOK page/time-left estimate from real per-file page counts, and must keep
+  // reflecting the whole file regardless of this scoping.
+  if (_cxReader && !isImmersivePageMode()) {
+    const range = resolveActiveTocEntry(href, page, pageCount);
+    if (range && (range.startPage > 1 || range.endPage < pageCount)) {
+      const span = Math.max(1, range.endPage - range.startPage + 1);
+      currentChapPage  = Math.min(span, Math.max(1, page - range.startPage + 1));
+      currentEndPage   = endPage ? Math.min(span, Math.max(1, endPage - range.startPage + 1)) : currentChapPage;
+      currentChapTotal = span;
+    }
+  }
   log(`[CXReader] relocated spine=${spineIndex} page=${page}/${pageCount} pct=${(currentPct*100).toFixed(1)}%`);
   trackReadingSpeed();
   renderStatusSlots();
+  // Book/chapter progress bar fill % (updateBookProgressBar/updateChapProgressBar) is only
+  // ever otherwise recomputed from a settings change — nothing previously kept it live as
+  // pages turned. This also re-asserts the bars' display:'' on every relocate, which is what
+  // actually fixes the real-world symptom: enabling a progress bar, closing the book, and
+  // reopening it left the bar checked-but-invisible until some unrelated settings toggle
+  // incidentally called applyProgressBarLayout() again. initSettingsUi()'s own call happens
+  // once, early, before the book has rendered a single page — this piggybacks on the same
+  // "runs on every real page render" guarantee renderStatusSlots() already relies on, so a
+  // freshly opened book gets a correct, live-updating bar without depending on that first
+  // call landing at exactly the right moment.
+  applyProgressBarLayout();
   updateActiveTocItem(href);
   // First cx-relocated: status bars now have content → measure real inset and reinit
   // paginator so page boundaries reflect the visible area (not the full viewer height).
-  if (!_cxViewerPaddingSet && _cxReader) {
+  // Comics skip this entirely — status bars overlay the full-bleed image instead of
+  // reserving space (see cxreader/index.js's _renderCbzItem), so there's no inset to
+  // repaginate around.
+  if (!_cxViewerPaddingSet && _cxReader && !isImmersivePageMode()) {
     _cxViewerPaddingSet = true;
     _cxMeasureViewerInset();
     if (_cxViewerPadTop > 0 || _cxViewerPadBot > 0) {
-      if (_cxReader._isCbz) {
-        _cxReader.setCbzInset(_cxViewerPadTop, _cxViewerPadBot);
-      } else {
-        _cxReader.reinitPaginator();
-        // Re-sync ALL page vars (not just the total) from the inset-corrected paginator, and
-        // refresh the cache, so the very first page shows the right page/total immediately.
-        currentChapPage  = _cxReader.page;
-        currentEndPage   = _cxReader.endPage;
-        currentChapTotal = _cxReader.pageCount;
-        if (currentChapTotal > 0) chapPageCache[spineIndex] = currentChapTotal;
-        renderStatusSlots();
-      }
+      _cxReader.reinitPaginator();
+      // Re-sync ALL page vars (not just the total) from the inset-corrected paginator, and
+      // refresh the cache, so the very first page shows the right page/total immediately.
+      currentChapPage  = _cxReader.page;
+      currentEndPage   = _cxReader.endPage;
+      currentChapTotal = _cxReader.pageCount;
+      if (currentChapTotal > 0) chapPageCache[spineIndex] = currentChapTotal;
+      renderStatusSlots();
     }
   }
   if (isReady) {
     const crossedChapter = oldSpineIndex !== null && spineIndex !== oldSpineIndex;
-    if (crossedChapter) {
+    if (crossedChapter && currentBook) logChapterVisit(currentBook.id, href, chapterLabelFromHref(href));
+    if (isContinuousMode()) {
+      // Continuous mode gets neither of the two paths below: forcing an immediate remote push
+      // on every crossedChapter (like the discrete-mode branch does) spams the server — a fast
+      // scroll can blow through many spine items a second (especially in a comic, where each
+      // image IS a spine item), confirmed live as dozens of BookOrbit/KOSync pushes in a
+      // couple of seconds. But relying purely on the 60s idle debounce (like an ordinary
+      // within-chapter page turn) would leave other devices' synced position stale for the
+      // entire reading session, only updating once the book is closed. So: local save is
+      // still (re)scheduled on every relocate via the debounce below, and a REMOTE push is
+      // additionally allowed through at most once every CONTINUOUS_REMOTE_PUSH_MS — frequent
+      // enough to keep other devices reasonably current, far too infrequent to spam anything.
+      if (currentPct > 0) scheduleDebouncedSync();
+      const nowTs = Date.now();
+      if (nowTs - _continuousRemotePushTs >= CONTINUOUS_REMOTE_PUSH_MS) {
+        _continuousRemotePushTs = nowTs;
+        void saveProgress({ allowRemote: true });
+      }
+    } else if (crossedChapter) {
       // Chapter boundary — mirror epub.js: force remote push, log visit, reset debounce.
       const alreadySent = href === lastSentChapterHref;
       const bookmarkPending = !!preBookmarkCfi;
       saveProgress({ forceRemote: !alreadySent && !bookmarkPending, allowRemote: !alreadySent && !bookmarkPending });
       cancelDebouncedSync();
       writeInterruptedSession();
-      if (currentBook) logChapterVisit(currentBook.id, href, chapterLabelFromHref(href));
       if (!alreadySent && !bookmarkPending) lastSentChapterHref = href;
     } else if (currentPct > 0) {
       // Within-chapter page turn — debounce remote push (matches epub.js pattern).
@@ -5060,8 +6410,14 @@ function _cxRelocatedHandler(e) {
     // True end of book — CXReader's pct is a page-fraction that never actually reaches 1.0
     // (see server/utils/bookCompletion.js), so detect the real last page directly instead:
     // last page of the last spine item. Not shown in peek mode (peek never saves progress).
+    // In two-column mode `page` is only the LEFT page of the current spread — on a book whose
+    // last spread starts at an odd page and pageCount is even (e.g. page=191/pageCount=192),
+    // `page` alone never reaches pageCount even though the spread's right-hand page (endPage)
+    // is the actual last page on screen. Confirmed live: this silently ate the "book finished"
+    // notification on a two-column read. endPage is 0 in single-column mode, hence the `||`.
     const spineTotal = _cxReader?.spine?.length || 0;
-    const atBookEnd = pageCount > 0 && page >= pageCount && spineTotal > 0 && spineIndex === spineTotal - 1;
+    const lastVisiblePage = Math.max(page, endPage || 0);
+    const atBookEnd = pageCount > 0 && lastVisiblePage >= pageCount && spineTotal > 0 && spineIndex === spineTotal - 1;
     if (atBookEnd && !_finishedMessageShown && !isPeekMode) {
       _finishedMessageShown = true;
       saveProgress({ forceRemote: true }).catch(() => {});
@@ -5112,9 +6468,39 @@ function _attachCxKbd(iframe) {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: e.key, bubbles: true }));
   }, true);
   iframe.contentWindow.addEventListener('wheel', (e) => {
+    if (isContinuousMode()) {
+      // Native scroll handles wheel input WITHIN a chapter on its own — nothing to do here for
+      // that. But at the very top/bottom of what's currently loaded, there's nothing left to
+      // scroll, so a wheel gesture there produces no 'scroll' event at all and would otherwise
+      // just do nothing (confirmed live: most noticeably on a short chapter — e.g. a
+      // single-page "Copyright"/"Dedication" chapter — that never has anything to scroll in
+      // the first place). Step in only at that boundary to advance/retreat chapters instead.
+      const doc = iframe.contentDocument;
+      const se  = doc?.scrollingElement || doc?.documentElement;
+      if (!se) return;
+      const atBottom = se.scrollTop + se.clientHeight >= se.scrollHeight - 2;
+      const atTop    = se.scrollTop <= 2;
+      if (e.deltaY > 0 && atBottom) _continuousBoundaryNav('next');
+      else if (e.deltaY < 0 && atTop) _continuousBoundaryNav('prev');
+      return;
+    }
     if (!prefs.mouseWheelNav) return;
     document.dispatchEvent(new CustomEvent('br-wheel', { detail: { deltaY: e.deltaY } }));
   }, { passive: true });
+}
+
+// Cooldown-guarded chapter-boundary nav for continuous mode — shared by wheel (_attachCxKbd
+// above) and touch (attachIframeTouchNav below), both of which step in only when there's
+// nothing left to scroll. A fast trackpad/wheel or a quick second swipe can fire multiple
+// times while still sitting at the boundary, each of which would otherwise call
+// goNext()/goPrev() again before the previous chapter-advance finished rendering. Mirrors
+// handleWheel's own wheelCooldown pattern.
+let _continuousBoundaryCooldown = false;
+function _continuousBoundaryNav(dir) {
+  if (_continuousBoundaryCooldown) return;
+  _continuousBoundaryCooldown = true;
+  setTimeout(() => { _continuousBoundaryCooldown = false; }, 400);
+  if (dir === 'next') goNext(); else goPrev();
 }
 
 // Returns a spine-level CFI for the current CXReader chapter (fallback when range is unavailable).
@@ -5314,6 +6700,27 @@ function _cxApplyIframeInset(iframe) {
   iframe.style.height    = inset > 0 ? `calc(100% - ${inset}px)` : '100%';
 }
 
+// See the call site's own comment (startCXRendition, right after _cxReader.open()) for when
+// this runs. Reaches into _cxReader._book._pdfDoc directly — reader.js already does the same
+// for _isCbz/_isPdf themselves throughout this file, cxreader/index.js has no public accessor
+// for the underlying pdf.js document and doesn't need one just for this.
+async function _backfillPdfCover(cxReader, book) {
+  try {
+    const doc = cxReader._book?._pdfDoc;
+    if (!doc) return;
+    const blob = await renderPdfCoverBlob(doc);
+    if (!blob) return;
+    const coverPath = await uploadPdfCover(apiFetch, book.id, blob);
+    if (coverPath) {
+      book.cover_path = coverPath;
+      if (currentBook === book) currentBook.cover_path = coverPath;
+      saveBookMeta(book).catch(() => {}); // keep the offline metadata cache in sync too
+    }
+  } catch (err) {
+    log('[reader] PDF cover backfill failed:', err?.message);
+  }
+}
+
 async function startCXRendition(displayCfi = null) {
   _cxViewerPaddingSet = false;
   _cxViewerPadTop = 0;
@@ -5339,11 +6746,44 @@ async function startCXRendition(displayCfi = null) {
   window.addEventListener('message', _cxLinkHandler);
 
   try {
-    const { CXReader } = await import('./cxreader/index.js');
+    // Cache-busted like reader.js's own <script> tag (see reader.html) — this dynamic import
+    // has no query string of its own otherwise, so it can go stale independently of reader.js
+    // (browser/SW cache keys purely on URL) even when reader.js itself is freshly fetched.
+    // Bump this alongside reader.html's ?v= whenever cxreader/index.js changes.
+    const { CXReader } = await import('./cxreader/index.js?v=br-v121');
     _cxReader = new CXReader();
+    _cxReader.setPdfPaperInversion(prefs.pdfPaperInversion);
     _cxReader.onBeforePaginate = (iframe) => { _cxApplyIframeInset(iframe); _cxApplyHooks(iframe); };
 
-    await _cxReader.open(_epubArrayBuffer);
+    await _cxReader.open(_epubArrayBuffer, currentBook?.title);
+    // Backfill a cover for a PDF that arrived without one — manual uploads already get theirs
+    // right after upload (see library.js), but a PDF added via OPDS or BookOrbit import happens
+    // server-side with no browser in the loop to render one at import time. Fire-and-forget:
+    // purely cosmetic, must never delay or fail the actual open.
+    //
+    // Gated on peek_expires_at (a genuinely ephemeral, soon-to-be-deleted row), NOT on isPeekMode
+    // — isPeekMode is just the read-only "?peek=1" URL flag, used for two very different things:
+    // an actual ephemeral BookOrbit/OPDS preview row (peek_expires_at set), and a normal
+    // permanently-owned book opened read-only for a quick look (e.g. jumping to a bookmark from
+    // library.js — see its own "peek=1" links, no ephemeral row involved at all). Excluding the
+    // latter meant a real book's PDF cover could never backfill at all if the user always happens
+    // to open it via one of those peek-flagged links — confirmed live: BookOrbit's "already
+    // downloaded" peek icon (bookorbit.js renderPeekButton) always adds peek=1 regardless of
+    // ownership. Generating a cover is a harmless, idempotent side effect either way; only a
+    // truly ephemeral row (about to be deleted) makes it pointless to bother.
+    if (_cxReader._isPdf && !currentBook?.peek_expires_at && currentBook?.id && !currentBook.cover_path) {
+      void _backfillPdfCover(_cxReader, currentBook);
+    }
+    // Comics always start with chrome hidden, regardless of the user's own autoHideHeader
+    // preference — see the .comic-mode rules in reader.css and handleComicTap()/
+    // handleComicDesktopClick() below.
+    readerLayout.classList.toggle('comic-mode', isImmersivePageMode());
+    readerLayout.classList.toggle('continuous', isContinuousMode());
+    if (isImmersivePageMode()) readerLayout.classList.remove('header-peek', 'bars-peek');
+    // Re-apply now that isImmersivePageMode() (_cxReader._isCbz / _isPdf) is actually known — the
+    // earlier applyUiTheme() call in init() ran before _cxReader existed, so it couldn't yet
+    // force the safe-area-fill strip (notch/camera-hole area) black for a comic.
+    applyUiTheme();
     if (_cxReader.toc?.length) {
       buildToc(_cxReader.toc);
       buildChapterMarkers();
@@ -5358,8 +6798,10 @@ async function startCXRendition(displayCfi = null) {
       if (_m) _cxStartIdx = Math.max(0, Math.floor(parseInt(_m[1], 10) / 2) - 1);
     }
 
-    // Choose single/two-column BEFORE the first render so page counts are correct from page 1.
-    _cxReader.setLayout({ twoColumn: cxWantsTwoCol(), columnGap: prefs.margin * 2 });
+    // Choose single/two-column/continuous BEFORE the first render so page counts are correct
+    // from page 1 (and, for continuous mode, so _makePaginator() picks ScrollPaginator from
+    // the very first render instead of only after a later setLayout call).
+    _cxReader.setLayout({ twoColumn: cxWantsTwoCol(), columnGap: prefs.margin * 2, continuous: isContinuousMode() });
 
     const readerCss = buildEpubCss();
     await _cxReader.renderChapter(_cxStartIdx, viewer, readerCss);
@@ -5431,7 +6873,8 @@ function _slideCapable() { return !prefs.eink && !_isLegacyWv; }
 function _useEngineSlide() {
   return (prefs.pageTurnAnim === 'paper' || prefs.pageTurnAnim === 'momentum')
     && !!_cxReader
-    && !_cxReader._isCbz && !_cxReader._isFixedLayout
+    && !isImmersivePageMode() && !_cxReader._isFixedLayout
+    && !isContinuousMode()
     && _slideCapable();
 }
 
@@ -5480,7 +6923,8 @@ function _momEnabled() {
   return prefs.pageTurnDrag
     && (prefs.pageTurnAnim === 'paper' || prefs.pageTurnAnim === 'momentum')
     && !!_cxReader
-    && !_cxReader._isCbz && !_cxReader._isFixedLayout
+    && !isImmersivePageMode() && !_cxReader._isFixedLayout
+    && !isContinuousMode()
     && _slideCapable() && isTouchReader() && !hasOpenPanel();
 }
 
@@ -5590,8 +7034,17 @@ function goNext() {
   // (see CXReader.next() in cxreader/index.js). Re-show the "book finished" overlay (with its
   // own "return to library" option) instead of doing nothing, since the automatic one-time
   // overlay from _cxRelocatedHandler may already have been dismissed by now.
+  // Must use _cxReader's own raw page/pageCount here, NOT currentChapPage/currentChapTotal —
+  // those get rescoped to the virtual TOC sub-chapter span when several chapters share one
+  // physical spine file (see _cxRelocatedHandler's resolveActiveTocEntry call). On a book whose
+  // LAST spine file packs many anchor-based chapters together, that made finishing just the
+  // first sub-chapter in that file look like "the true end of book" — confirmed live.
+  // Same two-column spread caveat as _cxRelocatedHandler's atBookEnd check above: `page` alone
+  // is only the spread's left page, so use whichever of page/endPage is further along.
   const spineTotal = _cxReader?.spine?.length || 0;
-  const atBookEnd = currentChapTotal > 0 && currentChapPage >= currentChapTotal
+  const physPage = Math.max(_cxReader?.page ?? 1, _cxReader?.endPage || 0);
+  const physPageCount = _cxReader?.pageCount ?? 1;
+  const atBookEnd = physPageCount > 0 && physPage >= physPageCount
     && spineTotal > 0 && currentSpineIndex === spineTotal - 1;
   if (atBookEnd) { showBookFinishedOverlay(); return; }
   _pageExit('next');
@@ -5634,18 +7087,109 @@ let touchStartY = 0;
 let suppressNextTap = false; // set by long-press dict lookup to prevent navigation on touchend
 let _selectSuppressNav = false; // true while a text-selection gesture is active — blocks swipe-nav preventDefault
 
+// Comic-mode-only, TOUCH tap path (see handleTouchEnd below): resolves a simple tap into a
+// page turn (nav zone / vertical tap zones), only at fit-to-screen zoom. Chrome reveal on
+// touch is swipe-only now (comicSwipeChrome, in handleTouchEnd) — not tap — so a tap that
+// isn't in a nav zone (or the page is zoomed in) simply does nothing. inNavZone(x) here is
+// only ever relevant to touch: a real edge click on the visible nav-zone-prev/next bands
+// never reaches this function at all (separate DOM elements with their own click listeners,
+// always winning first).
+function handleComicTap(x, y) {
+  if (comicViewer.zoom > 1) return;
+  const nav = inNavZone(x);
+  if (nav) { nav === 'prev' ? goPrev() : goNext(); return; }
+  if (prefs.vertNavZones) {
+    const isTop  = y < window.innerHeight / 2;
+    const goBack = prefs.vertNavZonesReversed ? !isTop : isTop;
+    goBack ? goPrev() : goNext();
+  }
+}
+
+// Comic-mode-only, DESKTOP click path: a plain left-half/right-half page-turn split,
+// independent of the configurable navZoneLeftPct/RightPct (which default to 0 — disabled —
+// and are shared with EPUB reading) since half-screen click-to-page is the standard,
+// discoverable comic-reader convention and shouldn't depend on tuning an unrelated setting.
+// No bars-reveal here at all: on desktop that's entirely hover-driven (header-sensor /
+// footer-sensor), so every click is free to just turn the page.
+function handleComicDesktopClick(x) {
+  if (comicViewer.zoom > 1) return; // zoomed: click doesn't page — drag/pan owns the gesture
+  x < window.innerWidth / 2 ? goPrev() : goNext();
+}
+
+// Comic mode routes a touch through comicViewer (pan/pinch) once either two fingers are down
+// or the page is already zoomed in — otherwise it falls through to the normal tap/swipe/nav-
+// zone handling below unmodified, so swipe-to-page-turn never needs reimplementing here.
+// Continuous comic mode never engages this at all — pinch/wheel zoom is out of scope there
+// (see the continuous-mode plan), and comicViewer.zoom never exceeds 1 since nothing else
+// calls into comicViewer for continuous mode either, so a stray 2-finger touch doesn't need
+// a special exclusion beyond this one check.
+let _comicGestureOwnsTouch = false;
+
 function handleTouchStart(e) {
+  if (isImmersivePageMode() && !isContinuousMode() && (e.touches.length >= 2 || comicViewer.zoom > 1)) {
+    _comicGestureOwnsTouch = true;
+    comicViewer.onTouchStart(e);
+    return;
+  }
+  _comicGestureOwnsTouch = false;
   touchStartX = e.changedTouches[0].clientX;
   touchStartY = e.changedTouches[0].clientY;
 }
 
+function handleTouchMove(e) {
+  if (_comicGestureOwnsTouch) { comicViewer.onTouchMove(e); return; }
+  // Continuous mode (comics): same reasoning as the EPUB iframe's own touchmove handler in
+  // attachIframeTouchNav — block the browser's own pull-to-refresh/overscroll-bounce right at
+  // the scroll boundary, or it can hijack the gesture (up to and including reloading the page)
+  // instead of leaving it to our own boundary-swipe chapter nav.
+  if (isImmersivePageMode() && isContinuousMode()) {
+    const curX = e.touches[0].clientX, curY = e.touches[0].clientY;
+    const absDx = Math.abs(curX - touchStartX), absDy = Math.abs(curY - touchStartY);
+    if (absDy > 8 && absDy > absDx) {
+      const pag = _cxReader?._paginator;
+      const draggingDown = curY > touchStartY;
+      if ((draggingDown && pag?.isAtStart) || (!draggingDown && pag?.isAtEnd)) e.preventDefault();
+    }
+  }
+}
+
 function handleTouchEnd(e) {
+  if (_comicGestureOwnsTouch) {
+    const result = comicViewer.onTouchEnd(e);
+    if (e.touches.length > 0) { comicViewer.onTouchStart(e); return; } // fingers remain — re-anchor, keep owning
+    _comicGestureOwnsTouch = false;
+    if (result?.type === 'tap') handleComicTap(result.x, result.y);
+    return;
+  }
   if (suppressNextTap) { suppressNextTap = false; return; }
   const dx    = e.changedTouches[0].clientX - touchStartX;
   const dy    = e.changedTouches[0].clientY - touchStartY;
   const absDx = Math.abs(dx);
   const absDy = Math.abs(dy);
   const y     = e.changedTouches[0].clientY;
+  // Continuous comic mode: vertical drag is native scroll (never intercepted — see
+  // handleTouchMove/handleTouchStart above, _comicGestureOwnsTouch never engages here), so the
+  // only gesture left for this handler to resolve is a horizontal swipe — axis-dominance
+  // checked explicitly so it doesn't fight scrolling. Swipe left→right (rightward, dx>0)
+  // toward the toolbar, right→left toward the status bars — reusing comicSwipeChrome's exact
+  // 'down'/'up' semantics (toward header / toward bars) from the paginated case, just keyed
+  // off the horizontal axis instead of vertical since vertical is now claimed by scroll. No
+  // page-turn/tap-to-page here at all — there's no discrete page in continuous mode.
+  if (isImmersivePageMode() && isContinuousMode()) {
+    if (absDx > absDy && absDx > SWIPE_THRESHOLD) comicSwipeChrome(dx > 0 ? 'down' : 'up');
+    return;
+  }
+  // Paginated comic mode: vertical swipe is the ONLY way to reveal chrome on touch (see
+  // comicSwipeChrome's own comment for why) — entirely independent of prefs.autoHideHeader,
+  // and checked before it so EPUB's own swipe-to-reveal-header behaviour below is untouched.
+  if (isImmersivePageMode() && dy > SWIPE_DOWN_OPEN && absDx < 70) {
+    comicSwipeChrome('down');
+    return;
+  }
+  if (isImmersivePageMode() && dy < -SWIPE_UP_CLOSE && absDx < 70) {
+    comicSwipeChrome('up');
+    return;
+  }
   if (prefs.autoHideHeader && dy > SWIPE_DOWN_OPEN && absDx < 70) {
     const wasHidden = !readerLayout.classList.contains('header-peek');
     if (!readerLayout.classList.toggle('header-peek')) closeJumpPanel();
@@ -5660,6 +7204,10 @@ function handleTouchEnd(e) {
   }
   if (absDx < TAP_MAX_DRIFT && absDy < TAP_MAX_DRIFT) {
     const x = e.changedTouches[0].clientX;
+    // Comic mode: handleComicTap already covers nav-zone / vertNavZones / bars-reveal (in
+    // that order) for a plain tap — comic pages have no per-iframe touch handler to fall
+    // back on for this at all (unlike EPUB's attachIframeTouchNav), so it belongs here.
+    if (isImmersivePageMode()) { handleComicTap(x, y); return; }
     const nav = inNavZone(x);
     if (nav === 'prev') { goPrev(); return; }
     if (nav === 'next') { goNext(); return; }
@@ -5676,7 +7224,42 @@ function handleTouchEnd(e) {
 }
 // Attach to the host container — covers the area outside the iframe (nav zones etc)
 epubViewer.addEventListener('touchstart', handleTouchStart, { passive: true });
+epubViewer.addEventListener('touchmove',  handleTouchMove,  { passive: false });
 epubViewer.addEventListener('touchend',   handleTouchEnd,   { passive: false });
+
+// ── Comic mode: desktop mouse drag-to-pan + click-to-page, wheel/pinch-to-zoom ────────────
+// Only meaningfully active once isImmersivePageMode() — the listeners are unconditional
+// (cheap early-return) to keep binding in one place rather than attach/detach per book.
+let _mouseDownX = 0, _mouseDownY = 0, _mouseDragged = false;
+epubViewer.addEventListener('mousedown', (e) => {
+  if (!isImmersivePageMode()) return;
+  _mouseDownX = e.clientX; _mouseDownY = e.clientY; _mouseDragged = false;
+  if (comicViewer.zoom > 1) comicViewer.onDragStart(e.clientX, e.clientY);
+});
+epubViewer.addEventListener('mousemove', (e) => {
+  if (!isImmersivePageMode() || e.buttons !== 1) return;
+  if (Math.hypot(e.clientX - _mouseDownX, e.clientY - _mouseDownY) > TAP_MAX_DRIFT) _mouseDragged = true;
+  if (comicViewer.zoom > 1) comicViewer.onDragMove(e.clientX, e.clientY);
+});
+// Bound on window, not epubViewer, so a drag that ends after the cursor left the viewer
+// (fast mouse movement) still resolves instead of leaving comicViewer's drag state stuck.
+window.addEventListener('mouseup', () => { if (isImmersivePageMode()) comicViewer.onDragEnd(); });
+epubViewer.addEventListener('click', (e) => {
+  // Continuous mode: no discrete page to click-turn to — desktop chrome reveal is entirely
+  // hover-driven there (header-sensor/footer-sensor), unaffected by this being a no-op.
+  if (!isImmersivePageMode() || isContinuousMode()) return;
+  if (_mouseDragged) { _mouseDragged = false; return; } // a real drag — not a page-turn click
+  handleComicDesktopClick(e.clientX);
+});
+// (Comic-mode wheel-zoom is handled by the existing wheel listener further down, near
+// handleWheel — kept as a single listener rather than a second one on the same element.)
+// Safari desktop trackpad pinch — Chrome/Firefox trackpad pinch instead arrives as a
+// ctrlKey wheel event, already handled by comicViewer.onWheel above.
+if ('GestureEvent' in window) {
+  epubViewer.addEventListener('gesturestart',  (e) => { if (isImmersivePageMode()) comicViewer.onGestureStart(e); });
+  epubViewer.addEventListener('gesturechange', (e) => { if (isImmersivePageMode()) comicViewer.onGestureChange(e); });
+  epubViewer.addEventListener('gestureend',    (e) => { if (isImmersivePageMode()) comicViewer.onGestureEnd(e); });
+}
 
 // Per-page: forward touch events from inside the epub iframe into our handlers
 function attachIframeTouchNav(view) {
@@ -5689,6 +7272,14 @@ function attachIframeTouchNav(view) {
   let iframeOffX = 0, iframeOffY = 0;
 
   win.addEventListener('touchstart', (e) => {
+    // suppressNextTap is set (in attachIframeDictionary's long-press timer, while the finger
+    // is still down) so THAT gesture's own touchend doesn't also trigger nav. It's normally
+    // consumed there — but if Android's native text-selection UI swallows that specific
+    // touchend once it takes over (it can), the flag is left stuck true and silently eats
+    // the NEXT, unrelated tap instead (e.g. the tap that deselects the word), before that
+    // tap's own nav-zone logic ever runs. A brand new touch starting is proof any previous
+    // gesture has fully ended, so clear it here too, not just on touchend.
+    suppressNextTap = false;
     const iframe = view.element?.querySelector('iframe') || view.element;
     iframeOffX   = iframe ? iframe.getBoundingClientRect().left : 0;
     iframeOffY   = iframe ? iframe.getBoundingClientRect().top  : 0;
@@ -5705,9 +7296,22 @@ function attachIframeTouchNav(view) {
     // Momentum finger-tracking drives the live page slide; if it engages it owns
     // the gesture (it preventDefaults too).
     if (_momMove(e.touches[0].clientX + iframeOffX, e.touches[0].clientY + iframeOffY, e)) return;
+    const curY = e.touches[0].clientY + iframeOffY;
     const absDx = Math.abs(e.touches[0].clientX + iframeOffX - touchStartX);
-    const absDy = Math.abs(e.touches[0].clientY + iframeOffY - touchStartY);
-    if (absDx > 8 && absDx > absDy) e.preventDefault();
+    const absDy = Math.abs(curY - touchStartY);
+    if (absDx > 8 && absDx > absDy) { e.preventDefault(); return; }
+    // Continuous mode: block the browser's own pull-to-refresh / overscroll-bounce right at
+    // the scroll boundary — dragging further down with nothing above (or up with nothing
+    // below) otherwise hands the gesture to the BROWSER instead of our own boundary-swipe
+    // chapter nav (see touchend below), and on at least some mobile browsers that native
+    // gesture can reload the page outright — confirmed live as "the whole content disappears"
+    // scrolling up from the very first page. Only guarded right at the boundary, so a normal
+    // scroll that's actually moving content is never touched.
+    if (isContinuousMode() && absDy > 8 && absDy > absDx) {
+      const pag = _cxReader?._paginator;
+      const draggingDown = curY > touchStartY; // finger moving down = trying to scroll UP further
+      if ((draggingDown && pag?.isAtStart) || (!draggingDown && pag?.isAtEnd)) e.preventDefault();
+    }
   }, { passive: false });
 
   // Zone-click navigation from inside the iframe (desktop + any pointer type).
@@ -5717,7 +7321,7 @@ function attachIframeTouchNav(view) {
   // of treating the first click as a navigation intent.
   let _zoneClickTimer = null;
   win.addEventListener('click', (e) => {
-    if (hasOpenPanel()) return;
+    if (hasOpenPanel() || isContinuousMode()) return; // continuous: no discrete page to click-jump to
     const iframe = view.element?.querySelector('iframe') || view.element;
     const offX = iframe ? iframe.getBoundingClientRect().left : 0;
     const nav = inNavZone(e.clientX + offX);
@@ -5756,7 +7360,14 @@ function attachIframeTouchNav(view) {
     const dy     = cy - touchStartY;
     const absDx  = Math.abs(dx);
     const absDy  = Math.abs(dy);
-    if (prefs.autoHideHeader && dy > SWIPE_DOWN_OPEN && absDx < 70) {
+    // Continuous mode: dy has no upper bound in these two checks below (by design, for the
+    // normal short deliberate reveal-gesture they're meant for) — but every ordinary downward
+    // scroll drag in continuous mode also satisfies "dy > SWIPE_DOWN_OPEN", so without this
+    // guard the header would pop open on every scroll-down instead of only a real short swipe.
+    // Continuous EPUB has no autoHideHeader-driven swipe-reveal of its own at all (status bars
+    // stay always-visible, same as paginated EPUB — see the continuous-mode plan), so skipping
+    // both checks entirely here is correct, not just a narrower threshold.
+    if (prefs.autoHideHeader && !isContinuousMode() && dy > SWIPE_DOWN_OPEN && absDx < 70) {
       if (e.cancelable) e.preventDefault();
       const wasHidden = !readerLayout.classList.contains('header-peek');
       if (!readerLayout.classList.toggle('header-peek')) closeJumpPanel();
@@ -5764,7 +7375,7 @@ function attachIframeTouchNav(view) {
       syncHeaderDismissBackdrop();
       return;
     }
-    if (prefs.autoHideHeader && dy < -SWIPE_UP_CLOSE && absDx < 70 && readerLayout.classList.contains('header-peek')) {
+    if (prefs.autoHideHeader && !isContinuousMode() && dy < -SWIPE_UP_CLOSE && absDx < 70 && readerLayout.classList.contains('header-peek')) {
       if (e.cancelable) e.preventDefault();
       forceHideAutoHeader();
       closeJumpPanel();
@@ -5773,34 +7384,60 @@ function attachIframeTouchNav(view) {
     if (absDx < TAP_MAX_DRIFT && absDy < TAP_MAX_DRIFT) {
       // Footnote links take priority over navigation hot zones — let the click fire
       if (e.changedTouches[0].target?.closest?.('a[data-footnote-href]')) return;
-      const nav = inNavZone(cx);
+      // Continuous mode: no discrete page to tap-jump to — a nav-zone/vertical-zone tap there
+      // just disorients (confirmed live: "jumps lower but it's hard to figure out where you
+      // left off"), so both are skipped entirely; scrolling is the only way to move.
+      const nav = isContinuousMode() ? null : inNavZone(cx);
       if (nav) {
         if (e.cancelable) e.preventDefault();
         if (nav === 'prev') goPrev(); else goNext();
         if (prefs.autoHideHeader && readerLayout.classList.contains('header-peek')) forceHideAutoHeader();
         return;
       }
-      // Vertical tap zones (one-handed navigation) — only when no overlay is open
-      if (prefs.vertNavZones) {
-        const anyOverlay = hasOpenPanel()
-          || document.getElementById('annot-toolbar')?.classList.contains('open')
-          || document.getElementById('sleep-timer-panel')?.classList.contains('open')
-          || document.getElementById('footnote-popup')?.classList.contains('open');
-        if (!anyOverlay && !e.changedTouches[0].target?.closest?.('a')) {
-          const sel = win.getSelection?.();
-          if (!sel || sel.isCollapsed) {
-            const isTop = cy < window.innerHeight / 2;
-            const goBack = prefs.vertNavZonesReversed ? !isTop : isTop;
-            if (e.cancelable) e.preventDefault();
-            if (goBack) goPrev(); else goNext();
-            if (prefs.autoHideHeader && readerLayout.classList.contains('header-peek')) forceHideAutoHeader();
-            return;
-          }
-        }
+      // Vertical tap zones (one-handed navigation). A *different* kind of overlay (settings/
+      // search/TOC/sleep-timer/footnote popup) should just close on this tap, not also
+      // navigate. A lingering text selection / annotation toolbar / dict popup left over from
+      // an earlier long-press, by contrast, is cleared right here — synchronously, ourselves —
+      // instead of waiting for Android to get around to collapsing the native Selection object
+      // on its own, which doesn't happen promptly enough to read reliably (a prior attempt at
+      // this used a 60ms re-check delay; still wasn't enough — clearPressHighlight's own
+      // linger is 500ms). Not depending on that timing at all is what lets this same tap both
+      // dismiss the leftover selection/popup and turn the page in one go.
+      const otherOverlayOpen = hasOpenPanel()
+        || document.getElementById('sleep-timer-panel')?.classList.contains('open')
+        || document.getElementById('footnote-popup')?.classList.contains('open');
+      if (prefs.vertNavZones && !isContinuousMode() && !otherOverlayOpen && !e.changedTouches[0].target?.closest?.('a')) {
+        if (e.cancelable) e.preventDefault();
+        if (document.getElementById('dict-popup')?.classList.contains('open')) closeDictPopup();
+        if (document.getElementById('annot-toolbar')?.classList.contains('open')) closeAnnotationToolbar(true);
+        clearPressHighlight();
+        const isTop = cy < window.innerHeight / 2;
+        const goBack = prefs.vertNavZonesReversed ? !isTop : isTop;
+        if (goBack) goPrev(); else goNext();
+        if (prefs.autoHideHeader && readerLayout.classList.contains('header-peek')) forceHideAutoHeader();
+        return;
       }
       if (prefs.autoHideHeader && readerLayout.classList.contains('header-peek')) {
         if (e.cancelable) e.preventDefault();
         forceHideAutoHeader();
+      }
+      return;
+    }
+    // Continuous mode: no horizontal page-turn on swipe — a discrete page-jump makes no sense
+    // once there's no discrete page (confirmed live: "swiping left and right will still jump
+    // to next page... makes no sense"). Vertical drag is native scroll wherever there's
+    // actually something to scroll; the one gap that leaves is a chapter (or the exact edge of
+    // one) with NOTHING left to scroll at all — most commonly a short single-page chapter (a
+    // title/copyright page) — where touchmove never fires a native scroll in the first place,
+    // so there'd otherwise be no way to swipe past it (confirmed live too: "on single page
+    // chapters I can't scroll to next chapter"). Gated on the paginator's own isAtEnd/isAtStart
+    // so a normal scroll that already moved real content never ALSO triggers a chapter jump —
+    // mirrors the wheel-boundary fix in _attachCxKbd's wheel listener above.
+    if (isContinuousMode()) {
+      if (absDy > absDx && absDy > SWIPE_THRESHOLD) {
+        const pag = _cxReader?._paginator;
+        if (dy < 0 && pag?.isAtEnd) { if (e.cancelable) e.preventDefault(); _continuousBoundaryNav('next'); }
+        else if (dy > 0 && pag?.isAtStart) { if (e.cancelable) e.preventDefault(); _continuousBoundaryNav('prev'); }
       }
       return;
     }
@@ -5862,6 +7499,37 @@ function isAndroidApp() {
   return navigator.userAgent.includes('CodexaApp');
 }
 
+// True while a text-editable element holds focus — the on-screen keyboard can only be open
+// because of that, and it's the deterministic signal (see the resize listener below) for
+// "this resize/layout-var churn is keyboard noise, not a real size change".
+function isTextInputFocused() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable === true;
+}
+
+// Timestamp of the last time a text-editable element lost focus. The resize listener's
+// isTextInputFocused() guard only catches the keyboard OPENING (input still focused when the
+// resize fires) — but code like closePanels() (e.g. tapping a search result) blurs the input
+// PROGRAMMATICALLY and SYNCHRONOUSLY, before the keyboard's own close animation has even
+// started, so by the time the keyboard-close resize event(s) actually arrive (each one
+// separately, ~300ms+ apart, matching this app's own debounce), the input is already blurred
+// and the guard sees nothing to skip. That let every one of those spurious resizes trigger a
+// full _cxSyncLayout() re-paginate right as the reader lands on a fresh page — exactly the
+// kind of main-thread churn that can make touch input get dropped (see _cancelPendingReflow
+// in cxreader/index.js for the sibling fix to the same class of problem). Extend the guard to
+// also cover a short window after a text input blurs, long enough for the keyboard's close
+// animation (and its resize events) to finish.
+let _lastTextInputBlurTs = 0;
+document.addEventListener('focusout', (e) => {
+  const tag = e.target?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable === true) {
+    _lastTextInputBlurTs = Date.now();
+  }
+}, true);
+const TEXT_INPUT_BLUR_GUARD_MS = 500; // covers the keyboard close animation + its resize event(s)
+
 // Running inside a Capacitor-wrapped WKWebView (iOS native app).
 // window.Capacitor is injected by the Capacitor bridge into every page the WKWebView loads.
 function isIOSApp() {
@@ -5916,104 +7584,196 @@ async function applyPortraitLock(enabled) {
 // ── Mouse wheel navigation ────────────────────────────────────────────────────
 let wheelCooldown = false;
 function handleWheel(deltaY) {
-  if (!prefs.mouseWheelNav || !isReady) return;
+  // Continuous mode: wheel scrolls natively (the iframe/container is overflow:auto — see
+  // ScrollPaginator/comic-viewer wiring) regardless of the mouseWheelNav preference, which is
+  // specifically the OPT-IN "one wheel gesture = one discrete page turn" feature — the two
+  // don't compose (a page-turn on top of native scroll would double-navigate every tick).
+  if (isContinuousMode() || !prefs.mouseWheelNav || !isReady) return;
   if (wheelCooldown) return;
   wheelCooldown = true;
   setTimeout(() => { wheelCooldown = false; }, 400);
   if (deltaY > 0) goNext(); else goPrev();
 }
-epubViewer.addEventListener('wheel', (e) => { handleWheel(e.deltaY); }, { passive: true });
+// Paginated comic mode: wheel (and Chrome/Firefox trackpad pinch, which arrives as a ctrlKey
+// wheel event) always zooms instead of paging — comicViewer.onWheel() calls preventDefault()
+// itself, so this listener can't stay passive. Continuous comic mode skips comicViewer
+// entirely and falls through to native scroll instead — pinch/wheel zoom-while-scrolling is
+// out of scope for v1 (see the continuous-mode plan), and #epub-viewer is overflow-y:auto in
+// that mode (see reader.css's .comic-mode.continuous rules) so the wheel event's default
+// native-scroll behaviour is exactly what's wanted, undisturbed.
+epubViewer.addEventListener('wheel', (e) => {
+  if (isImmersivePageMode() && !isContinuousMode()) { comicViewer.onWheel(e); return; }
+  handleWheel(e.deltaY);
+}, { passive: false });
 document.addEventListener('br-wheel', (e) => { handleWheel(e.detail.deltaY); });
 
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
 window.addEventListener('resize', debounce(() => {
   applyHeaderButtonSize();
-  // When running inside the Android app, system bars are always hidden in reader.
-  // Update layout vars here since this resize fires right after bars hide/show.
+  // Skip entirely while a text input is focused — the on-screen keyboard opening/closing fires
+  // 'resize' too (both in a plain browser and, per the branch below, inside the wrapped Android
+  // app), and reacting to it was rewriting --layout-h to whatever the keyboard-shrunk/restored
+  // window.innerHeight happened to be at that moment, then re-paginating CXReader against it —
+  // twice per keyboard cycle (once on open, once on close), each at a different height. The
+  // camera-cutout inset and true full-screen height don't actually change just because a
+  // keyboard opened, so there's nothing here that legitimately needs to react to it; skipping
+  // avoids both the visible resize/jerk and CXReader drifting to the wrong page in the process.
+  // Also skip shortly after a text input blurs (see _lastTextInputBlurTs) — that's the keyboard
+  // CLOSING, which fires this same spurious resize but with the input already unfocused, so
+  // isTextInputFocused() alone can't catch it.
+  if (isTextInputFocused() || Date.now() - _lastTextInputBlurTs < TEXT_INPUT_BLUR_GUARD_MS) return;
+  // When running inside the Android app, system bars are hidden in reader, but that doesn't
+  // mean the top/bottom inset is zero — a camera cutout (or gesture-nav pill) still reserves
+  // real space that env(safe-area-inset-*) reports independently of bar visibility. This used
+  // to hardcode --sat/--sab to 0px here (pre-dating cutout-aware safe-area support), which
+  // silently stomped the correct probed value on every resize — including the spurious resize
+  // some devices fire when the screen turns back on after sleep, permanently zeroing the top
+  // safe area until the book was reopened. Re-probe instead of guessing.
   if (isAndroidApp()) {
     const r = document.documentElement;
-    r.style.setProperty('--sat', '0px');
-    r.style.setProperty('--sab', '0px');
     r.style.setProperty('--layout-h', window.innerHeight + 'px');
+    window.__applyInsets?.(true);
   }
   // CXReader re-evaluates column mode and re-paginates directly.
   if (_cxReader) _cxSyncLayout();
 }, 300));
 
 // ── Reading statistics ────────────────────────────────────────────────────────
-async function startStatsSession(bookId) {
+
+// Reading-session outbox (offline resilience). Each finalized chunk (see buildSessionRecord) is
+// already a complete start+end+pages record by the time it reaches here, so unlike the old
+// open-then-close model there's nothing that has to have succeeded earlier for this to be
+// meaningful — every entry is self-contained and safe to keep indefinitely until delivered.
+// client_id lets the server dedupe a chunk that's delivered twice (see endStatsSessionBackground's
+// own comment on why that can happen) instead of double-counting it.
+const SESSION_Q_KEY = 'br_session_q';
+
+function enqueueSessionRecord(rec) {
   try {
-    const res = await apiFetch('/stats/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ book_id: bookId, start_ts: Math.floor(Date.now() / 1000) }),
-    });
-    statsSessionId = res?.id || null;
-    sessionPageCount = 0;
-    sessionStartPct = currentPct > 0 ? currentPct : null;
-    log('[stats] session started id:', statsSessionId);
-  } catch (e) {
-    warn('[stats] failed to start session:', e.message);
+    const q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]');
+    q.push(rec);
+    localStorage.setItem(SESSION_Q_KEY, JSON.stringify(q));
+  } catch { /* quota */ }
+}
+
+function dequeueSessionRecord(clientId) {
+  try {
+    const q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]');
+    const next = q.filter(r => r.client_id !== clientId);
+    if (next.length !== q.length) localStorage.setItem(SESSION_Q_KEY, JSON.stringify(next));
+  } catch { /* ignore */ }
+}
+
+async function flushSessionCheckpoints() {
+  let q;
+  try { q = JSON.parse(localStorage.getItem(SESSION_Q_KEY) || '[]'); } catch { q = []; }
+  if (!q.length) return;
+  const remaining = [];
+  for (const rec of q) {
+    try {
+      await apiFetch('/stats/session/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rec),
+      });
+      log('[stats] flushed queued session chunk for book', rec.book_id, 'pages', rec.pages_nav);
+    } catch (e) {
+      warn('[stats] session chunk still undeliverable, keeping queued:', e.message);
+      remaining.push(rec);
+    }
   }
+  try { localStorage.setItem(SESSION_Q_KEY, JSON.stringify(remaining)); } catch { /* ignore */ }
+}
+
+// Purely local — no network call, so unlike the old server-assigned session id this can never
+// fail to be set. The chunk it starts tracking only gets sent to the server once it's finished
+// (see buildSessionRecord + endStatsSession/endStatsSessionBackground below), which is what makes
+// the whole model offline-safe: nothing has to succeed up front for reading to start being
+// tracked. Confirmed live before this fix: opening a book with no connectivity at all left the old
+// statsSessionId null with no retry of its own until the next visibilitychange, so a multi-hour
+// continuous offline reading session recorded zero time — not queued anywhere, just gone.
+function startStatsSession(bookId) {
+  sessionChunkStartTs = Math.floor(Date.now() / 1000);
+  sessionPageCount = 0;
+  lastContinuousActivityTs = 0;
+  sessionPageCountAtLastCheck = 0;
+  sessionStartPct = currentPct > 0 ? currentPct : null;
+  log('[stats] tracking chunk started for book', bookId, 'at', sessionChunkStartTs);
+}
+
+// Builds the complete record for the chunk tracked so far, and resets local state for a fresh one
+// — the two are done together so every caller finalizes exactly once per chunk, whether or not the
+// resulting record ever gets delivered.
+function buildAndResetSessionRecord() {
+  if (!sessionChunkStartTs || !currentBook) return null;
+  const rec = {
+    client_id:  `${currentBook.id}:${sessionChunkStartTs}:${Math.random().toString(36).slice(2, 10)}`,
+    book_id:    currentBook.id,
+    start_ts:   sessionChunkStartTs,
+    end_ts:     Math.floor(Date.now() / 1000),
+    pages_nav:  sessionPageCount,
+    start_pct:  sessionStartPct,
+    end_pct:    currentPct > 0 ? currentPct : null,
+  };
+  sessionChunkStartTs = null;
+  sessionPageCount = 0;
+  lastContinuousActivityTs = 0;
+  sessionPageCountAtLastCheck = 0;
+  sessionStartPct = null;
+  return rec;
 }
 
 function endStatsSessionBackground() {
-  if (!statsSessionId) return;
-  const id  = statsSessionId;
-  const pgs = sessionPageCount;
-  const startPct = sessionStartPct;
-  const pct = currentPct > 0 ? currentPct : null;
-  statsSessionId   = null;
-  sessionPageCount = 0;
-  sessionStartPct  = null;
+  const rec = buildAndResetSessionRecord();
+  if (!rec) return;
+  // Queued unconditionally, before even trying the fetch: a keepalive fetch's success can't be
+  // observed on page-unload (same limitation saveProgressBackground's own comment describes for
+  // position saves), so there's no reliable "it failed" signal to hang queuing on here. Delivering
+  // it twice is harmless (client_id dedupes server-side); NOT queuing it and having the keepalive
+  // fetch silently die in a closing tab was the actual old failure mode this replaces.
+  enqueueSessionRecord(rec);
   const token = getToken();
   const headers = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
-  fetch(`/api/stats/session/${id}`, {
-    method: 'PATCH',
+  fetch('/api/stats/session/complete', {
+    method: 'POST',
     headers,
-    body: JSON.stringify({ end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct }),
+    body: JSON.stringify(rec),
     keepalive: true,
-  }).catch(() => {});
+  }).then(() => dequeueSessionRecord(rec.client_id)) // arrived after all — avoid a redundant re-send later
+    .catch(() => {}); // already queued regardless
 }
 
 async function endStatsSession() {
-  if (!statsSessionId) return;
-  const id  = statsSessionId;
-  const pgs = sessionPageCount;
-  const startPct = sessionStartPct;
-  const pct = currentPct > 0 ? currentPct : null;
-  statsSessionId   = null;
-  sessionPageCount = 0;
-  sessionStartPct  = null;
+  const rec = buildAndResetSessionRecord();
+  if (!rec) return;
   try {
-    await apiFetch(`/stats/session/${id}`, {
-      method: 'PATCH',
+    await apiFetch('/stats/session/complete', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ end_ts: Math.floor(Date.now() / 1000), pages_nav: pgs, end_pct: pct, start_pct: startPct }),
+      body: JSON.stringify(rec),
     });
   } catch (e) {
-    warn('[stats] failed to end session:', e.message);
+    warn('[stats] failed to deliver session chunk, queued for retry:', e.message);
+    enqueueSessionRecord(rec);
   }
 }
 
-// Finalizes the current reading_sessions row and immediately opens a new one — a "checkpoint" so
-// a long session isn't entirely lost (for both Codexa's own stats and BookOrbit's reading log,
-// which only ever sees a session once it has an end_ts — see uploadSessions() in
-// bookorbitSync.js) if the app never gets a chance to close cleanly afterward: a killed tab, an
-// e-reader cover closing and cutting wifi, or a crash. Called both automatically (page hidden)
-// and from the manual KOSync push actions.
+// Finalizes the tracked chunk and immediately starts a new one — a "checkpoint" so a long reading
+// stretch isn't entirely lost (for both Codexa's own stats and BookOrbit's reading log, which only
+// ever sees a chunk once it's delivered — see uploadSessions() in bookorbitSync.js) if the app
+// never gets a chance to close cleanly afterward: a killed tab, an e-reader cover closing and
+// cutting wifi, or a crash. Called both automatically (page hidden) and from the manual KOSync
+// push actions. Starting the new chunk is always local-only now, so unlike the old model it can
+// never leave tracking off the way a failed server round-trip used to.
 // `background`: use the keepalive-fetch finalize (endStatsSessionBackground) instead of the
-// normal awaited PATCH — for the visibilitychange→hidden case, where the page may vanish before
-// a regular fetch completes. Starting the new session is always a best-effort, non-keepalive
-// call either way: if the page really is closing, it simply won't finish, which just means
-// tracking resumes at the next successful checkpoint (or the visibilitychange→visible handler
-// below) instead of right now — same failure mode as not rotating at all, no worse.
+// normal awaited POST — for the visibilitychange→hidden case, where the page may vanish before a
+// regular fetch completes.
 function rotateStatsSession({ background = false } = {}) {
-  if (!currentBook || !statsSessionId) return;
+  if (!currentBook || !sessionChunkStartTs) return;
   if (background) endStatsSessionBackground();
   else endStatsSession().catch(() => {});
   startStatsSession(currentBook.id);
@@ -6121,6 +7881,7 @@ function renderBookmarkList() {
       _clearNavPreJumps();
       if (currentCfi) {
         preBookmarkCfi = currentCfi;
+        preBookmarkPage = currentChapPage;
         bookmarkBackBtn.style.display   = '';
         bookmarkAcceptBtn.style.display = '';
       }
@@ -6327,12 +8088,14 @@ document.querySelectorAll('.annot-edit-color-btn').forEach(btn => {
   });
 });
 
-// Dictionary button inside annotation toolbar
+// Dictionary button inside annotation toolbar. Multi-word selections (e.g. "rat snake",
+// made via long-press-then-extend selection) are looked up as the full phrase first —
+// showDictPopup() itself falls back to just the first word if the phrase has no entry
+// in any enabled dictionary.
 document.getElementById('annot-btn-dict')?.addEventListener('click', () => {
-  const text = _pendingAnnotation?.text || '';
-  const word = text.split(/\s+/)[0].replace(/^[''-]+|[''-]+$/g, '').trim();
+  const text = (_pendingAnnotation?.text || '').trim().replace(/^[''-]+|[''-]+$/g, '').trim();
   closeAnnotationToolbar(true); // keep press highlight visible while dict popup is open
-  if (word) showDictPopup(word);
+  if (text) showDictPopup(text);
 });
 
 // Copy selection to clipboard
@@ -6418,25 +8181,59 @@ document.getElementById('kosync-zone-bl')?.addEventListener('click', async () =>
   if (!await kosyncConfirm('pull')) return;
 
   const docKey = externalDocKey();
-  const [extResult, intResult] = await Promise.allSettled([
+  const [extResult, intResult, ownResult, boResult] = await Promise.allSettled([
     apiFetch(`/kosync/remote/${encodeURIComponent(docKey)}`),
     apiFetch(`/kosync/internal/${encodeURIComponent(docKey)}`),
+    // Codexa's own cross-device progress (independent of KOSync, always kept up to date
+    // by saveProgress on every device) — this session may have loaded this book without
+    // ever refetching it (e.g. resumed from a WebView paused/backgrounded state rather
+    // than a fresh navigation), so a manual pull needs to check it too, not just KOSync.
+    apiFetch(`/progress/${encodeURIComponent(currentBook.file_hash)}`),
+    // BookOrbit-native (see fetchBookorbitProgress) — the only pull path when kosync_url
+    // isn't configured, but checked here too since it can be freshest either way.
+    fetchBookorbitProgress(),
   ]);
 
-  if (extResult.status === 'rejected' && intResult.status === 'rejected') {
+  if (extResult.status === 'rejected' && intResult.status === 'rejected' && ownResult.status === 'rejected' && boResult.status === 'rejected') {
     toast.error(t('reader.kosync_fetch_error'));
     return;
   }
 
   const ext = extResult.status === 'fulfilled' ? extResult.value : null;
   const int = intResult.status === 'fulfilled' ? intResult.value : null;
+  const ownRaw = ownResult.status === 'fulfilled' ? ownResult.value : null;
+  const bo  = boResult.status  === 'fulfilled' ? boResult.value  : null;
+  // own only exists to cover a stale *live session* (e.g. resumed from a backgrounded WebView
+  // that never refetched) — it's Codexa's own last-saved position, not an independent remote
+  // signal. Letting it compete for "best" purely on timestamp meant it routinely outranked a
+  // genuinely newer e-reader push (confirmed live: it's re-saved on every debounced/periodic
+  // save, so its timestamp is almost always the newest the instant anyone is actively reading)
+  // and, being ~equal to currentPct by construction, made the pull silently report "same
+  // position" instead of ever showing the real answer. So it only counts at all when its own
+  // CFI chapter is genuinely ahead of the live session's — otherwise it has nothing to add.
+  const ownSpineIdx = spineIndexFromCfi(ownRaw?.cfi_position);
+  const own = (ownRaw && typeof ownRaw.percentage === 'number'
+               && compareChapterPositions(ownSpineIdx, ownRaw.percentage, currentSpineIndex, currentPct, 0.01) > 0)
+    ? { percentage: ownRaw.percentage, progress: null, timestamp: ownRaw.updated_at || 0, device: ownRaw.device || 'web' }
+    : null;
+
+  // Pick the freshest usable source. A source is usable if it has a numeric percentage —
+  // .progress (KOReader xpointer) is only an optional precision refinement, never required
+  // to jump (see navigateToSyncedPosition). Checked ext → int → own → bo so each only wins
+  // ties against an earlier one if strictly newer, matching the existing tie-break.
+  const hasPosition = r => r && typeof r.percentage === 'number';
   let best = null;
-  if (ext?.progress) best = ext;
-  if (int?.progress && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  if (hasPosition(ext)) best = ext;
+  if (hasPosition(int) && (!best || (int.timestamp || 0) > (best.timestamp || 0))) best = int;
+  if (hasPosition(own) && (!best || (own.timestamp || 0) > (best.timestamp || 0))) best = own;
+  if (hasPosition(bo)  && (!best || (bo.timestamp  || 0) > (best.timestamp || 0))) best = bo;
 
-  if (!best?.progress) { toast.info(t('reader.kosync_no_progress')); return; }
+  if (!hasPosition(best)) { toast.info(t('reader.kosync_no_progress')); return; }
 
-  if (Math.abs((best.percentage || 0) - currentPct) <= 0.01) {
+  // Chapter-first (see compareKosyncPosition) — this is the exact "Already at the same
+  // position" false positive from the live report: a percentage-only comparison read a real
+  // one-chapter gap as no difference at all on a book with many short chapters.
+  if (compareKosyncPosition(best.percentage, best.progress, currentPct, currentSpineIndex, 0.01) === 0) {
     toast.info(t('reader.kosync_same_position'));
     return;
   }
@@ -6444,10 +8241,7 @@ document.getElementById('kosync-zone-bl')?.addEventListener('click', async () =>
   const doSync = await showSyncDialog(best, currentPct, null);
   if (!doSync) return;
 
-  if (_cxReader && best.percentage != null) {
-    await _cxReader.goToPct(best.percentage);
-    _cxReader.seekToPercent(best.percentage);
-  }
+  await navigateToSyncedPosition(best.percentage, best.progress);
 });
 
 document.getElementById('kosync-zone-br')?.addEventListener('click', async () => {
@@ -6488,16 +8282,18 @@ document.getElementById('btn-search').addEventListener('click', () =>
 document.getElementById('btn-search-back').addEventListener('click', async () => {
   if (!preSearchCfi) return;
   clearSearchHighlights();
-  const cfi = preSearchCfi;
+  const cfi = preSearchCfi, page = preSearchPage || 1;
   preSearchCfi = null;
+  preSearchPage = null;
   searchBackBtn.style.display   = 'none';
   searchAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
-  if (_cxReader) await _cxReader.goToCfi(cfi);
+  if (_cxReader) await _cxReader.goToCfi(cfi, page);
 });
 document.getElementById('btn-search-accept').addEventListener('click', () => {
   clearSearchHighlights();
   preSearchCfi = null;
+  preSearchPage = null;
   searchBackBtn.style.display   = 'none';
   searchAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
@@ -6505,15 +8301,17 @@ document.getElementById('btn-search-accept').addEventListener('click', () => {
 // Bookmark navigation back/accept — same pattern as search
 document.getElementById('btn-bookmark-back').addEventListener('click', async () => {
   if (!preBookmarkCfi) return;
-  const cfi = preBookmarkCfi;
+  const cfi = preBookmarkCfi, page = preBookmarkPage || 1;
   preBookmarkCfi = null;
+  preBookmarkPage = null;
   bookmarkBackBtn.style.display   = 'none';
   bookmarkAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
-  if (_cxReader) await _cxReader.goToCfi(cfi);
+  if (_cxReader) await _cxReader.goToCfi(cfi, page);
 });
 document.getElementById('btn-bookmark-accept').addEventListener('click', () => {
   preBookmarkCfi = null;
+  preBookmarkPage = null;
   bookmarkBackBtn.style.display   = 'none';
   bookmarkAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
@@ -6522,15 +8320,17 @@ document.getElementById('btn-bookmark-accept').addEventListener('click', () => {
 });
 document.getElementById('btn-annotation-back').addEventListener('click', async () => {
   if (!preAnnotationCfi) return;
-  const cfi = preAnnotationCfi;
+  const cfi = preAnnotationCfi, page = preAnnotationPage || 1;
   preAnnotationCfi = null;
+  preAnnotationPage = null;
   annotationBackBtn.style.display   = 'none';
   annotationAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
-  if (_cxReader) await _cxReader.goToCfi(cfi);
+  if (_cxReader) await _cxReader.goToCfi(cfi, page);
 });
 document.getElementById('btn-annotation-accept').addEventListener('click', () => {
   preAnnotationCfi = null;
+  preAnnotationPage = null;
   annotationBackBtn.style.display   = 'none';
   annotationAcceptBtn.style.display = 'none';
   if (prefs.autoHideHeader) forceHideAutoHeader();
@@ -6543,7 +8343,8 @@ document.getElementById('btn-sync')?.addEventListener('click', async () => {
   const btn = document.getElementById('btn-sync');
   if (!isReady || !currentBook || btn.disabled) return;
   const pct = currentPct > 0 ? currentPct : lastKnownGoodPct;
-  const isBackwards = pct > 0 && pct < bestKnownRemotePct - 0.005;
+  // Chapter-first (see compareChapterPositions) — same reasoning as saveProgress's own guard.
+  const isBackwards = pct > 0 && compareChapterPositions(bestKnownRemoteSpineIdx, bestKnownRemotePct, currentSpineIndex, pct, 0.005) > 0;
   if (isBackwards) {
     const curPctStr  = Math.round(pct * 100) + '%';
     const bestPctStr = Math.round(bestKnownRemotePct * 100) + '%';
@@ -6570,6 +8371,7 @@ document.getElementById('btn-sync')?.addEventListener('click', async () => {
     if (!ok) return;
     // User confirmed — reset the high-water mark to the current position
     bestKnownRemotePct = pct;
+    bestKnownRemoteSpineIdx = currentSpineIndex;
   }
   btn.classList.add('btn-sync-busy');
   btn.disabled = true;
@@ -6725,7 +8527,10 @@ async function init() {
   await _i18nReady;
 
   // If localStorage was cleared (no saved prefs), restore dict selection/order from the
-  // server copy so word lookups use the user's configured dictionaries, not the language default.
+  // server copy so word lookups use the user's configured dictionaries, not the language
+  // default. Deliberately narrow (dictionaries only, only on a genuinely empty device): the
+  // rest of `prefs` is per-device on purpose — see activePresetId above. A device that's
+  // already been used keeps its own settings/preset rather than inheriting another device's.
   if (!localStorage.getItem('br_reader_prefs')) {
     apiFetch('/settings').then(s => {
       const sp = typeof s.reader_prefs === 'string' ? JSON.parse(s.reader_prefs) : (s.reader_prefs || {});
@@ -6866,6 +8671,28 @@ async function init() {
     }
     bookTitleEl.textContent = currentBook.title;
     document.title = `${currentBook.title} — Codexa`;
+    // Comics/PDFs default to Continuous mode with a real margin (not full-bleed) the FIRST
+    // time a given book is opened — full-width paginated reads badly on a large screen and
+    // isn't a great first impression. This is deliberately NOT a new global default: 'spread'
+    // and 'margin' are already PER_BOOK_KEYS (see loadBookPrefs/saveBookPrefs above), so this
+    // only seeds the starting values for a book with no saved override of its own — it must run
+    // BEFORE loadBookPrefs() so any real per-book override (including the user deliberately
+    // choosing full-bleed/paginated) still wins. The moment the user changes anything while
+    // reading this book, saveBookPrefs records that per book and this seed never applies again,
+    // and it never leaks into any other book since it's derived fresh from this book's own
+    // format/hasBookPrefs state, not written into the shared global prefs blob.
+    const _cpFmt = currentBook.format
+      || (currentBook.filename?.endsWith('.pdf') ? 'pdf' : currentBook.filename?.endsWith('.cbz') ? 'cbz' : '');
+    if ((_cpFmt === 'cbz' || _cpFmt === 'pdf') && !hasBookPrefs(currentBook.id)) {
+      prefs.spread = 'continuous';
+      prefs.margin = 80;
+      // initSettingsUi() already ran (earlier in init(), before currentBook was known) and set
+      // the --cx-comic-margin CSS var from whatever prefs.margin held at the time — refresh it
+      // now that we've just changed prefs.margin, or continuous mode's margin (CSS-driven,
+      // unlike paginated mode's columnGap which setLayout() below picks up fresh) would still
+      // render with the stale value.
+      applyComicMargin();
+    }
     loadBookPrefs(currentBook.id);
     syncSettingsUi();
   } catch (err) {
@@ -6880,6 +8707,14 @@ async function init() {
   // ── EPUB file ──────────────────────────────────────────────────────────────
   log('[reader] loading epub...');
   let arrayBuffer;
+  // On the legacy WebView path (and the rare modern-path case with no Content-Length) there's no
+  // byte-level progress to show at all, just a static message, for as long as the 12s connect +
+  // 30s body timeouts allow — exactly the "nothing happens for a while on a large book" complaint.
+  // Escalate to a "this may be a large file" hint after a few seconds so it's clear the download
+  // is still in flight rather than stuck; the Cancel button in the overlay covers the actual bail-out.
+  const _slowFileDlTimer = setTimeout(() => {
+    if (loadingMsg) loadingMsg.textContent = t('common.download_slow_hint');
+  }, 8000);
   try {
     _rafStop = true; // stop dots — show progress % for network downloads
     loadingMsg.textContent = t('reader.loading_file');
@@ -6945,7 +8780,9 @@ async function init() {
         log('[reader] epub from network, bytes:', arrayBuffer.byteLength);
       }
     }
+    clearTimeout(_slowFileDlTimer);
   } catch (err) {
+    clearTimeout(_slowFileDlTimer);
     warn('[reader] epub load failed:', err?.message);
     if (!arrayBuffer) {
       const msg = !navigator.onLine
@@ -6995,10 +8832,13 @@ async function init() {
   if (isAndroidApp() && window.AndroidCodexa?.setReaderMode) {
     window.AndroidCodexa.setReaderMode(true);
     setTimeout(() => {
+      // Re-probe (not hardcode) once immersive mode has settled: a camera cutout still
+      // reserves real top-inset space even with the status bar hidden, so pinning --sat/--sab
+      // to 0px here — as this used to do, from before cutout-aware safe-area support existed —
+      // wiped out the correct value reader.html's own probe had already set moments earlier.
       const r = document.documentElement;
-      r.style.setProperty('--sat', '0px');
-      r.style.setProperty('--sab', '0px');
       r.style.setProperty('--layout-h', window.innerHeight + 'px');
+      window.__applyInsets?.(true);
       if (_cxReader) _cxSyncLayout();
     }, 600);
   }
@@ -7077,8 +8917,13 @@ async function init() {
       log('[reader] localProgress:', localProgress?.cfi_position?.slice(0, 60), 'pct:', localProgress?.percentage);
       if (localProgress?.percentage > 0) {
         lastKnownGoodPct = localProgress.percentage;
-        // Seed the high-water mark so we never push below what the server already has
-        if (localProgress.percentage > bestKnownRemotePct) bestKnownRemotePct = localProgress.percentage;
+        // Seed the high-water mark so we never push below what the server already has.
+        // cfi_position here is always Codexa's own CFI (this is our own DB row), so the
+        // paired spine index is exact, not a cross-engine guess.
+        if (localProgress.percentage > bestKnownRemotePct) {
+          bestKnownRemotePct = localProgress.percentage;
+          bestKnownRemoteSpineIdx = spineIndexFromCfi(localProgress.cfi_position);
+        }
         // Keep the offline metadata in sync so "Currently Reading" is correct offline
         if (!_legacyWebView) getBookMeta(Number(bookId)).then(meta => {
           if (meta) saveBookMeta({ ...meta, percentage: localProgress.percentage }).catch(() => {});
@@ -7119,13 +8964,10 @@ async function init() {
     // which is why the CFI correction loop below runs after this call.
     const syncTarget = (prefs.skipOpenProgressCheck || skipOpenSync || isPeekMode) ? null : await syncOnOpen(localProgress);
     if (syncTarget?.percentage != null) {
-      if (_cxReader) {
-        // CXReader: navigate by percentage — most reliable since DocFragment data can be
-        // stale/mismatched from earlier sessions. Percentage scales linearly over spine count.
-        await _cxReader.goToPct(syncTarget.percentage);
-        // goToPct only resolves to chapter level (page 1); fine-tune to the exact page.
-        _cxReader.seekToPercent(syncTarget.percentage);
-      }
+      // See navigateToSyncedPosition's own comment: percentage alone is NOT reliable across
+      // engines (confirmed live) — navigate by the xpointer's chapter when it resolves, only
+      // falling back to percentage when it doesn't.
+      await navigateToSyncedPosition(syncTarget.percentage, syncTarget.progress);
     } else if (_cxReader && localProgress?.percentage > 0 && !isPeekMode) {
       // CXReader, no sync jump: restore exact page first; fall back to % if out of range.
       // Skip in peek mode: peek never saves position.

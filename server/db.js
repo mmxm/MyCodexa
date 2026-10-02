@@ -21,6 +21,18 @@ function getDb() {
   return db;
 }
 
+// Closes the DB handle cleanly (checkpoints the WAL file back into codexa.db and releases the
+// native handle). Node gives WAL mode no chance to do this on its own — an abrupt process kill
+// (the default for SIGTERM with no handler, e.g. every `docker stop`/restart) leaves
+// codexa.db-wal/-shm in whatever state they were mid-write, and better-sqlite3 has to recover
+// that on the next open. Call this from a graceful-shutdown handler, not on every request path.
+function closeDb() {
+  if (db) {
+    db.close();
+    db = undefined;
+  }
+}
+
 function initDb() {
   const database = getDb();
 
@@ -38,6 +50,17 @@ function initDb() {
       value TEXT NOT NULL DEFAULT ''
     );
 
+    CREATE TABLE IF NOT EXISTS invitations (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      email       TEXT    NOT NULL,
+      token_hash  TEXT    UNIQUE NOT NULL,
+      created_by  INTEGER NOT NULL,
+      created_at  INTEGER DEFAULT (strftime('%s', 'now')),
+      expires_at  INTEGER NOT NULL,
+      accepted_at INTEGER DEFAULT NULL,
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id                  INTEGER PRIMARY KEY,
       opds_servers             TEXT    DEFAULT '[]',
@@ -45,6 +68,7 @@ function initDb() {
       kosync_username          TEXT    DEFAULT '',
       kosync_password_enc      TEXT    DEFAULT '',
       kosync_internal_enabled  INTEGER DEFAULT 0,
+      kosync_external_enabled INTEGER DEFAULT 1,
       reader_prefs             TEXT    DEFAULT '{}',
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -83,6 +107,66 @@ function initDb() {
       device         TEXT    DEFAULT 'web',
       updated_at     INTEGER DEFAULT (strftime('%s', 'now')),
       UNIQUE (user_id, document_hash),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- Permanent log of finished-book events, written once per genuine 'read' crossing (see
+    -- maybeMarkBookFinished in server/utils/bookCompletion.js). Unlike reading_progress (keyed
+    -- by content hash, never cleaned up, effectively invisible once its book is gone) or
+    -- books.read_status (lives on the books row, deleted along with it), this table snapshots
+    -- title/author and lets book_id go NULL on deletion instead of cascading — so "books
+    -- finished" stays a true lifetime count even after the book itself is removed or re-hashed.
+    CREATE TABLE IF NOT EXISTS book_completions (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id        INTEGER NOT NULL,
+      book_id        INTEGER DEFAULT NULL,
+      document_hash  TEXT    NOT NULL,
+      title          TEXT    NOT NULL,
+      author         TEXT    DEFAULT '',
+      completed_at   INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
+    );
+
+    -- Per-book reading totals rolled up from reading_sessions at the moment a book is deleted
+    -- (see trg_books_archive_stats below). reading_sessions.book_id cascades away with the book,
+    -- so without this, finishing a book and then deleting it (or shelf sync removing it) erased
+    -- all of its time/pages/sessions from the statistics — confirmed live: a finished book kept
+    -- its book_completions row but every session it ever had vanished. Rows carry the same
+    -- file_hash the book had (document_hash), so a book re-added later still merges with its
+    -- archived history in the stats queries.
+    CREATE TABLE IF NOT EXISTS book_stats_archive (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id        INTEGER NOT NULL,
+      document_hash  TEXT    NOT NULL,
+      title          TEXT    NOT NULL,
+      author         TEXT    DEFAULT '',
+      total_secs     INTEGER DEFAULT 0,
+      sessions       INTEGER DEFAULT 0,
+      pages          INTEGER DEFAULT 0,
+      first_read     INTEGER,
+      last_read      INTEGER,
+      archived_at    INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- BookOrbit's own cross-device reading totals for a book (GET /books/:id/sessions -> stats),
+    -- cached so the finished list can show them without a network call per row. Keyed by Codexa's
+    -- content hash with no FK to books — same reason as book_stats_archive: it has to outlive the
+    -- book. bo_book_id is the mapping itself (bookorbit_sync_state's copy cascades away with the
+    -- book, and BookOrbit only knows its own MD5-flavored hashes, so a deleted book can't be
+    -- looked up again by Codexa's hash); fetched_at NULL = mapping known, totals not fetched yet.
+    CREATE TABLE IF NOT EXISTS bookorbit_book_stats (
+      user_id           INTEGER NOT NULL,
+      document_hash     TEXT    NOT NULL,
+      bo_book_id        INTEGER NOT NULL,
+      total_seconds     INTEGER DEFAULT 0,
+      total_sessions    INTEGER DEFAULT 0,
+      first_session_at  INTEGER,
+      last_session_at   INTEGER,
+      by_source         TEXT    DEFAULT '[]',
+      fetched_at        INTEGER,
+      PRIMARY KEY (user_id, document_hash),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -175,6 +259,19 @@ function initDb() {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
     );
+
+    -- Named reader-settings snapshots (font/theme/layout etc.), switchable from the
+    -- Theme tab. Deliberately excludes dictionary selection, which has its own
+    -- global sync + per-book-language-default logic (see user_settings.reader_prefs).
+    CREATE TABLE IF NOT EXISTS reader_presets (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL,
+      name       TEXT    NOT NULL,
+      prefs      TEXT    NOT NULL DEFAULT '{}',
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
   `);
 
   console.log(`[db] SQLite initialized at ${DB_PATH}`);
@@ -218,6 +315,14 @@ function initDb() {
     // (see bookorbitSync.uploadSessions).
     [`ALTER TABLE reading_sessions ADD COLUMN end_pct              REAL    DEFAULT NULL`,     'reading_sessions.end_pct'],
     [`ALTER TABLE reading_sessions ADD COLUMN start_pct            REAL    DEFAULT NULL`,     'reading_sessions.start_pct'],
+    // Client-generated id for a session recorded via POST /stats/session/complete (reader.js's
+    // offline-resilient chunk model — see that route's own comment). Lets a chunk be delivered
+    // more than once (a keepalive fetch on page-unload whose outcome can't be observed, followed
+    // by the same chunk being flushed again from the local queue) without double-counting: the
+    // insert is `ON CONFLICT (user_id, client_id) DO NOTHING`. NULL for every session created the
+    // old way (POST /stats/session + PATCH .../:id) — SQLite treats each NULL as distinct in a
+    // UNIQUE index, so those rows are unaffected.
+    [`ALTER TABLE reading_sessions ADD COLUMN client_id             TEXT    DEFAULT NULL`,     'reading_sessions.client_id'],
     // Bookmark sync tracking (create/delete only — BookOrbit's bookmark API has no update route)
     [`ALTER TABLE bookmarks       ADD COLUMN bo_id                 TEXT    DEFAULT ''`,       'bookmarks.bo_id'],
     [`ALTER TABLE bookmarks       ADD COLUMN deleted                INTEGER DEFAULT 0`,       'bookmarks.deleted'],
@@ -234,12 +339,150 @@ function initDb() {
     // imported) — safe to delete after this unix timestamp or on explicit close signal.
     // See server/utils/peekCleanup.js.
     [`ALTER TABLE books           ADD COLUMN peek_expires_at        INTEGER DEFAULT NULL`,     'books.peek_expires_at'],
+    // OIDC-linked accounts (Google/Apple/self-hosted IdP login). NULL provider/sub = local
+    // password account. password_hash stays NOT NULL for these too (a random unusable hash is
+    // generated at account-creation time) to avoid a table-rebuild migration.
+    [`ALTER TABLE users           ADD COLUMN oidc_provider          TEXT    DEFAULT NULL`,     'users.oidc_provider'],
+    [`ALTER TABLE users           ADD COLUMN oidc_sub                TEXT    DEFAULT NULL`,     'users.oidc_sub'],
+    [`ALTER TABLE users           ADD COLUMN email                   TEXT    DEFAULT NULL`,     'users.email'],
+    // Last time this user made an authenticated request — throttled write, see
+    // server/middleware/auth.js. Powers the admin panel's per-user activity display.
+    [`ALTER TABLE users           ADD COLUMN last_active_at          INTEGER DEFAULT 0`,        'users.last_active_at'],
+    // Lets a user pause the external KOSync proxy (push+pull against kosync_url) without
+    // clearing the saved URL/credentials — e.g. to isolate BookOrbit-only sync for testing,
+    // then flip it back on later. DEFAULT 1 so existing users with a kosync_url already
+    // configured keep working unchanged after this migration; kosync_url itself being empty
+    // already gates the feature off regardless of this flag.
+    [`ALTER TABLE user_settings   ADD COLUMN kosync_external_enabled INTEGER DEFAULT 1`,        'user_settings.kosync_external_enabled'],
+    // User-configurable replacements for the hardcoded thresholds maybeMarkBookFinished() used
+    // to apply to everyone alike (see server/utils/bookCompletion.js). Both are 0-1 fractions,
+    // same convention as reading_progress.percentage. Defaults preserve prior behavior exactly:
+    // reading_finish_pct=0.95 matches the old FINISHED_THRESHOLD constant; reading_start_pct=0
+    // means "any progress at all" marks a book 'reading', which is what the UI already implied
+    // (library.js's isCurrentlyReading() has always treated percentage>0 as "reading" for shelf
+    // membership) even though read_status itself was never actually set until now.
+    [`ALTER TABLE user_settings   ADD COLUMN reading_start_pct       REAL    DEFAULT 0`,        'user_settings.reading_start_pct'],
+    [`ALTER TABLE user_settings   ADD COLUMN reading_finish_pct      REAL    DEFAULT 0.95`,      'user_settings.reading_finish_pct'],
+    // Date (YYYY-MM-DD) of the latest 'completed' reading attempt BookOrbit has for this book —
+    // its own record of when it was actually finished, vs book_completions.completed_at which is
+    // just when Codexa's progress crossed the threshold (often the day a KOReader position synced).
+    [`ALTER TABLE bookorbit_book_stats ADD COLUMN finished_on TEXT DEFAULT NULL`, 'bookorbit_book_stats.finished_on'],
+    // The read status BookOrbit is known to hold for this book (last one pushed or adopted). Lets
+    // syncBookState tell "the user CLEARED the status" (push 'unread') from "the status was never
+    // set locally" (leave BookOrbit's alone) — see the empty-status branch there.
+    [`ALTER TABLE bookorbit_sync_state ADD COLUMN pushed_status TEXT DEFAULT NULL`, 'bookorbit_sync_state.pushed_status'],
   ];
   for (const [sql, label] of migrations) {
     try {
       database.exec(sql);
       console.log(`[db] Migration: added ${label}`);
     } catch { /* column already exists — ignore */ }
+  }
+
+  // Composite uniqueness for OIDC identities can't be expressed via ADD COLUMN.
+  try {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc
+        ON users(oidc_provider, oidc_sub) WHERE oidc_provider IS NOT NULL
+    `);
+  } catch (e) {
+    console.warn('[db] idx_users_oidc creation:', e.message);
+  }
+
+  // Email is optional (used as a second login identifier and to auto-link an OIDC identity
+  // to an existing local account — see server/routes/oidc.js). Always stored lowercased by
+  // the app, so a plain unique index is enough (no need for a functional LOWER() index).
+  try {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+        ON users(email) WHERE email IS NOT NULL AND email != ''
+    `);
+  } catch (e) {
+    console.warn('[db] idx_users_email creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_pending_email
+        ON invitations(email) WHERE accepted_at IS NULL
+    `);
+  } catch (e) {
+    console.warn('[db] idx_invitations_pending_email creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_book_completions_user
+        ON book_completions(user_id, completed_at)
+    `);
+  } catch (e) {
+    console.warn('[db] idx_book_completions_user creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_book_stats_archive_user
+        ON book_stats_archive(user_id, document_hash)
+    `);
+  } catch (e) {
+    console.warn('[db] idx_book_stats_archive_user creation:', e.message);
+  }
+
+  try {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_sessions_client_id
+        ON reading_sessions(user_id, client_id)
+    `);
+  } catch (e) {
+    console.warn('[db] idx_reading_sessions_client_id creation:', e.message);
+  }
+
+  // A trigger rather than code in each delete route because books get deleted from several
+  // places (DELETE /api/books/:id, shelf-sync stale removal, peek cleanup) — one DB-level hook
+  // covers all of them. BEFORE DELETE, so reading_sessions rows still exist: the FK cascade that
+  // removes them only runs after the book row itself is gone. Same "real session" bar as
+  // stats.js's REAL_SESSION. The users-exists guard is for `DELETE FROM users` cascading into
+  // books: archiving then would insert a row for a user that's already being removed.
+  try {
+    database.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_books_archive_stats
+      BEFORE DELETE ON books
+      WHEN EXISTS (SELECT 1 FROM users WHERE id = OLD.user_id)
+       AND EXISTS (
+         SELECT 1 FROM reading_sessions
+          WHERE book_id = OLD.id AND end_ts IS NOT NULL AND pages_nav >= 2 AND (end_ts - start_ts) >= 60
+       )
+      BEGIN
+        INSERT INTO book_stats_archive
+          (user_id, document_hash, title, author, total_secs, sessions, pages, first_read, last_read)
+        SELECT OLD.user_id, OLD.file_hash, OLD.title, COALESCE(OLD.author, ''),
+               SUM(end_ts - start_ts), COUNT(*), SUM(pages_nav), MIN(start_ts), MAX(start_ts)
+          FROM reading_sessions
+         WHERE book_id = OLD.id AND end_ts IS NOT NULL AND pages_nav >= 2 AND (end_ts - start_ts) >= 60;
+      END
+    `);
+  } catch (e) {
+    console.warn('[db] trg_books_archive_stats creation:', e.message);
+  }
+
+  // Keeps the BookOrbit id of a book that's about to be deleted (bookorbit_sync_state cascades
+  // away with it) so its cross-device totals can still be fetched later. OR IGNORE: an existing
+  // cache row for this hash already has the mapping (and possibly totals) — don't clobber it.
+  try {
+    database.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_books_keep_bo_mapping
+      BEFORE DELETE ON books
+      WHEN EXISTS (SELECT 1 FROM users WHERE id = OLD.user_id)
+       AND EXISTS (SELECT 1 FROM bookorbit_sync_state WHERE user_id = OLD.user_id AND book_id = OLD.id AND bo_book_id IS NOT NULL)
+      BEGIN
+        INSERT OR IGNORE INTO bookorbit_book_stats (user_id, document_hash, bo_book_id)
+        SELECT OLD.user_id, OLD.file_hash, bo_book_id
+          FROM bookorbit_sync_state
+         WHERE user_id = OLD.user_id AND book_id = OLD.id AND bo_book_id IS NOT NULL;
+      END
+    `);
+  } catch (e) {
+    console.warn('[db] trg_books_keep_bo_mapping creation:', e.message);
   }
 
   // Backfill last_opened_at from last progress save, else added_at (counts as "opened when added").
@@ -277,6 +520,44 @@ function initDb() {
   } catch (e) {
     console.warn('[db] bookorbit_url backfill:', e.message);
   }
+
+  // One-time: book_completions didn't exist before this release, so every finish that already
+  // happened (reading_progress at or past the finished threshold) needs to be logged retroactively
+  // or "books finished" stays 0 until someone finishes something new. Left/joined against books
+  // by any of the three hash flavors (see maybeMarkBookFinished's own comment on why) — when none
+  // match (the book was since deleted or re-hashed), the title/author is unrecoverable and falls
+  // back to a placeholder; the count is still correct even though the label isn't pretty.
+  try {
+    database.exec(`
+      INSERT INTO book_completions (user_id, book_id, document_hash, title, author, completed_at)
+      SELECT rp.user_id, b.id, rp.document_hash,
+             COALESCE(b.title, 'Unknown'), COALESCE(b.author, ''),
+             rp.updated_at
+        FROM reading_progress rp
+        LEFT JOIN books b ON b.user_id = rp.user_id
+          AND (b.file_hash = rp.document_hash OR b.file_hash_md5 = rp.document_hash OR b.kosync_hash = rp.document_hash)
+       WHERE rp.percentage >= 0.95
+         AND NOT EXISTS (
+           SELECT 1 FROM book_completions bc WHERE bc.user_id = rp.user_id AND bc.document_hash = rp.document_hash
+         )
+    `);
+  } catch (e) {
+    console.warn('[db] book_completions backfill:', e.message);
+  }
+
+  // Books synced before pushed_status existed: any non-empty local status was pushed to (or adopted
+  // from) BookOrbit already, so seed it — otherwise clearing that status locally would stop
+  // resetting BookOrbit's copy. Only fills NULLs, so it's a no-op once seeded.
+  try {
+    database.exec(`
+      UPDATE bookorbit_sync_state
+         SET pushed_status = (SELECT b.read_status FROM books b WHERE b.id = bookorbit_sync_state.book_id)
+       WHERE pushed_status IS NULL
+         AND COALESCE((SELECT b.read_status FROM books b WHERE b.id = bookorbit_sync_state.book_id), '') != ''
+    `);
+  } catch (e) {
+    console.warn('[db] pushed_status backfill:', e.message);
+  }
 }
 
-module.exports = { getDb, initDb, DATA_DIR };
+module.exports = { getDb, initDb, closeDb, DATA_DIR };

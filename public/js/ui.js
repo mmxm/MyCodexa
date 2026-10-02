@@ -3,6 +3,70 @@
  */
 import { t } from './i18n.js';
 
+// ── Native status bar appearance sync (Android app only) ─────────────────────
+// The Android host never learns which in-app theme is active — the WebView's
+// system status/nav bar icon color is whatever the OS last set it to, so a light
+// in-app theme on a phone with light-icon system defaults renders invisible
+// (white icons on a white bar). Call this whenever a theme is applied/resolved,
+// passing the actual background color that theme just set — the Android app
+// exposes AndroidCodexa.setStatusBarAppearance(isLight) to flip icon color to
+// match. No-op outside the Android app (bridge method won't exist) and no-op on
+// older installed APKs that predate this bridge method.
+function isLightColor(color) {
+  const hex = String(color || '').trim().replace('#', '');
+  const full = hex.length === 3 ? hex.split('').map(c => c + c).join('') : hex;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5;
+}
+
+// "Check for update" — unregisters the service worker, then reloads with a cache-busting query
+// param so the browser's own HTTP cache can't hand back a stale document either. This is the
+// in-app equivalent of the only other known fix for a PWA stuck on an old build (removing and
+// re-adding the home screen icon). Shared by sidebar.js (Codexa title tap while logged in) and
+// login.js (same tap on the sign-in screen) — a stale-cached login page/script talking to an
+// already-updated server is exactly the shape of "PWA won't log in until reinstalled".
+//
+// Deliberately does NOT touch caches.delete() itself — BOOKS_CACHE (downloaded books for
+// offline reading) lives in the same Cache Storage as the app-shell cache, and wiping every
+// cache here would force a full re-download of every offline book just to pick up a JS/CSS
+// change. The freshly-registered service worker's own `activate` handler (sw.js) already does
+// the right, narrower thing on its own — it deletes only stale app-shell cache versions and
+// explicitly preserves BOOKS_CACHE — so unregister+reload is enough to reach it.
+// Reader preferences (fonts, layout, margins, theme, …) live in localStorage/IndexedDB, not
+// Cache Storage, so none of this ever touches them regardless.
+export async function hardRefreshApp() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch { /* best-effort — still fall through to the reload below */ }
+  const url = new URL(window.location.pathname, window.location.origin);
+  url.searchParams.set('_refresh', Date.now());
+  window.location.href = url.toString();
+}
+
+// Wires the "tap the Codexa title to check for an update" confirm dialog onto any element.
+// Shared between sidebar.js (rebuilt twice — initSidebar and the langchange re-render) and
+// login.js so all three call sites stay in sync with a single piece of dialog copy/behavior.
+export function attachUpdateCheckHandler(el, { skipSelector = null } = {}) {
+  el?.addEventListener('click', (e) => {
+    if (skipSelector && e.target.closest(skipSelector)) return;
+    e.preventDefault();
+    confirmDialog(t('sidebar.check_update_confirm'), hardRefreshApp, t('sidebar.check_update_reload'), false);
+  });
+}
+
+export function syncStatusBarAppearance(bgColor) {
+  if (typeof window.AndroidCodexa?.setStatusBarAppearance !== 'function') return;
+  const light = isLightColor(bgColor);
+  if (light === null) return;
+  window.AndroidCodexa.setStatusBarAppearance(light);
+}
+
 // ── Toast notifications ──────────────────────────────────────────────────────
 function ensureToastContainer() {
   let el = document.getElementById('toast-container');
@@ -57,11 +121,48 @@ export function showProgressToast(label, formatCount) {
       el.querySelector('.toast-progress-counter').textContent =
         formatCount ? formatCount(current, total) : `${current} / ${total}`;
     },
-    dismiss() {
+    // instant: skip the fade and remove right away — use when a follow-up toast (e.g. a
+    // success/error result) is about to appear immediately after, so the two don't overlap
+    // on screen for the ~300ms the fade would otherwise take.
+    dismiss(instant = false) {
+      if (instant) { el.remove(); return; }
       el.style.opacity = '0';
       el.style.transition = 'opacity .3s';
       setTimeout(() => el.remove(), 320);
     },
+  };
+}
+
+// ── Blocking overlay (spinner + message + cancel) ────────────────────────────
+// For actions that wait on a server-side operation with no client-visible byte
+// progress (e.g. the server fetching a not-yet-owned book from a remote OPDS/
+// BookOrbit catalog before a "peek"). Covers the whole viewport like
+// confirmDialog's backdrop so nothing else is clickable while it's up.
+// Cancel is intentionally "soft" — it never calls AbortController.abort() on the
+// underlying request. Passing a signal to fetch() is known to hang indefinitely
+// on some old WebView builds (see the NOTE in api.js), so cancelling here just
+// hides the overlay and hands control back to the caller; the in-flight request
+// is left to resolve or fail on its own and the caller decides what to do with
+// a late result (see bookorbit.js/opds.js peek handlers).
+export function showBlockingOverlay(message, onCancel) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop blocking-overlay';
+  backdrop.innerHTML = `
+    <div class="modal blocking-overlay-box" role="alertdialog" aria-modal="true" aria-live="polite">
+      <span class="spinner"></span>
+      <p class="blocking-overlay-msg"></p>
+      <button class="btn btn-secondary" id="blocking-overlay-cancel">${t('common.cancel')}</button>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const msgEl = backdrop.querySelector('.blocking-overlay-msg');
+  msgEl.textContent = message;
+  backdrop.querySelector('#blocking-overlay-cancel').addEventListener('click', () => {
+    backdrop.remove();
+    onCancel?.();
+  });
+  return {
+    setMessage(msg) { msgEl.textContent = msg; },
+    dismiss() { backdrop.remove(); },
   };
 }
 
@@ -102,6 +203,26 @@ export function setButtonLoading(btn, loading, originalLabel) {
     btn.innerHTML = originalLabel || btn.dataset.origLabel || '';
     btn.disabled = false;
   }
+}
+
+// ── Scroll-to-top after a page change (catalog browsers) ──────────────────────
+// OPDS/BookOrbit's Next/Prev pagination swaps the grid's content in place, but which
+// element actually owns the scrollbar varies by layout/breakpoint: on desktop
+// .opds-layout/.opds-catalog are overflow:hidden (main.css ~2652/2698) and the real
+// scrollbar lives on the inner #catalog-grid/#bookorbit-grid box itself — .app-body
+// never overflows there at all, so resetting it alone was a no-op on desktop (the
+// reported case). On mobile those inner boxes switch to overflow:visible and the
+// scroll bubbles up to .app-body/the panel instead. Some Android WebViews scroll the
+// document/scrollingElement regardless of either. Rather than pick one and be wrong
+// somewhere, reset every plausible scroll owner; resetting one that isn't actually
+// scrolled is a harmless no-op.
+export function scrollCatalogToTop() {
+  document.scrollingElement?.scrollTo(0, 0);
+  document.querySelector('.app-body')?.scrollTo(0, 0);
+  document.getElementById('panel-opds')?.scrollTo(0, 0);
+  document.getElementById('panel-bookorbit')?.scrollTo(0, 0);
+  document.getElementById('catalog-grid')?.scrollTo(0, 0);
+  document.getElementById('bookorbit-grid')?.scrollTo(0, 0);
 }
 
 function escHtml(str) {

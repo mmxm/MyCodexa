@@ -11,6 +11,7 @@ const { getDb, DATA_DIR }              = require('../db');
 const { authenticateToken }            = require('../middleware/auth');
 const { computeFileHash, computeFileMd5, extractEpubMetadata, extractCbzMetadata } = require('../utils/epub');
 const { isCbrBuffer, convertCbrToCbz } = require('../utils/cbr');
+const { isPdfBuffer, extractPdfMetadata } = require('../utils/pdf');
 const { peekFilePath, PEEK_TTL_SECONDS } = require('../utils/peekCleanup');
 const bookorbit = require('../services/bookorbitSync');
 
@@ -44,6 +45,73 @@ router.get('/health', async (req, res) => {
 // Used by the reader after a chapter/manual push, where a fresh probe would add latency.
 router.get('/last-status', (req, res) => {
   res.json(bookorbit.getLastStatus(req.user.id));
+});
+
+// GET /api/bookorbit/progress/:bookId — BookOrbit-native cross-device progress pull, used by
+// the reader as a candidate source alongside the generic kosync_url "ext" one. Needed because
+// that KOSync proxy is entirely opt-in (a separate kosync_url setting) — a user who relies on
+// BookOrbit alone for cross-device sync (no external KOSync server configured at all) otherwise
+// has no pull path whatsoever, only push (see triggerProgressPush, called from every KOSync-
+// internal write regardless of whether kosync_url is set). Returns null (200, not an error)
+// whenever there's nothing usable — same "quietly nothing to report" contract as
+// fetchRemoteProgress()'s missing-kosync_url case client-side.
+router.get('/progress/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  res.json(await bookorbit.getProgress(req.user.id, bookId));
+});
+
+// GET /api/bookorbit/book-stats/:bookId — BookOrbit's cross-device reading totals for one local
+// book (every device/reader on the account, not just what Codexa pushed). Null (200) when
+// BookOrbit is off or the book isn't mapped to it — nothing to show, not an error.
+router.get('/book-stats/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  res.json(await bookorbit.getBookStats(req.user.id, bookId));
+});
+
+// GET /api/bookorbit/book-sessions/:bookId?page=&pageSize= — the per-session rows behind those
+// totals, for a LOCAL book (the Reading tab of Codexa's own info dialog). Null (200) when BookOrbit
+// is off / the book isn't mapped; 502 when it's mapped but BookOrbit didn't answer.
+router.get('/book-sessions/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  const out = await bookorbit.getBookSessions(req.user.id, bookId, req.query.page, req.query.pageSize);
+  if (out?.unreachable) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
+// GET /api/bookorbit/book-attempts/:bookId — BookOrbit's read-throughs (attempts) of a LOCAL book: start/end
+// dates, outcome, time and sessions each. Same null / 502 contract as /book-sessions above.
+router.get('/book-attempts/:bookId', async (req, res) => {
+  const bookId = parseInt(req.params.bookId, 10);
+  if (!Number.isFinite(bookId)) return res.json(null);
+  const out = await bookorbit.getBookAttempts(req.user.id, bookId);
+  if (out?.unreachable) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
+// GET /api/bookorbit/books/:boBookId/attempts — same, keyed by BookOrbit's own id (BookOrbit browser dialog).
+router.get('/books/:boBookId/attempts', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  if (!Number.isFinite(boBookId)) return res.status(400).json({ error: 'error.bookorbit_unreachable' });
+  const out = await bookorbit.fetchAttempts(req.user.id, ctx, boBookId);
+  if (!out) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
+});
+
+// GET /api/bookorbit/books/:boBookId/sessions?page=&pageSize= — same rows keyed by BookOrbit's own
+// id, for the BookOrbit browser's book dialog (works for books never imported into Codexa).
+router.get('/books/:boBookId/sessions', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  if (!Number.isFinite(boBookId)) return res.status(400).json({ error: 'error.bookorbit_unreachable' });
+  const out = await bookorbit.fetchSessionPage(req.user.id, ctx, boBookId, req.query.page, req.query.pageSize);
+  if (!out) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.json(out);
 });
 
 // Thin GET proxy for the simple "list everything" endpoints. Forwards `q`/`page`/`size` when
@@ -298,6 +366,18 @@ router.get('/books/:boBookId/detail', async (req, res) => {
   });
 });
 
+// GET /api/bookorbit/books/:boBookId/related — same recommendation engine + series/author
+// lookups as the local book info modal's Related tab (server/routes/books.js's
+// GET /api/books/:id/related), but keyed directly by BookOrbit's own book id since a book
+// browsed here may not be imported into Codexa (no local mapping to resolve).
+router.get('/books/:boBookId/related', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const boBookId = parseInt(req.params.boBookId, 10);
+  const data = await bookorbit.getRelatedByBoId(req.user.id, ctx, boBookId);
+  res.json(data);
+});
+
 // PUT/DELETE /api/bookorbit/books/:boBookId/collections/:collectionId — add/remove this book
 // from a collection. This is the feature that removes the need to open BookOrbit at all for
 // collection assignment.
@@ -323,16 +403,32 @@ router.delete('/books/:boBookId/collections/:collectionId', async (req, res) => 
 // (server/routes/opds.js), but the source is BookOrbit's Bearer-token file endpoint instead of
 // an OPDS Basic-auth acquisition link. Shared by the single-book import route and the bulk
 // collection/smart-scope sync route below — never writes to `res` itself, just returns a result.
-const SUPPORTED_FORMATS = new Set(['epub', 'cbz', 'cbr']);
+// Kept in sync with the file-type story told everywhere else (multer's upload filter in
+// books.js, the error.epub_required message text itself) — a KEPUB is just an EPUB/ZIP
+// container as far as this app is concerned (see books.js's fileFilter comment), and both
+// callers below already fall through to outFormat 'epub' for it once past this gate. Missing
+// 'kepub' here meant BookOrbit libraries that report a file's format as "kepub" (e.g. Kobo-
+// synced .kepub.epub files kept as-is because the library has metadata/rename updates
+// disabled) got rejected with a 400 before ever reaching BookOrbit's own download endpoint —
+// see GitHub issue #34.
+const SUPPORTED_FORMATS = new Set(['epub', 'kepub', 'cbz', 'cbr', 'pdf']);
 
-async function importBookOrbitFile(userId, ctx, { boBookId, fileId, format, title, author }) {
+async function importBookOrbitFile(userId, ctx, { boBookId, fileId, format, title, author, seriesName, seriesIndex, language, onProgress, abandonSignal }) {
   const clientFormat = String(format || '').toLowerCase();
   if (clientFormat && !SUPPORTED_FORMATS.has(clientFormat)) {
     return { ok: false, status: 400, error: 'error.epub_required' };
   }
 
-  const asset = await bookorbit.fetchAsset(userId, ctx, `/books/files/${fileId}/download`);
-  if (!asset.ok) return { ok: false, status: 502, error: 'error.bookorbit_unreachable' };
+  const asset = await bookorbit.fetchAssetStream(userId, ctx, `/books/files/${fileId}/download`, onProgress, abandonSignal);
+  if (!asset.ok) {
+    // Surfaced as its own error rather than the generic "unreachable" one — a truncated download
+    // is a distinct, actionable case for the user (retry) from a server that's simply down, and
+    // conflating them made this failure mode invisible: nothing before this ever logged it, so a
+    // silently-truncated file sailed straight through to disk/parsing (see fetchAssetStream's own
+    // comment for the full story of why that matters beyond just a missing cover).
+    if (asset.incomplete) return { ok: false, status: 502, error: 'error.bookorbit_download_incomplete' };
+    return { ok: false, status: 502, error: 'error.bookorbit_unreachable' };
+  }
 
   const buf = asset.buffer;
   if (!buf || buf.length < 100) return { ok: false, status: 502, error: 'error.file_empty' };
@@ -345,11 +441,24 @@ async function importBookOrbitFile(userId, ctx, { boBookId, fileId, format, titl
   let workBuf = buf;
   let outFormat = 'epub';
   const ctLower = (asset.contentType || '').toLowerCase();
-  if (isCbrBuffer(workBuf)) {
+  const isPdf = isPdfBuffer(workBuf);
+  if (isPdf || ctLower.includes('pdf') || clientFormat === 'pdf') {
+    outFormat = 'pdf';
+  } else if (isCbrBuffer(workBuf)) {
     workBuf = await convertCbrToCbz(workBuf);
     outFormat = 'cbz';
   } else if (ctLower.includes('cbz') || ctLower.includes('comicbook+zip') || clientFormat === 'cbz') {
     outFormat = 'cbz';
+  }
+  // EPUB/CBZ are both ZIP containers ('PK' signature); anything defaulting to 'epub' that isn't
+  // actually a PDF or a ZIP isn't a real book file at all — most likely BookOrbit's own download
+  // endpoint returned an error page/JSON body instead of the asset (confirmed possible: this
+  // endpoint's fetchAsset() doesn't itself validate content, so a 200-with-wrong-body slips
+  // through as "ok"). Failing clearly here beats writing that response to disk as a fake
+  // ".epub"/".pdf" and only discovering it's not a real book once the reader tries to open it.
+  if (outFormat === 'epub' && !isPdf && !(workBuf.length >= 2 && workBuf[0] === 0x50 && workBuf[1] === 0x4b)) {
+    console.warn(`[bookorbit] import: fileId=${fileId} rejected — not a valid book file (${workBuf.length} bytes)`);
+    return { ok: false, status: 502, error: 'error.bookorbit_invalid_file' };
   }
 
   const tmpPath = path.join(TMP_DIR, `bo_${Date.now()}_${userId}_${Math.random().toString(36).slice(2)}.tmp`);
@@ -368,32 +477,64 @@ async function importBookOrbitFile(userId, ctx, { boBookId, fileId, format, titl
       return { ok: false, status: 409, error: 'error.book_already_in_library', id: existing.id, alreadyOwned: true };
     }
 
-    const ext      = outFormat === 'cbz' ? '.cbz' : '.epub';
+    const ext      = outFormat === 'pdf' ? '.pdf' : outFormat === 'cbz' ? '.cbz' : '.epub';
     const filename = `${fileHash}${ext}`;
     const destPath = path.join(userDir, filename);
     try { fs.renameSync(tmpPath, destPath); }
     catch { fs.copyFileSync(tmpPath, destPath); fs.unlinkSync(tmpPath); }
 
-    const meta = outFormat === 'cbz'
+    const meta = outFormat === 'pdf' ? await extractPdfMetadata(destPath, COVERS_DIR, fileHash)
+      : outFormat === 'cbz'
       ? extractCbzMetadata(destPath, COVERS_DIR, fileHash)
       : extractEpubMetadata(destPath, COVERS_DIR, fileHash);
+    // PDFs never get a cover from extraction at all (metadata-only — see server/utils/pdf.js),
+    // and EPUB/CBZ extraction can occasionally come up empty too (a non-compliant manifest, no
+    // image in the archive, ...). BookOrbit already serves a cover for every book in its own
+    // library — that's what renders the BookOrbit browsing-grid thumbnails and the "more like
+    // this" cards (GET /api/books/bookorbit-cover, both via this same bookorbit.getCover()) —
+    // so fall back to fetching that instead of leaving the book with just a placeholder.
+    if (!meta.cover_path) {
+      try {
+        const coverAsset = await bookorbit.getCover(userId, boBookId);
+        if (coverAsset.ok && coverAsset.buffer?.length > 100) {
+          const ct    = (coverAsset.contentType || '').toLowerCase();
+          const cext  = ct.includes('png') ? '.png' : ct.includes('webp') ? '.webp' : '.jpg';
+          const coverFilename = `${fileHash}${cext}`;
+          fs.writeFileSync(path.join(COVERS_DIR, coverFilename), coverAsset.buffer);
+          meta.cover_path = coverFilename;
+        }
+      } catch (err) {
+        console.warn('[bookorbit] cover fallback fetch failed:', err.message);
+      }
+    }
     const bookTitle  = meta.title  || title  || 'Unknown';
     const bookAuthor = meta.author || author || '';
+    // The file's own metadata wins when present, but a comic/PDF often has none at all (e.g.
+    // no ComicInfo.xml) — fall back to what BookOrbit's own catalog already told us about this
+    // book (its series membership in particular is almost never embedded in the file itself).
+    const bookSeriesName   = meta.series_name   || seriesName || '';
+    const bookSeriesNumber = meta.series_number || (seriesIndex != null ? String(seriesIndex) : '');
+    const bookLanguage     = meta.language      || language   || '';
     const fileSize   = fs.statSync(destPath).size;
 
     const result = db.prepare(`
       INSERT INTO books (user_id, title, author, series_name, series_number, description, file_hash, file_hash_md5, filename, cover_path, file_size,
                          publisher, language, isbn, genres, pages, format)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(userId, bookTitle, bookAuthor, meta.series_name || '', meta.series_number || '', meta.description || '',
+    `).run(userId, bookTitle, bookAuthor, bookSeriesName, bookSeriesNumber, meta.description || '',
            fileHash, fileHashMd5, filename, meta.cover_path || '', fileSize,
-           meta.publisher || '', meta.language || '', meta.isbn || '', meta.genres || '', meta.pages || null, outFormat);
+           meta.publisher || '', bookLanguage, meta.isbn || '', meta.genres || '', meta.pages || null, outFormat);
 
     const newBookId = result.lastInsertRowid;
     bookorbit.mapLocalBook(userId, newBookId, boBookId, Number(fileId));
 
+    console.log(`[bookorbit] import: added book id=${newBookId} "${bookTitle}" (${outFormat}, ${fileSize} bytes, cover=${meta.cover_path ? 'yes' : 'no'})`);
     return { ok: true, id: newBookId, title: bookTitle, author: bookAuthor };
   } catch (err) {
+    // This used to fail completely silently server-side (the client got a JSON error, but
+    // nothing was ever logged here) — the one gap left where a bad import could go unnoticed
+    // entirely instead of at least showing up in the log for later correlation.
+    console.error(`[bookorbit] import failed for fileId=${fileId}:`, err);
     try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     return { ok: false, status: 500, error: err.message };
   }
@@ -404,16 +545,81 @@ router.post('/books/:boBookId/import', async (req, res) => {
   if (!ctx) return;
 
   const boBookId = parseInt(req.params.boBookId, 10);
-  const { fileId, format, title, author } = req.body || {};
+  const { fileId, format, title, author, seriesName, seriesIndex, language } = req.body || {};
   if (!fileId) return res.status(400).json({ error: 'error.file_id_required' });
 
+  // Same client-disconnect handling as import-sse below: stop the (potentially large)
+  // background download rather than let it run to completion for a client that already left.
+  const abortController = new AbortController();
+  req.on('close', () => abortController.abort());
+
   try {
-    const result = await importBookOrbitFile(req.user.id, ctx, { boBookId, fileId, format, title, author });
+    const result = await importBookOrbitFile(req.user.id, ctx, { boBookId, fileId, format, title, author, seriesName, seriesIndex, language, abandonSignal: abortController.signal });
+    if (res.writableEnded) return; // client already gone — nothing left to respond to
     if (!result.ok) return res.status(result.status || 500).json({ error: result.error, id: result.id });
     res.status(201).json({ id: result.id, title: result.title, author: result.author });
   } catch (err) {
     console.error('[bookorbit] import error:', err.message);
-    res.status(500).json({ error: err.message });
+    if (!res.writableEnded) res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/bookorbit/books/:boBookId/import-sse?fileId=&format=&title=&author=&seriesName=&
+// seriesIndex=&language=&token= — same import as POST /import above, but streamed as SSE so the
+// client can show a real byte-progress bar on the book's cover while BookOrbit's file downloads
+// (the plain POST route blocks silently until the whole thing is done). GET+query-params (not
+// POST) because EventSource can only issue GET requests; auth via ?token= — same fallback
+// authenticateToken already supports for /sync-sse above.
+router.get('/books/:boBookId/import-sse', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+
+  const boBookId = parseInt(req.params.boBookId, 10);
+  const { fileId, format, title, author, seriesName, language } = req.query;
+  const seriesIndex = req.query.seriesIndex != null && req.query.seriesIndex !== '' ? Number(req.query.seriesIndex) : null;
+  if (!fileId) return res.status(400).json({ error: 'error.file_id_required' });
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no', // defeat nginx/reverse-proxy response buffering if present
+  });
+  res.flushHeaders();
+
+  // Track the client going away (e.g. the phone loses connection mid-download) so this
+  // request stops both writing to a dead socket AND downloading in the background for
+  // nobody. Without this, a disconnect-then-retry left the original download running to
+  // completion unseen, then crashed the whole process trying to report back to a closed
+  // connection — see server/index.js's uncaughtException handler comment for the full story.
+  let clientGone = false;
+  const abortController = new AbortController();
+  req.on('close', () => { clientGone = true; abortController.abort(); });
+  // Belt-and-suspenders: if a write below still somehow throws (e.g. a disconnect that lands
+  // in the narrow window between the writableEnded check and the write itself), swallow it
+  // here rather than let it become an unhandled 'error' event.
+  res.on('error', () => {});
+  const send = (obj) => {
+    if (clientGone || res.writableEnded) return;
+    try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* client gone mid-write */ }
+  };
+
+  try {
+    const result = await importBookOrbitFile(req.user.id, ctx, {
+      boBookId, fileId, format, title, author, seriesName, seriesIndex, language,
+      abandonSignal: abortController.signal,
+      onProgress: (loaded, total) => send({ type: 'progress', loaded, total }),
+    });
+    if (!result.ok) {
+      send({ type: 'error', message: result.error, id: result.id, alreadyOwned: result.alreadyOwned });
+    } else {
+      send({ type: 'done', id: result.id, title: result.title, author: result.author });
+    }
+  } catch (err) {
+    console.error('[bookorbit] import-sse error:', err.message);
+    send({ type: 'error', message: err.message });
+  } finally {
+    if (!clientGone && !res.writableEnded) res.end();
   }
 });
 
@@ -432,7 +638,11 @@ async function createBookOrbitPeek(userId, ctx, { boBookId, fileId, format, titl
   }
 
   const asset = await bookorbit.fetchAsset(userId, ctx, `/books/files/${fileId}/download`);
-  if (!asset.ok) return { ok: false, status: 502, error: 'error.bookorbit_unreachable' };
+  if (!asset.ok) {
+    // See importBookOrbitFile's identical branch for why this is split out.
+    if (asset.incomplete) return { ok: false, status: 502, error: 'error.bookorbit_download_incomplete' };
+    return { ok: false, status: 502, error: 'error.bookorbit_unreachable' };
+  }
 
   const buf = asset.buffer;
   if (!buf || buf.length < 100) return { ok: false, status: 502, error: 'error.file_empty' };
@@ -443,11 +653,23 @@ async function createBookOrbitPeek(userId, ctx, { boBookId, fileId, format, titl
   let workBuf = buf;
   let outFormat = 'epub';
   const ctLower = (asset.contentType || '').toLowerCase();
-  if (isCbrBuffer(workBuf)) {
+  const isPdf = isPdfBuffer(workBuf);
+  if (isPdf || ctLower.includes('pdf') || clientFormat === 'pdf') {
+    outFormat = 'pdf';
+  } else if (isCbrBuffer(workBuf)) {
     workBuf = await convertCbrToCbz(workBuf);
     outFormat = 'cbz';
   } else if (ctLower.includes('cbz') || ctLower.includes('comicbook+zip') || clientFormat === 'cbz') {
     outFormat = 'cbz';
+  }
+  // EPUB/CBZ are both ZIP containers ('PK' signature); anything defaulting to 'epub' that isn't
+  // actually a PDF or a ZIP isn't a real book file at all — most likely BookOrbit's own download
+  // endpoint returned an error page/JSON body instead of the asset (confirmed possible: this
+  // endpoint's fetchAsset() doesn't itself validate content, so a 200-with-wrong-body slips
+  // through as "ok"). Failing clearly here beats writing that response to disk as a fake
+  // ".epub"/".pdf" and only discovering it's not a real book once the reader tries to open it.
+  if (outFormat === 'epub' && !isPdf && !(workBuf.length >= 2 && workBuf[0] === 0x50 && workBuf[1] === 0x4b)) {
+    return { ok: false, status: 502, error: 'error.bookorbit_invalid_file' };
   }
 
   const stagingPath = path.join(TMP_DIR, `bo_peek_${Date.now()}_${userId}_${Math.random().toString(36).slice(2)}.tmp`);
@@ -472,7 +694,7 @@ async function createBookOrbitPeek(userId, ctx, { boBookId, fileId, format, titl
     // POST /api/books/:id/opened's triggerSync() never wastes a round-trip on this row, and this
     // row's transient reading_sessions can never get synced into BookOrbit before cleanup runs.
     const peekHash = `peek_${boBookId}_${fileId}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const ext      = outFormat === 'cbz' ? '.cbz' : '.epub';
+    const ext      = outFormat === 'pdf' ? '.pdf' : outFormat === 'cbz' ? '.cbz' : '.epub';
     const filename = `${peekHash}${ext}`;
     const destPath = peekFilePath(userId, filename);
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
@@ -662,6 +884,7 @@ router.get('/sync-sse', async (req, res) => {
         const result = await importBookOrbitFile(req.user.id, ctx, {
           boBookId: b.id, fileId: primaryFile.id, format: primaryFile.format,
           title: b.title, author: (b.authors || [])[0],
+          seriesName: b.seriesName, seriesIndex: b.seriesIndex, language: b.language,
         });
         if (result.ok) {
           addToShelf.run(shelf.id, result.id);
@@ -685,27 +908,228 @@ router.get('/sync-sse', async (req, res) => {
     // a book might still genuinely be in the source but beyond the limited slice — check its
     // bo_book_id against the FULL unlimited listing (allBooks) before calling it stale.
     const staleBooks = [];
+    let autoRemoved = 0;
     if (preExistingBookIds.size > 0) {
       const allBoIds = new Set(allBooks.map(b => b.id));
+      const unlinkFromShelf = db.prepare('DELETE FROM book_shelves WHERE shelf_id = ? AND book_id = ?');
       for (const bookId of preExistingBookIds) {
         if (syncedBookIds.has(bookId)) continue;
         const state = db.prepare('SELECT bo_book_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(req.user.id, bookId);
         if (state?.bo_book_id != null && allBoIds.has(state.bo_book_id)) continue;
         const bk = db.prepare('SELECT id, title, author FROM books WHERE id = ?').get(bookId);
-        if (bk) {
-          const { cnt: otherShelfCount } = db.prepare(
-            'SELECT COUNT(*) AS cnt FROM book_shelves WHERE book_id = ? AND shelf_id != ?'
-          ).get(bookId, shelf.id) || { cnt: 0 };
-          staleBooks.push({ ...bk, otherShelfCount });
+        if (!bk) continue;
+        const { cnt: otherShelfCount } = db.prepare(
+          'SELECT COUNT(*) AS cnt FROM book_shelves WHERE book_id = ? AND shelf_id != ?'
+        ).get(bookId, shelf.id) || { cnt: 0 };
+        if (otherShelfCount > 0) {
+          // Still present on at least one other shelf (e.g. moved to a different linked
+          // collection/smart scope upstream, like BookOrbit's own "want to read" -> "currently
+          // reading") — unlinking from just THIS shelf is always safe, nothing is lost, so do it
+          // automatically rather than making the user click through a "Delete" dialog for a book
+          // they're still actively reading elsewhere. Confirmed live: that dialog's own "delete"
+          // action already only unlinked in this case (see openBookorbitStaleDialog client-side),
+          // but the red "Delete" wording/styling was needlessly alarming for something this safe.
+          unlinkFromShelf.run(shelf.id, bookId);
+          autoRemoved++;
+          continue;
         }
+        staleBooks.push({ ...bk, otherShelfCount });
       }
     }
 
-    done({ type: 'done', added, skipped, errors, shelfId: shelf.id, staleBooks });
+    done({ type: 'done', added, skipped, errors, shelfId: shelf.id, staleBooks, autoRemoved });
   } catch (err) {
     console.error('[bookorbit] sync-sse error:', err.message);
     done({ type: 'error', message: err.message });
   }
+});
+
+// ── BookOrbit Dash — account-wide reading stats, powered by BookOrbit's own ──
+// /dashboard/widgets/* endpoints (the same ones its web client uses). Distinct from Codexa's own
+// local /api/stats: these numbers cover the whole BookOrbit account (KOReader/Kobo/manual
+// sessions too, plus concepts Codexa has no equivalent of like a yearly reading goal), not just
+// activity that happened inside Codexa.
+
+// GET /api/bookorbit/dashboard — fetches every widget in parallel. Each is independent — one
+// widget failing (or legitimately returning null, e.g. highlight-of-the-day with zero
+// annotations) doesn't blank the rest of the page; only a total connectivity failure 502s.
+const DASHBOARD_WIDGETS = {
+  readingGoal:       '/dashboard/widgets/reading-goal',
+  readingStreak:      '/dashboard/widgets/reading-streak',
+  currentlyReading:   '/dashboard/widgets/currently-reading',
+  libraryOverview:    '/dashboard/widgets/library-overview',
+  highlightOfTheDay:  '/dashboard/widgets/highlight-of-the-day',
+};
+
+router.get('/dashboard', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+
+  const entries = await Promise.all(
+    Object.entries(DASHBOARD_WIDGETS).map(async ([key, p]) => [key, await bookorbit.api(req.user.id, ctx, 'GET', p)])
+  );
+
+  const out = {};
+  let anyOk = false;
+  for (const [key, r] of entries) {
+    out[key] = r.ok ? r.data : null;
+    anyOk = anyOk || r.ok;
+  }
+  if (!anyOk) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+
+  // Annotate currentlyReading books + the highlight-of-the-day book with localBookId, same batch
+  // lookup as GET /books above, so the client can link straight into the reader for anything
+  // already downloaded instead of always falling back to a non-interactive row.
+  const boIds = [
+    ...(out.currentlyReading?.books || []).map(b => b.bookId),
+    out.highlightOfTheDay?.bookId,
+  ].filter(Boolean);
+  if (boIds.length) {
+    const db = getDb();
+    const placeholders = boIds.map(() => '?').join(',');
+    const rows = db.prepare(
+      `SELECT bo_book_id, book_id FROM bookorbit_sync_state WHERE user_id = ? AND bo_book_id IN (${placeholders})`
+    ).all(req.user.id, ...boIds);
+    const localByBoId = new Map(rows.map(r => [r.bo_book_id, r.book_id]));
+    if (out.currentlyReading?.books) {
+      out.currentlyReading.books = out.currentlyReading.books.map(b => ({ ...b, localBookId: localByBoId.get(b.bookId) || null }));
+    }
+    if (out.highlightOfTheDay) {
+      out.highlightOfTheDay.localBookId = localByBoId.get(out.highlightOfTheDay.bookId) || null;
+    }
+  }
+
+  res.json(out);
+});
+
+// ── Activity: all-devices reading calendar, goal trend, rhythm ────────────────────
+// Backed by BookOrbit's user-statistics endpoints. activity-overview does a full 365-day session
+// scan on BookOrbit's side (it caches 5 min itself), so it's also cached here briefly — switching
+// tabs or reopening the panel shouldn't re-run it — and trimmed to just what the Activity tab draws.
+// Everything uses READING seconds: BookOrbit's plain totals also fold in audiobook/TTS listening.
+const ACTIVITY_TTL_MS = 2 * 60 * 1000;
+const activityCache = new Map(); // key -> { at, data }
+
+const isoToUnix = (iso) => { const ms = iso ? new Date(iso).getTime() : NaN; return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
+
+function trimCalendar(cal) {
+  if (!cal) return null;
+  return {
+    year: cal.year,
+    availableYears: Array.isArray(cal.availableYears) ? cal.availableYears : [],
+    days: (cal.days || []).map(d => ({ day: d.day, readingSeconds: Number(d.readingSeconds) || 0, sessionsCount: Number(d.sessionsCount) || 0 })),
+  };
+}
+
+function trimActivity(o) {
+  const reading = (x) => Number(x?.readingSeconds) || 0;
+  const readingPace = (o.pace?.byMedia || []).find(m => m.bucket === 'reading');
+  return {
+    timezone: o.timezone || 'UTC',
+    snapshot: {
+      todaySeconds:        reading(o.snapshot?.today),
+      lastSevenDays:       reading(o.snapshot?.lastSevenDays),
+      previousSevenDays:   reading(o.snapshot?.previousSevenDays),
+      currentStreak:       Number(o.snapshot?.currentStreak) || 0,
+      longestStreak:       Number(o.snapshot?.longestStreak) || 0,
+      completedBooksYtd:   Number(o.snapshot?.completedBooksYtd) || 0,
+    },
+    goal: o.goal ? {
+      year:           o.goal.year,
+      goalBooks:      o.goal.goalBooks ?? null,
+      completedBooks: Number(o.goal.completedBooks) || 0,
+      projectedBooks: Number(o.goal.projectedBooks) || 0,
+      status:         o.goal.status ?? null,
+      points: (o.goal.points || []).map(p => ({ month: p.month, actualCumulative: Number(p.actualCumulative) || 0, targetCumulative: p.targetCumulative ?? null })),
+    } : null,
+    rhythm: {
+      weekdays: (o.rhythm?.weekdays || []).map(w => ({ dayOfWeek: w.dayOfWeek, averageReadingSeconds: Number(w.averageReadingSeconds) || 0 })),
+      hours:    (o.rhythm?.hours || []).map(h => ({ hour: h.hour, readingSeconds: Number(h.readingSeconds) || 0 })),
+      favoriteDayOfWeek: o.rhythm?.favoriteDayOfWeek ?? null,
+      peakHour:          o.rhythm?.peakHour ?? null,
+    },
+    sources: (o.sources?.slices || []).map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0 })),
+    completion: { months: (o.completion?.months || []).map(m => ({ year: m.year, month: m.month, count: Number(m.count) || 0 })) },
+    medianSessionSeconds: readingPace?.medianDurationSeconds ?? o.pace?.medianDurationSeconds ?? null,
+    calendar: trimCalendar(o.calendar),
+  };
+}
+
+async function cachedGet(req, res, ctx, key, path, trim) {
+  const c = activityCache.get(key);
+  if (!req.query.refresh && c && Date.now() - c.at < ACTIVITY_TTL_MS) return res.json(c.data);
+  const r = await bookorbit.api(req.user.id, ctx, 'GET', path);
+  if (!r.ok || !r.data) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  const data = trim(r.data);
+  activityCache.set(key, { at: Date.now(), data });
+  res.json(data);
+}
+
+// GET /api/bookorbit/activity[?refresh=1] — everything the Activity tab draws, in one call.
+router.get('/activity', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  await cachedGet(req, res, ctx, `${req.user.id}:overview`, '/user-statistics/activity-overview', trimActivity);
+});
+
+// GET /api/bookorbit/activity/calendar/:year — another year's calendar (the year switcher).
+router.get('/activity/calendar/:year', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const year = parseInt(req.params.year, 10);
+  if (!Number.isInteger(year) || year < 1970 || year > new Date().getFullYear()) return res.status(400).json({ error: 'error.invalid_date' });
+  await cachedGet(req, res, ctx, `${req.user.id}:cal:${year}`, `/user-statistics/activity-calendar/${year}`, trimCalendar);
+});
+
+// GET /api/bookorbit/activity/day/:day — the reading sessions behind one heatmap cell. Sessions of
+// books that are also in Codexa carry localBookId so the client can link into the reader.
+router.get('/activity/day/:day', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+  const day = String(req.params.day);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day))) return res.status(400).json({ error: 'error.invalid_date' });
+  const r = await bookorbit.api(req.user.id, ctx, 'GET', `/user-statistics/activity-days/${day}`);
+  if (!r.ok || !r.data) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  const sessions = (r.data.sessions || []).filter(x => x.mediaBucket !== 'listening');
+  const boIds = [...new Set(sessions.map(x => x.bookId).filter(Boolean))];
+  let localByBoId = new Map();
+  if (boIds.length) {
+    const rows = getDb().prepare(
+      `SELECT bo_book_id, book_id FROM bookorbit_sync_state WHERE user_id = ? AND bo_book_id IN (${boIds.map(() => '?').join(',')})`
+    ).all(req.user.id, ...boIds);
+    localByBoId = new Map(rows.map(x => [x.bo_book_id, x.book_id]));
+  }
+  res.json({
+    day,
+    readingSeconds: Number(r.data.totals?.readingSeconds) || 0,
+    sessions: sessions.map(x => ({
+      bookId:               x.bookId,
+      localBookId:          localByBoId.get(x.bookId) || null,
+      bookTitle:            x.bookTitle || null,
+      startedAt:            isoToUnix(x.startedAt),
+      endedAt:              isoToUnix(x.endedAt),
+      durationOnDaySeconds: Number(x.durationOnDaySeconds) || 0,
+      progressDelta:        x.progressDelta ?? null,
+      sourceBucket:         x.sourceBucket || 'bookorbit',
+    })),
+  });
+});
+
+// PUT /api/bookorbit/dashboard/goal — body: { goalBooks: number|null }. null clears the goal.
+router.put('/dashboard/goal', async (req, res) => {
+  const ctx = requireContext(req, res);
+  if (!ctx) return;
+
+  const goalBooks = req.body?.goalBooks ?? null;
+  if (goalBooks !== null && (!Number.isInteger(goalBooks) || goalBooks < 0)) {
+    return res.status(400).json({ error: 'error.invalid_goal' });
+  }
+
+  const r = await bookorbit.api(req.user.id, ctx, 'PATCH', '/users/me/settings', {
+    settings: { dashboardConfig: { readingGoal: goalBooks } },
+  });
+  if (!r.ok) return res.status(502).json({ error: 'error.bookorbit_unreachable' });
+  res.status(204).end();
 });
 
 module.exports = router;

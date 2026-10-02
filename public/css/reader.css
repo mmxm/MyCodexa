@@ -9,16 +9,44 @@
  *   --layout-h    window.innerHeight px  (e.g. 852px) — true full screen height
  */
 :root {
-  --sat:      env(safe-area-inset-top,    0px); /* overwritten by JS after settle */
-  --sab:      34px;                             /* safe default for home-indicator iPhones;
-                                                   JS corrects to real value (0 on Android/iPad/home-button phones) */
-  --layout-h: 100svh;                           /* overwritten by JS after settle */
+  --sat:      env(safe-area-inset-top,    0px); /* JS (Android only) overrides after settle */
+  /* Live env() reference, same as --sat above — not a flat 34px guess: that guess (plus the JS
+     logic that used to fall back to it) was found to compound into real lost reading-content
+     space on iOS PWA when the JS snapshot it relied on was wrong (see reader.html's
+     applyInsets()). --sat already proves this exact live-CSS-default pattern works correctly on
+     iOS; --sab now gets the same treatment instead of a JS-computed inline override there. */
+  --sab:      env(safe-area-inset-bottom, 0px); /* JS (Android only) overrides after settle */
+  /* 100lvh (large viewport height — the true full screen, assuming no dynamic browser chrome),
+     not 100dvh/100svh. Measured directly with a purpose-built test page (see temp/pwatest/):
+     on iOS standalone-PWA, dvh/svh/window.innerHeight/visualViewport.height are ALL consistently
+     793px, while lvh/vh/screen.height/outerHeight are ALL consistently 852px — a difference of
+     exactly env(safe-area-inset-top) (59px on that device). This isn't timing/staleness (every
+     reading agreed, taken back-to-back) — dvh/svh apparently define their height as "screen
+     height minus the status bar" in iOS standalone mode. That's wrong for .reader-layout/#box:
+     it starts at top:0 and handles its own top inset via --sat padding, so it needs the true,
+     un-shrunk full-screen height or it necessarily falls exactly env(safe-area-inset-top) short
+     of the real bottom edge — the persistent bottom gap. `100vh` as a fallback for browsers old
+     enough to not support `lvh` (Safari < 16.4) — CSS silently ignores a rule with an unsupported
+     unit, so the vh declaration stays in effect there and lvh simply overrides it where support
+     exists. Android keeps its own separately-set JS window.innerHeight override, unaffected by
+     this — confirmed correct there independently. */
+  --layout-h: 100vh;
+  --layout-h: 100lvh;
 }
 
 html, body {
   overflow: hidden;
   height: var(--layout-h);
   scrollbar-gutter: auto;
+  /* main.css's generic `html, body { background: var(--color-bg); }` is never overridden here
+     otherwise, and --color-bg is only ever set to a rough approximate theme color by the inline
+     bootstrap script in <head> (so the loading screen isn't blank white) — visibly different
+     from .reader-layout's own, precise --reader-page-bg. Any residual sliver of body peeking
+     out from under .reader-layout's height (env()/dvh measurement is never guaranteed
+     pixel-perfect across every device) showed up as a distinct off-shade strip rather than
+     being invisible. Match the same background here so a leftover gap, however small, blends
+     in instead of banding. */
+  background: var(--reader-page-bg, var(--color-bg));
 }
 
 .reader-layout {
@@ -53,12 +81,33 @@ html, body {
   z-index: 19;
   pointer-events: none;
 }
-.autohide-header #header-sensor {
+.autohide-header #header-sensor,
+.comic-mode #header-sensor {
+  pointer-events: auto;
+}
+
+/* Comic-mode-only mirror of #header-sensor at the bottom edge — EPUB has no bottom chrome to
+   reveal this way, so this stays inert (pointer-events:none) outside comic mode. */
+#footer-sensor {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: calc(5% + var(--sab, 0px));
+  z-index: 19;
+  pointer-events: none;
+}
+.comic-mode #footer-sensor {
   pointer-events: auto;
 }
 
 /* ── Auto-hide header ────────────────────────────────────────────────────────── */
-.reader-layout.autohide-header .reader-header {
+/* Comic mode (.comic-mode, set whenever a CBZ is open) reuses this exact overlay + peek
+   mechanism to hide/reveal the header, regardless of the user's own autoHideHeader
+   preference — comics always start with chrome hidden. Deliberately independent from the
+   status bars' own .bars-peek toggle further down (top-edge hover reveals the toolbar;
+   bottom-edge hover reveals the status bars — mirroring how the two edges read visually,
+   rather than one hover revealing chrome at both ends of the screen at once). */
+.reader-layout.autohide-header .reader-header,
+.reader-layout.comic-mode .reader-header {
   position: absolute;
   top: var(--sat);
   left: 0;
@@ -69,14 +118,16 @@ html, body {
   transition: transform .25s ease, opacity .25s ease;
   z-index: 20;
 }
-.reader-layout.autohide-header.header-peek .reader-header {
+.reader-layout.autohide-header.header-peek .reader-header,
+.reader-layout.comic-mode.header-peek .reader-header {
   transform: translateY(0);
   opacity: 1;
   pointer-events: auto;
   z-index: 21;
 }
 /* Reader main fills full height when header is out of flow */
-.reader-layout.autohide-header .reader-main {
+.reader-layout.autohide-header .reader-main,
+.reader-layout.comic-mode .reader-main {
   flex: 1;
   height: 100%;
 }
@@ -555,6 +606,94 @@ html, body {
 #epub-viewer iframe {
   background: var(--reader-page-bg, #1a1a2e) !important;
 }
+/* Comic mode: force black background the whole way up the #epub-viewer ancestor chain, not
+   just on #epub-viewer itself. #epub-viewer's own inline background (set by JS to match the
+   reading theme, for the EPUB case) was the first fix here — but the page-turn animation
+   (fade/zoom, see the anim-fade/anim-zoom rules below) animates #epub-viewer's own `opacity`
+   down to 0 and back on every page turn, and while it's not fully opaque, whatever sits
+   BEHIND it shows through regardless of #epub-viewer's own background colour. .reader-layout
+   and .reader-main both default to the reading theme's own colour (.reader-layout's own
+   background rule below reads var(--reader-page-bg)) — hence the flash from theme colour to
+   black on every page turn, confirmed live. Blacking out the whole chain removes anything
+   theme-coloured for the animation to reveal in the first place. */
+.reader-layout.comic-mode,
+.comic-mode .reader-main,
+.comic-mode #epub-viewer {
+  background: #000 !important;
+}
+
+/* ── Comic (CBZ) full-bleed immersive viewer ─────────────────────────────────── */
+/* Always black, regardless of reading theme — letterboxing around a comic page should
+   read as "cinema black," not the theme's paper colour. See cxreader/index.js's
+   _renderCbzItem and comic-viewer.js, which transforms this element for zoom/pan. */
+.cx-cbz-wrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  box-sizing: border-box;
+  /* No transition here deliberately — comic-viewer.js drives this transform every frame of a
+     live wheel/pinch/drag gesture, and a CSS transition would make 1:1 tracking feel laggy. */
+}
+.cx-cbz-wrap.two-page { gap: 6px; }
+.cx-cbz-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  /* Without this, mousedown-and-move on the image itself starts the browser's own native
+     image drag-and-drop instead of comic-viewer.js's pan gesture — the native drag swallows
+     the rest of the pointer sequence, so the pan appeared to "stop" the instant the mouse
+     moved. Confirmed live (desktop Chrome). */
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.cx-cbz-wrap.two-page .cx-cbz-img { max-width: calc(50% - 3px); }
+/* Desktop affordance: only show a pan cursor once actually zoomed in — clicking at
+   fit-to-screen zoom pages/reveals chrome, not zooms (that's wheel/pinch-only), so a
+   zoom-in cursor there would misleadingly suggest click-to-zoom. Never applies in continuous
+   mode — zoom is out of scope there, comicViewer is never invoked, so .cx-comic-zoomed never
+   gets added. */
+.comic-mode #epub-viewer.cx-comic-zoomed { cursor: grab; }
+.comic-mode #epub-viewer.cx-comic-zoomed:active { cursor: grabbing; }
+
+/* ── Continuous comic mode: full book stacked, no gaps, native scroll ───────────────────── */
+/* #epub-viewer is overflow:hidden everywhere else (paginated modes clip by design) — here it's
+   the actual scroll container (see cxreader/index.js's _renderCbzContinuous, which passes it
+   directly to ScrollPaginator rather than an inner wrapper). touch-action on #epub-viewer
+   (further up this file) already reserves horizontal touch gestures for JS — see reader.js's
+   continuous-mode branch in handleTouchEnd — while leaving vertical panning native. */
+.comic-mode.continuous #epub-viewer {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+.cx-cbz-continuous-wrap {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  /* Honors the reader's existing margin setting (see reader.js's applyComicMargin) — 0px keeps
+     today's edge-to-edge "webtoon" full-bleed behavior; a wide desktop monitor can otherwise
+     stretch a comic page uncomfortably wide with no way to rein it in. The black background
+     comes from #epub-viewer (top of this file), so the margin reads as letterboxing, matching
+     paginated comic mode's look. */
+  padding-left:  var(--cx-comic-margin, 0px);
+  padding-right: var(--cx-comic-margin, 0px);
+}
+/* Overrides .cx-cbz-img's fit-to-screen max-height/object-fit (meant for one full-bleed page)
+   — here every image is full width (of the padded wrap above), height auto per its own aspect
+   ratio, the standard "webtoon" convention. display:block eliminates the few-px inline-image
+   whitespace gap between stacked images that "no gaps" means avoiding. */
+.cx-cbz-continuous-wrap .cx-cbz-img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  max-height: none;
+  object-fit: initial;
+}
 
 /* ── Page turn animations ────────────────────────────────────────────────────── */
 /* Fade */
@@ -610,6 +749,7 @@ html, body {
 #search-sidebar,
 #bookmarks-sidebar,
 #settings-panel,
+#color-picker-panel,
 .sleep-timer-panel,
 .dict-popup {
   box-shadow: none;
@@ -621,7 +761,8 @@ html, body {
 body.page-gap-shadow-on #toc-sidebar,
 body.page-gap-shadow-on #search-sidebar,
 body.page-gap-shadow-on #bookmarks-sidebar,
-body.page-gap-shadow-on #settings-panel {
+body.page-gap-shadow-on #settings-panel,
+body.page-gap-shadow-on #color-picker-panel {
   box-shadow: var(--shadow);
 }
 
@@ -633,6 +774,7 @@ body.page-gap-shadow-on #settings-panel {
 #search-sidebar.open,
 #bookmarks-sidebar.open,
 #settings-panel.open,
+#color-picker-panel.open,
 .sleep-timer-panel.open,
 .dict-popup.open {
   box-shadow: var(--shadow);
@@ -674,12 +816,19 @@ body.page-gap-shadow-on #settings-panel {
 }
 
 /* KOSync tap hot zones */
+/* z-index 22: must beat #footer-sensor (z:19, pointer-events:auto in .comic-mode — the
+   bottom-edge hover/tap sensor that reveals the status bars) and .header-peek's revealed
+   header (z:21), both siblings of .reader-main further up the DOM. .reader-main itself
+   establishes no stacking context of its own (position:relative with no z-index), so these
+   hotzones stack purely by z-index against those outer siblings regardless of nesting depth —
+   without this they sit visually on top but the sensor still eats the click underneath,
+   exactly when a user reveals the status bar and then taps the corner to sync. */
 .kosync-hotzone {
   position: absolute;
   bottom: 0;
   width: 56px;
   height: 40px;
-  z-index: 6;
+  z-index: 22;
   cursor: pointer;
 }
 .kosync-hotzone-bl { left:  0; }
@@ -763,6 +912,27 @@ body.page-gap-shadow-on #settings-panel {
   backdrop-filter: blur(2px);
 }
 #panel-backdrop.visible { display: block; }
+
+/* "Remove book blur when settings are open" (prefs.settingsNoBlur): keep the backdrop present
+   (it still captures the tap-to-close), but drop the dim + blur so the book stays legible for a
+   live font/margin/line-spacing/color preview. Scoped to the settings panel and the color
+   picker it can open (which is always opened from inside settings, so this is somewhat
+   belt-and-suspenders, but it's cheap and keeps the two decoupled) — TOC, search, bookmarks
+   and annotations still dim as before. E-ink mode always gets this behaviour regardless of the
+   toggle (a flat 55% overlay just muddies an e-ink screen, and blur is a no-op there anyway) —
+   the toggle itself is disabled in that mode, see syncSettingsUi(). */
+body.settings-no-blur #settings-panel.open ~ #panel-backdrop,
+body.settings-no-blur #color-picker-panel.open ~ #panel-backdrop,
+[data-reader-eink] #settings-panel.open ~ #panel-backdrop,
+[data-reader-eink] #color-picker-panel.open ~ #panel-backdrop {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* A setting row locked because another setting overrides it (e.g. this one under e-ink mode). */
+.setting-row.setting-disabled { opacity: .45; }
+.setting-row.setting-disabled .toggle { pointer-events: none; }
 
 /* ── TOC sidebar ─────────────────────────────────────────────────────────────── */
 #toc-sidebar {
@@ -1093,6 +1263,34 @@ body.page-gap-shadow-on #settings-panel {
   flex-direction: column;
 }
 #settings-panel.open { transform: translateX(0); }
+
+/* Same slot/width/z-index-adjacent as #settings-panel: it visually "replaces" settings while
+   open (one higher z-index) rather than stacking beside it, reading as drilling one level in —
+   settings-panel is left untouched underneath and reappears as soon as this closes. */
+#color-picker-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--layout-h, 100%);
+  width: min(320px, 94vw);
+  background: var(--color-surface);
+  border-left: 1px solid var(--color-border);
+  z-index: 301;
+  transform: translateX(100%);
+  transition: transform .25s ease;
+  display: flex;
+  flex-direction: column;
+}
+#color-picker-panel.open { transform: translateX(0); }
+.cp-panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: .75rem;
+  padding: 1rem 1.25rem calc(1rem + var(--sab, 0px));
+  border-top: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
 .settings-panel-header {
   display: flex;
   flex-direction: column;
@@ -1442,6 +1640,32 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
 .theme-btn.theme-custom    { background: #000000; color: #c8b89a; }
 .spread-btn { background: var(--color-surface2); color: var(--color-text); }
 
+/* Reader-settings presets (Theme tab) */
+.presets-block { display: flex; flex-direction: column; gap: .5rem; width: 100%; }
+.presets-list { display: flex; flex-wrap: wrap; gap: .5rem; }
+.preset-chip {
+  padding: .4rem .8rem;
+  border: 2px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface2);
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: .8rem;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: border-color .15s, color .15s;
+}
+.preset-chip.active { border-color: var(--color-accent); color: var(--color-accent); }
+.preset-custom-label {
+  font-size: .78rem;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+.presets-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+
 /* Custom color pickers */
 .custom-color-pickers {
   display: flex;
@@ -1462,16 +1686,114 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
   font-size: .8rem;
   color: var(--color-text);
   cursor: pointer;
+  font-family: inherit;
+  text-align: left;
 }
-.custom-color-picker input[type="color"] {
+.custom-color-picker .color-swatch {
   width: 2rem;
   height: 1.6rem;
   border: 1px solid var(--color-border);
   border-radius: 4px;
-  cursor: pointer;
-  padding: 1px 2px;
-  background: none;
   flex-shrink: 0;
+  /* Checkerboard behind the swatch itself isn't needed — colors here are always opaque —
+     but a thin inset ring keeps very dark/black swatches visible against a dark theme. */
+  box-shadow: inset 0 0 0 1px rgba(127,127,127,.25);
+}
+
+/* ── Custom color picker panel contents ─────────────────────────────────────────
+   Own SV square + hue slider + hex/RGB inputs, replacing native <input type="color">
+   on every platform: Android's system picker opens at HSV(0,0,0) instead of the
+   current value and has no hex/RGB entry at all, so desktop and mobile used to give a
+   genuinely different (and on Android, broken) experience for the same setting.
+   (#color-picker-panel itself — the docked panel shell — is styled up near
+   #settings-panel, since it deliberately shares that positioning.) */
+.cp-sv-square {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1.6 / 1;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+  /* Standard CSS-only saturation/value picker: layer a value (black, bottom-up) and a
+     saturation (white, left-to-right) gradient over the flat hue color that JS sets via
+     background-color (see _cpRender in reader.js) — no canvas needed. */
+  background-image:
+    linear-gradient(to top, #000, rgba(0,0,0,0)),
+    linear-gradient(to right, #fff, rgba(255,255,255,0));
+}
+.cp-sv-thumb {
+  position: absolute;
+  width: 16px; height: 16px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0,0,0,.5), 0 1px 3px rgba(0,0,0,.4);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.cp-hue-slider {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  margin-top: .85rem;
+  border-radius: 7px;
+  border: 1px solid var(--color-border);
+  background: linear-gradient(to right,
+    hsl(0,100%,50%), hsl(60,100%,50%), hsl(120,100%,50%),
+    hsl(180,100%,50%), hsl(240,100%,50%), hsl(300,100%,50%), hsl(360,100%,50%));
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+}
+.cp-hue-thumb {
+  position: absolute;
+  top: 50%;
+  width: 18px; height: 18px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0,0,0,.5), 0 1px 3px rgba(0,0,0,.4);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.cp-fields {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+  margin-top: 1.1rem;
+}
+.cp-preview {
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  box-shadow: inset 0 0 0 1px rgba(127,127,127,.25);
+  flex-shrink: 0;
+}
+.cp-hex-field { display: flex; flex-direction: column; gap: .25rem; }
+.cp-hex-field span, .cp-rgb-field span {
+  font-size: .68rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.cp-hex-field input {
+  width: 6.5em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-transform: uppercase;
+}
+.cp-rgb-row { display: flex; gap: .4rem; }
+.cp-rgb-field input { width: 3.2em; text-align: center; }
+.cp-hex-field input, .cp-rgb-field input {
+  padding: .35rem .4rem;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface2);
+  color: var(--color-text);
+  font-size: .85rem;
+}
+.cp-hex-field input.cp-invalid, .cp-rgb-field input.cp-invalid {
+  border-color: var(--color-danger, #e5484d);
 }
 
 /* E-ink reader: spread button high-contrast */
@@ -1481,6 +1803,16 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
   border-color: #000;
 }
 [data-reader-eink] .spread-btn.active {
+  background: #000;
+  color: #fff;
+  border-color: #000;
+}
+[data-reader-eink] .preset-chip {
+  background: #fff;
+  color: #000;
+  border-color: #000;
+}
+[data-reader-eink] .preset-chip.active {
   background: #000;
   color: #fff;
   border-color: #000;
@@ -1576,15 +1908,82 @@ html.no-flexgap .spread-buttons.page-anim-grid > * + * { margin-left: 0; }
 }
 .sb-bar-top    { top:    calc(var(--edge-pad-top, 0px) + 6px); }
 .sb-bar-bottom { bottom: calc(var(--sab) + 4px + var(--edge-pad-bottom, 0px)); }
+
+/* Comic mode: status bars overlay the full-bleed image instead of the page reserving space
+   for them (see cxreader/index.js's _renderCbzItem) — hidden by default, revealed via
+   .bars-peek, a toggle independent of the header's own .header-peek (bottom-edge hover/tap
+   reveals the status bars; top-edge hover/tap reveals the toolbar — see reader.js's
+   footer-sensor/header-sensor wiring). Styled to match the toolbar (same background/blur/text
+   variables, see .reader-header below) rather than a plain black scrim, since .sb-bar itself
+   has no background at all normally (fine sitting on a themed page, not on an image) — and
+   pinned flush to the true screen edge (--sat/--sab only, dropping the small cosmetic offset
+   .sb-bar-top/.sb-bar-bottom otherwise use to sit a little inset from the page margin, which
+   read as a stray gap once here at the very edge of a full-bleed image). */
+/* Slide + fade, matching .reader-header's own reveal transition above — #sb-top slides down
+   from off-screen, #sb-bottom slides up from off-screen. (The blanket
+   "[data-reader-eink] * { transition: none !important }" rule further up this file already
+   kills this transition — and the .reader-header one it mirrors — in e-ink mode, so nothing
+   extra is needed here for that.) */
+.comic-mode #sb-top {
+  opacity: 0;
+  transform: translateY(-100%);
+  transition: opacity .25s ease, transform .25s ease;
+}
+.comic-mode #sb-bottom {
+  opacity: 0;
+  transform: translateY(100%);
+  transition: opacity .25s ease, transform .25s ease;
+}
+.comic-mode .sb-sep-top,
+.comic-mode .sb-sep-bottom {
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.comic-mode.bars-peek #sb-top,
+.comic-mode.bars-peek #sb-bottom {
+  opacity: 1;
+  transform: translateY(0);
+}
+/* Separators (independently toggled on/off by the user's own status-bar settings, via
+   inline display:none/'' — see reader.js's renderStatusSlots) restore their own normal
+   opacity rather than 1, matching how subtle they're meant to look outside comic mode too. */
+.comic-mode.bars-peek .sb-sep-top,
+.comic-mode.bars-peek .sb-sep-bottom {
+  opacity: .3;
+}
+.comic-mode .sb-bar-top,
+.comic-mode .sb-bar-bottom {
+  background: var(--reader-header-bg, var(--color-surface));
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.comic-mode .sb-bar-top {
+  top: var(--sat);
+  padding-top: .5rem;
+}
+.comic-mode .sb-bar-bottom {
+  bottom: var(--sab);
+  padding-bottom: .5rem;
+}
+.comic-mode .sb-bar-top .sb-slot,
+.comic-mode .sb-bar-bottom .sb-slot {
+  color: var(--reader-header-text, var(--color-text));
+}
 .sb-slot       { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-slot:first-child  { text-align: left; }
 .sb-slot:nth-child(2) { text-align: center; }
 .sb-slot:last-child   { text-align: right; }
+/* An empty slot (nothing assigned there, or everything assigned currently has no value —
+   toggled in renderStatusSlots()) collapses to zero width instead of still reserving its
+   1/3 share; the remaining non-empty slot(s) in that bar (still flex:1 above) then grow to
+   fill the freed space. This is what stops a lone center item (e.g. book + chapter title)
+   from truncating inside 1/3 of the bar while the other two-thirds sit empty — and, as a
+   side effect, subsumes what used to be a two-page-bottom-bar-only special case for an
+   empty center slot (now just one instance of the same general rule). */
+.sb-slot.sb-slot-empty { flex: 0; min-width: 0; padding: 0; overflow: hidden; }
 /* Two-page mode: bl = left page (left-aligned), br = right page (right-aligned) */
-/* BC collapse is handled in JS (only collapsed when empty) */
 .sb-bar-bottom.two-page .sb-slot:first-child  { text-align: left; }
 .sb-bar-bottom.two-page .sb-slot:last-child   { text-align: right; }
-.sb-bar-bottom.two-page-no-center .sb-slot:nth-child(2) { flex: 0; min-width: 0; padding: 0; overflow: hidden; }
 /* Separator lines — positioned just below the top bar or just above the bottom bar */
 .sb-separator {
   position: absolute;

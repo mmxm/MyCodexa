@@ -1,5 +1,5 @@
-import { apiFetch } from './api.js';
-import { toast, confirmDialog, setButtonLoading } from './ui.js';
+import { apiFetch, apiUpload } from './api.js';
+import { toast, confirmDialog, setButtonLoading, showProgressToast } from './ui.js';
 import { t } from './i18n.js';
 import { showPanel } from './router.js';
 import { setBookorbitNavVisible } from './sidebar.js';
@@ -31,6 +31,7 @@ export async function initSettings() {
   _initialized = true;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
+const kosyncExternalEnabled  = document.getElementById('kosync-external-enabled');
 const kosyncUrl              = document.getElementById('kosync-url');
 const kosyncUsername         = document.getElementById('kosync-username');
 const kosyncPassword         = document.getElementById('kosync-password');
@@ -50,6 +51,9 @@ const bookorbitAcctUsername  = document.getElementById('bookorbit-account-userna
 const bookorbitAcctPassword  = document.getElementById('bookorbit-account-password');
 const bookorbitStatus        = document.getElementById('bookorbit-status');
 const btnTestBookorbit       = document.getElementById('btn-test-bookorbit');
+const readingStartPct        = document.getElementById('reading-start-pct');
+const readingFinishPct       = document.getElementById('reading-finish-pct');
+const btnSaveProgressThresholds = document.getElementById('btn-save-progress-thresholds');
 
 // ── Load current settings ─────────────────────────────────────────────────────
 async function loadSettings() {
@@ -59,7 +63,8 @@ async function loadSettings() {
     kosyncUsername.value = s.kosync_username  || '';
     // password is never returned; show placeholder when set
     kosyncPassword.placeholder = s.has_kosync_password ? t('settings.kosync_pass_saved') : t('settings.kosync_pass_ph');
-    updateStatusBadge(s.kosync_url ? null : 'not_configured');
+    kosyncExternalEnabled.checked = s.kosync_external_enabled !== false;
+    updateExternalStatusBadge();
     kosyncInternalEnabled.checked = s.kosync_internal_enabled || false;
     updateInternalUrlBox();
     bookorbitUrl.value = s.bookorbit_url || '';
@@ -69,6 +74,10 @@ async function loadSettings() {
     bookorbitAcctPassword.placeholder = s.has_bookorbit_account_password
       ? t('settings.kosync_pass_saved') : t('settings.kosync_pass_ph');
     updateBookorbitGate(!!s.bookorbit_url && !!s.has_bookorbit_account_password);
+    // Stored server-side as a 0-1 fraction (same convention as reading_progress.percentage);
+    // shown here as a whole-number percentage, the more natural unit for this input.
+    if (readingStartPct)  readingStartPct.value  = Math.round((s.reading_start_pct  ?? 0)    * 100);
+    if (readingFinishPct) readingFinishPct.value = Math.round((s.reading_finish_pct ?? 0.95) * 100);
   } catch (err) {
     toast.error(t('settings.err_load', { msg: err.message }));
   }
@@ -89,6 +98,14 @@ function updateInternalUrlBox() {
 
 kosyncInternalEnabled.addEventListener('change', updateInternalUrlBox);
 
+// Reflects the enabled toggle immediately (before Save is clicked) so unchecking it doesn't
+// leave a stale "Connection successful" badge showing from an earlier test.
+function updateExternalStatusBadge() {
+  if (!kosyncExternalEnabled.checked) updateStatusBadge('disabled');
+  else updateStatusBadge(kosyncUrl.value.trim() ? null : 'not_configured');
+}
+kosyncExternalEnabled.addEventListener('change', updateExternalStatusBadge);
+
 // ── Status badge ──────────────────────────────────────────────────────────────
 function setStatusBadge(el, reason) {
   el.className = 'kosync-status';
@@ -100,6 +117,9 @@ function setStatusBadge(el, reason) {
   if (reason === 'not_configured') {
     el.classList.add('status-off');
     el.textContent = t('settings.status_not_configured');
+  } else if (reason === 'disabled') {
+    el.classList.add('status-off');
+    el.textContent = t('settings.status_disabled');
   } else if (reason === 'ok') {
     el.classList.add('status-ok');
     el.textContent = t('settings.status_ok');
@@ -160,14 +180,14 @@ btnSaveKosync.addEventListener('click', async () => {
 
   setButtonLoading(btnSaveKosync, true, t('settings.btn_saving'));
   try {
-    const body = { kosync_url: url, kosync_username: username };
+    const body = { kosync_url: url, kosync_username: username, kosync_external_enabled: kosyncExternalEnabled.checked };
     // Only send password if user typed something new
     if (password) body.kosync_password = password;
 
     await apiFetch('/settings', { method: 'PUT', body: JSON.stringify(body) });
     kosyncPassword.value       = '';
     kosyncPassword.placeholder = password ? t('settings.kosync_pass_saved') : kosyncPassword.placeholder;
-    updateStatusBadge(url ? null : 'not_configured');
+    updateExternalStatusBadge();
     toast.success(t('settings.saved'));
   } catch (err) {
     toast.error(t('settings.err_save', { msg: err.message }));
@@ -185,12 +205,13 @@ btnClearKosync.addEventListener('click', () => {
       try {
         await apiFetch('/settings', {
           method: 'PUT',
-          body: JSON.stringify({ kosync_url: '', kosync_username: '', kosync_password: '' }),
+          body: JSON.stringify({ kosync_url: '', kosync_username: '', kosync_password: '', kosync_external_enabled: true }),
         });
         kosyncUrl.value      = '';
         kosyncUsername.value = '';
         kosyncPassword.value       = '';
         kosyncPassword.placeholder = t('settings.kosync_pass_ph');
+        kosyncExternalEnabled.checked = true;
         updateStatusBadge('not_configured');
         toast.success(t('settings.removed'));
       } catch (err) {
@@ -295,6 +316,8 @@ btnTestBookorbit.addEventListener('click', async () => {
 const adminCard    = document.getElementById('admin-card');
 const adminRegTgl  = document.getElementById('admin-reg-toggle');
 const btnSaveReg   = document.getElementById('btn-save-reg');
+const adminInviteEmail = document.getElementById('admin-invite-email');
+const btnCreateInvite  = document.getElementById('btn-create-invite');
 
 async function loadAdminFonts() {
   const list = document.getElementById('admin-fonts-list');
@@ -340,6 +363,11 @@ async function loadAdminFonts() {
   });
 }
 
+// Path-encodes a dictionary id (e.g. "en-en/merriam-webster") for use after /dictionary/ in a URL.
+function encodeDictId(id) {
+  return id.split('/').map(encodeURIComponent).join('/');
+}
+
 async function loadAdminDicts() {
   const list = document.getElementById('admin-dicts-list');
   if (!list) return;
@@ -355,20 +383,70 @@ async function loadAdminDicts() {
         <span class="admin-user-name">${escHtml(d.name)}</span>
         ${d.wordcount ? `<span class="admin-user-meta">${d.wordcount.toLocaleString()} ${t('reader.dict_words')}</span>` : ''}
       </div>
+      <div class="dict-lang-inputs">
+        <input type="text" class="dict-lang-from" value="${escHtml(d.lang_from || '')}" maxlength="10"
+          placeholder="${t('settings.dict_lang_placeholder')}"
+          title="${t('settings.dict_lang_from')}" aria-label="${t('settings.dict_lang_from')}">
+        <span class="dict-lang-sep">→</span>
+        <input type="text" class="dict-lang-to" value="${escHtml(d.lang_to || '')}" maxlength="10"
+          placeholder="${t('settings.dict_lang_placeholder')}"
+          title="${t('settings.dict_lang_to')}" aria-label="${t('settings.dict_lang_to')}">
+      </div>
       <button class="btn btn-danger btn-sm">${t('common.delete')}</button>
     </div>
   `).join('');
   list.querySelectorAll('[data-dict-id]').forEach(row => {
+    const id = row.dataset.dictId;
     row.querySelector('button').addEventListener('click', async () => {
-      const id = row.dataset.dictId;
       try {
-        await apiFetch(`/dictionary/${id.split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' });
-        await loadAdminDicts();
+        await apiFetch(`/dictionary/${encodeDictId(id)}`, { method: 'DELETE' });
+        await Promise.all([loadAdminDicts(), loadDictPrefs()]);
       } catch (err) {
         toast.error(t('common.error_msg', { msg: err.message }));
       }
     });
+    // Sets this dictionary's global default language (applies to every user who hasn't set
+    // their own per-user override in the Dictionaries tab) — moves it into/out of a
+    // "<lang_from>-<lang_to>/" folder server-side, see PUT /api/dictionary/*.
+    // Commits on focusout of the *pair* (not per-field 'change') — a per-field 'change' fires as
+    // soon as you tab/click from "from" into "to", saving a still-half-filled value and
+    // rebuilding the whole list mid-edit, which wiped out whatever hadn't been saved yet. Only
+    // save once focus actually leaves both inputs, using both of their values at that point.
+    const langWrap   = row.querySelector('.dict-lang-inputs');
+    const fromInput  = row.querySelector('.dict-lang-from');
+    const toInput    = row.querySelector('.dict-lang-to');
+    const initialFrom = fromInput.value.trim().toLowerCase();
+    const initialTo   = toInput.value.trim().toLowerCase();
+
+    async function commitLangChange() {
+      const fromVal = fromInput.value.trim().toLowerCase();
+      const toVal   = toInput.value.trim().toLowerCase();
+      if (fromVal === initialFrom && toVal === initialTo) return; // nothing actually changed
+      try {
+        await apiFetch(`/dictionary/${encodeDictId(id)}`, {
+          method: 'PUT',
+          body: JSON.stringify({ lang_from: fromVal || null, lang_to: toVal || null }),
+        });
+        await Promise.all([loadAdminDicts(), loadDictPrefs()]);
+      } catch (err) {
+        toast.error(t('common.error_msg', { msg: err.message }));
+      }
+    }
+    langWrap.addEventListener('focusout', (e) => {
+      if (langWrap.contains(e.relatedTarget)) return; // focus moved to the other lang input — not done yet
+      commitLangChange();
+    });
+    [fromInput, toInput].forEach(inp => {
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
+    });
   });
+}
+
+// Renders a showProgressToast() counter as MB — dictionary ZIPs especially can be large
+// enough that a raw byte counter (or no feedback at all, which is what this replaced) leaves
+// the upload looking hung for a while.
+function formatMB(loaded, total) {
+  return `${(loaded / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`;
 }
 
 let _adminUploadsBound = false;
@@ -381,13 +459,15 @@ function bindAdminUploads() {
     if (!files.length) return;
     this.value = '';
     for (const file of files) {
-      toast.info(`${t('reader.uploading')} ${file.name}…`);
+      const progress = showProgressToast(`${t('reader.uploading')} ${file.name}…`, formatMB);
       const fd = new FormData();
       fd.append('fonts', file);
       try {
-        await apiFetch('/fonts', { method: 'POST', body: fd });
+        await apiUpload('/fonts', fd, (loaded, total) => progress.update(loaded, total));
+        progress.dismiss(true);
         toast.success(file.name);
       } catch (e) {
+        progress.dismiss(true);
         toast.error(`${file.name}: ${e.message}`);
       }
     }
@@ -399,19 +479,23 @@ function bindAdminUploads() {
     if (!files.length) return;
     this.value = '';
     for (const file of files) {
-      toast.info(`${t('reader.uploading')} ${file.name}…`);
+      const progress = showProgressToast(`${t('reader.uploading')} ${file.name}…`, formatMB);
       const fd = new FormData();
       fd.append('dict', file);
       try {
-        const result = await apiFetch('/dictionary', { method: 'POST', body: fd });
+        const result = await apiUpload('/dictionary', fd, (loaded, total) => progress.update(loaded, total));
+        progress.dismiss(true);
         const r = result.results?.[0];
         if (r?.error) toast.error(`${file.name}: ${r.error}`);
         else toast.success(file.name);
       } catch (e) {
+        progress.dismiss(true);
         toast.error(`${file.name}: ${e.message}`);
       }
     }
-    await loadAdminDicts();
+    // Also refresh the Dictionaries tab's own separate list (#settings-dict-list) — otherwise a
+    // freshly uploaded dictionary doesn't show up there until Settings is reopened.
+    await Promise.all([loadAdminDicts(), loadDictPrefs()]);
   });
 }
 
@@ -471,11 +555,11 @@ async function loadDictPrefs() {
         ${d.wordcount ? `<span class="dict-settings-count">${d.wordcount.toLocaleString()} ${t('reader.dict_words')}</span>` : ''}
       </div>
       <div class="dict-lang-inputs">
-        <input type="text" class="dict-lang-from" value="${escHtml(lf)}" maxlength="3"
+        <input type="text" class="dict-lang-from" value="${escHtml(lf)}" maxlength="10"
           placeholder="${t('settings.dict_lang_placeholder')}"
           title="${t('settings.dict_lang_from')}" aria-label="${t('settings.dict_lang_from')}">
         <span class="dict-lang-sep">→</span>
-        <input type="text" class="dict-lang-to" value="${escHtml(lt)}" maxlength="3"
+        <input type="text" class="dict-lang-to" value="${escHtml(lt)}" maxlength="10"
           placeholder="${t('settings.dict_lang_placeholder')}"
           title="${t('settings.dict_lang_to')}" aria-label="${t('settings.dict_lang_to')}">
       </div>
@@ -541,10 +625,31 @@ async function loadAdminSection() {
     const { enabled } = await apiFetch('/auth/registration-status');
     adminRegTgl.checked = enabled;
     await loadAdminUsers();
+    await loadAdminInvitations();
     await loadAdminFonts();
     await loadAdminDicts();
     bindAdminUploads();
   } catch (_) { /* not admin or error — keep hidden */ }
+}
+
+// Relative "last active" label — this codebase's convention is a small local formatter per
+// file (see e.g. reader.js's fmtTs for the sync dialog) rather than a shared date-fmt util.
+function fmtRelativeActive(unixSecs) {
+  if (!unixSecs) return t('settings.admin_never_active');
+  const mins = Math.floor((Date.now() / 1000 - unixSecs) / 60);
+  if (mins < 3)   return t('settings.admin_active_now');
+  if (mins < 60)  return t('settings.admin_active_mins_ago',  { n: mins });
+  if (mins < 1440) return t('settings.admin_active_hours_ago', { n: Math.floor(mins / 60) });
+  return t('settings.admin_active_days_ago', { n: Math.floor(mins / 1440) });
+}
+
+// 7-day reading-activity dots, modeled visually on bookorbitDash.js's .bod-streak-dots
+// (own small CSS class here, not a shared one — that panel is BookOrbit-account-wide,
+// this is per-user-in-this-Codexa-instance, different data source and audience).
+function adminActivityDotsHtml(dailySecs) {
+  if (!dailySecs?.length) return '';
+  return `<div class="admin-activity-dots">${dailySecs.map(secs =>
+    `<span class="admin-activity-dot${secs > 0 ? ' filled' : ''}"></span>`).join('')}</div>`;
 }
 
 async function loadAdminUsers() {
@@ -556,15 +661,22 @@ async function loadAdminUsers() {
       list.innerHTML = `<p style="color:var(--color-text-muted);font-size:.85rem;margin:0" data-i18n="settings.admin_users_empty">${t('settings.admin_users_empty')}</p>`;
       return;
     }
-    list.innerHTML = users.map(u => `
+    list.innerHTML = users.map(u => {
+      const reading = u.currently_reading
+        ? `<span class="admin-user-meta">${t('settings.admin_currently_reading', { title: escHtml(u.currently_reading.title) })}</span>`
+        : '';
+      return `
       <div class="admin-user-row" data-id="${u.id}">
         <div class="admin-user-info">
           <span class="admin-user-name">${escHtml(u.username)}</span>
-          <span class="admin-user-meta">${t('settings.admin_users_books', { n: u.book_count })}</span>
+          <span class="admin-user-meta">${t('settings.admin_users_books', { n: u.book_count })} &middot; ${fmtRelativeActive(u.last_active_at)}</span>
+          ${reading}
+          ${adminActivityDotsHtml(u.daily_secs)}
         </div>
         <button class="btn btn-danger btn-sm admin-user-delete-btn" data-id="${u.id}" data-username="${escHtml(u.username)}">${t('common.delete')}</button>
       </div>
-    `).join('');
+    `;
+    }).join('');
     list.querySelectorAll('.admin-user-delete-btn').forEach(btn => {
       btn.addEventListener('click', () => deleteAdminUser(Number(btn.dataset.id), btn.dataset.username));
     });
@@ -583,6 +695,56 @@ function deleteAdminUser(id, username) {
         await loadAdminUsers();
       } catch (err) {
         toast.error(t('settings.admin_err_delete_user', { msg: err.message }));
+      }
+    },
+    t('common.delete'),
+    true
+  );
+}
+
+async function loadAdminInvitations() {
+  const list = document.getElementById('admin-invitations-list');
+  if (!list) return;
+  try {
+    const invitations = await apiFetch('/auth/admin/invitations');
+    if (!invitations.length) {
+      list.innerHTML = `<p style="color:var(--color-text-muted);font-size:.85rem;margin:0" data-i18n="settings.admin_invite_pending_empty">${t('settings.admin_invite_pending_empty')}</p>`;
+      return;
+    }
+    const now = Date.now() / 1000;
+    list.innerHTML = invitations.map(inv => {
+      const expired = inv.expires_at <= now;
+      const expiryLabel = expired
+        ? t('settings.admin_invite_expired')
+        : t('settings.admin_invite_expires', { date: new Date(inv.expires_at * 1000).toLocaleDateString() });
+      return `
+      <div class="admin-user-row" data-id="${inv.id}">
+        <div class="admin-user-info">
+          <span class="admin-user-name">${escHtml(inv.email)}</span>
+          <span class="admin-user-meta">${expiryLabel}</span>
+        </div>
+        <button class="btn btn-danger btn-sm admin-invite-delete-btn" data-id="${inv.id}" data-email="${escHtml(inv.email)}">${t('common.delete')}</button>
+      </div>
+    `;
+    }).join('');
+    list.querySelectorAll('.admin-invite-delete-btn').forEach(btn => {
+      btn.addEventListener('click', () => deleteAdminInvitation(Number(btn.dataset.id), btn.dataset.email));
+    });
+  } catch (err) {
+    toast.error(t('settings.admin_err_load_invitations', { msg: err.message }));
+  }
+}
+
+function deleteAdminInvitation(id, email) {
+  confirmDialog(
+    t('settings.admin_invite_delete_confirm', { email }),
+    async () => {
+      try {
+        await apiFetch(`/auth/admin/invitations/${id}`, { method: 'DELETE' });
+        toast.success(t('settings.admin_invite_deleted'));
+        await loadAdminInvitations();
+      } catch (err) {
+        toast.error(t('settings.admin_err_delete_invitation', { msg: err.message }));
       }
     },
     t('common.delete'),
@@ -618,6 +780,86 @@ btnSaveReg?.addEventListener('click', async () => {
     setButtonLoading(btnSaveReg, false, t('settings.btn_save'));
   }
 });
+
+btnCreateInvite?.addEventListener('click', async () => {
+  const email = adminInviteEmail.value.trim();
+  if (!email) {
+    toast.error(t('error.email_invalid'));
+    return;
+  }
+  setButtonLoading(btnCreateInvite, true, t('settings.btn_saving'));
+  try {
+    const { token } = await apiFetch('/auth/admin/invitations', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    const link = `${window.location.origin}/login.html?invite=${encodeURIComponent(token)}`;
+    const result = document.getElementById('admin-invite-result');
+    const input = document.getElementById('admin-invite-link');
+    input.value = link;
+    result.hidden = false;
+    input.select();
+    toast.success(t('settings.admin_invite_created'));
+    await loadAdminInvitations();
+  } catch (err) {
+    toast.error(t('common.error_msg', { msg: err.message }));
+  } finally {
+    setButtonLoading(btnCreateInvite, false, t('settings.admin_invite_create'));
+  }
+});
+// ── Account email ─────────────────────────────────────────────────────────────
+const accountEmail = document.getElementById('account-email');
+const btnSaveEmail = document.getElementById('btn-save-email');
+
+async function loadAccountEmail() {
+  if (!accountEmail) return;
+  try {
+    const { user } = await apiFetch('/auth/me');
+    accountEmail.value = user.email || '';
+  } catch (_) { /* ignore — leave blank */ }
+}
+
+btnSaveEmail?.addEventListener('click', async () => {
+  setButtonLoading(btnSaveEmail, true, t('settings.btn_saving'));
+  try {
+    const { email } = await apiFetch('/auth/email', {
+      method: 'PUT',
+      body: JSON.stringify({ email: accountEmail.value.trim() }),
+    });
+    accountEmail.value = email;
+    toast.success(t('settings.email_save_success'));
+  } catch (err) {
+    toast.error(t('common.error_msg', { msg: err.message }));
+  } finally {
+    setButtonLoading(btnSaveEmail, false, t('settings.email_save_btn'));
+  }
+});
+
+btnSaveProgressThresholds?.addEventListener('click', async () => {
+  const startVal  = Number(readingStartPct.value);
+  const finishVal = Number(readingFinishPct.value);
+  if (!Number.isFinite(startVal) || !Number.isFinite(finishVal) || startVal < 0 || startVal > 100 || finishVal < 0 || finishVal > 100) {
+    toast.error(t('settings.progress_thresholds_invalid'));
+    return;
+  }
+  if (startVal >= finishVal) {
+    toast.error(t('settings.progress_thresholds_order'));
+    return;
+  }
+  setButtonLoading(btnSaveProgressThresholds, true, t('settings.btn_saving'));
+  try {
+    await apiFetch('/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ reading_start_pct: startVal / 100, reading_finish_pct: finishVal / 100 }),
+    });
+    toast.success(t('settings.progress_thresholds_saved'));
+  } catch (err) {
+    toast.error(t('common.error_msg', { msg: err.message }));
+  } finally {
+    setButtonLoading(btnSaveProgressThresholds, false, t('settings.progress_thresholds_save_btn'));
+  }
+});
+
 // ── Change password ───────────────────────────────────────────────────────────
 const btnChangePw = document.getElementById('btn-change-pw');
 btnChangePw?.addEventListener('click', async () => {
@@ -794,6 +1036,7 @@ btnCancelEdit.addEventListener('click', exitEditMode);
   loadOpdsServers();
   loadDictPrefs();
   loadAdminSection();
+  loadAccountEmail();
 
   document.addEventListener('langchange', () => {
     loadDictPrefs();

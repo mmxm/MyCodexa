@@ -225,7 +225,10 @@ html[data-lib-theme="eink"] .stats-book-cover,
 html[data-lib-theme="eink"] .info-modal-cover,
 html[data-lib-theme="eink"] .cover-preview-img,
 html[data-lib-theme="eink"] .info-modal-kosync-result-cover,
-html[data-lib-theme="eink"] .imt-related-cover { filter: grayscale(100%); }
+html[data-lib-theme="eink"] .imt-related-cover {
+  -webkit-filter: grayscale(100%) invert(1) brightness(0.78) invert(1);
+  filter: grayscale(100%) invert(1) brightness(0.78) invert(1);
+}
 html[data-lib-theme="eink"] .opds-welcome .icon,
 .sidebar-layout[data-lib-theme="eink"] .opds-welcome .icon { filter: grayscale(100%); }
 html[data-lib-theme="eink"] .book-offline-badge,
@@ -282,7 +285,7 @@ html[data-lib-theme="eink"] #info-modal-reset-progress,
   transition: background var(--transition), opacity var(--transition);
   white-space: nowrap;
 }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn:disabled { opacity: .5; cursor: not-allowed; pointer-events: none; }
 .btn-primary  { background: var(--color-accent); color: #fff; }
 .btn-primary:hover  { background: var(--color-accent-dark); }
 .btn-secondary { background: var(--color-surface2); color: var(--color-text); border: 1px solid var(--color-border); }
@@ -306,6 +309,20 @@ html[data-lib-theme="eink"] #info-modal-reset-progress,
 /* ── Form elements ──────────────────────────────────────────────────────────── */
 .form-group { display: flex; flex-direction: column; gap: .4rem; }
 .form-group label { font-size: .85rem; color: var(--color-text-muted); font-weight: 600; }
+
+.settings-pct-input { display: flex; align-items: center; gap: .5rem; max-width: 8rem; }
+.settings-pct-input input[type="number"] {
+  width: 100%;
+  padding: .55rem .65rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: .95rem;
+  outline: none;
+}
+.settings-pct-input input[type="number"]:focus { border-color: var(--color-accent); }
+.settings-pct-input span { color: var(--color-text-muted); font-size: .9rem; }
 
 input[type="text"],
 input[type="password"],
@@ -473,7 +490,8 @@ body.is-offline .app-version { display: none; }
 html[data-lib-theme="eink"] .nav-icon-offline { content: url('/images/offline_bw.svg'); }
 body.is-offline #nav-settings,
 body.is-offline #nav-opds,
-body.is-offline #nav-bookorbit { opacity: 0.4; cursor: not-allowed; }
+body.is-offline #nav-bookorbit,
+body.is-offline #nav-bookorbit-dash { opacity: 0.4; cursor: not-allowed; }
 body.is-offline .sidebar-shelf-item,
 body.is-offline #add-shelf-btn { opacity: 0.4; cursor: not-allowed; }
 body.is-offline #sidebar-stats-btn { opacity: 0.4; cursor: not-allowed; }
@@ -806,6 +824,17 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
 .modal-close:hover { color: var(--color-text); }
 .modal-footer { display: flex; justify-content: flex-end; gap: .75rem; margin-top: 1.5rem; }
 
+.blocking-overlay-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1rem;
+  max-width: 320px;
+}
+.blocking-overlay-box .spinner { width: 1.8rem; height: 1.8rem; border-width: 3px; }
+.blocking-overlay-msg { margin: 0; color: var(--color-text-muted); }
+
 /* ── Spinner ────────────────────────────────────────────────────────────────── */
 .spinner {
   display: inline-block;
@@ -889,6 +918,42 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
   overflow: hidden;
 }
 .admin-upload-btn { position: relative; cursor: pointer; }
+
+/* ── Upload status dialog ───────────────────────────────────────────────────── */
+.upload-status-list {
+  display: flex;
+  flex-direction: column;
+  gap: .4rem;
+  max-height: 320px;
+  overflow-y: auto;
+  margin-bottom: 1rem;
+}
+.upload-status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .5rem;
+  padding: .4rem .6rem;
+  border-radius: var(--radius);
+  background: var(--color-surface2);
+  font-size: .88rem;
+}
+.upload-status-row-fail { background: rgba(233,69,96,.08); }
+.upload-status-icon { flex-shrink: 0; width: 1.1em; text-align: center; }
+.upload-status-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.upload-status-ok   { color: #81c784; font-weight: bold; }
+.upload-status-fail { color: #ff6b8a; font-weight: bold; }
+.upload-status-error { flex-basis: 100%; font-size: .78rem; color: var(--color-text-muted); }
+.upload-status-link {
+  background: none;
+  border: none;
+  color: var(--color-accent);
+  cursor: pointer;
+  font-size: .82rem;
+  text-decoration: underline;
+  padding: 0;
+  margin-left: auto;
+}
 
 /* ── Scrollbar ──────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -1351,6 +1416,45 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
   flex-wrap: wrap;
 }
 
+/* ── BookOrbit Dash (reading-stats panel fed by BookOrbit's own account-wide data) ── */
+.bookorbit-dash-wrap { max-width: 720px; margin: 0 auto; }
+.bookorbit-dash-title { font-size: 1.15rem; font-weight: 600; margin: 0 0 1.25rem; }
+.bookorbit-dash-section { margin-top: 1.5rem; }
+.bod-streak-dots { display: flex; gap: .25rem; justify-content: center; margin-top: .4rem; }
+.bod-streak-dot {
+  width: .5rem;
+  height: .5rem;
+  border-radius: 50%;
+  background: var(--color-border);
+  display: inline-block;
+}
+.bod-streak-dot.filled { background: var(--color-accent); }
+.bod-goal-card { cursor: pointer; }
+.bod-goal-card:hover, .bod-goal-card:focus-visible { background: var(--color-border); }
+.bod-book-row[role="button"] { cursor: pointer; border-radius: var(--radius); padding: .3rem; margin: -0.3rem; }
+.bod-book-row[role="button"]:hover, .bod-book-row[role="button"]:focus-visible { background: var(--color-surface2); }
+.bod-progress-track {
+  width: 100%;
+  height: .3rem;
+  background: var(--color-border);
+  border-radius: 3px;
+  margin-top: .3rem;
+  overflow: hidden;
+}
+.bod-progress-bar { height: 100%; background: var(--color-accent); }
+.bod-highlight-card {
+  display: flex;
+  gap: .75rem;
+  background: var(--color-surface2);
+  border-radius: var(--radius);
+  padding: .75rem;
+}
+.bod-highlight-card.bod-clickable { cursor: pointer; }
+.bod-highlight-card.bod-clickable:hover, .bod-highlight-card.bod-clickable:focus-visible { background: var(--color-border); }
+.bod-highlight-body { min-width: 0; }
+.bod-highlight-text { font-size: .9rem; font-style: italic; margin: 0 0 .3rem; }
+.bod-highlight-note { font-size: .8rem; color: var(--color-text-muted); margin: 0 0 .3rem; }
+
 /* ── Language picker (custom dropdown, same look as sort menu) ───────────────── */
 .lang-picker-icon {
   font-size: .9rem;
@@ -1626,6 +1730,58 @@ html[data-lib-theme="eink"] .book-card-actions .cover-preview-btn .nav-icon,
 .imt-session-time { display: block; font-size: .74rem; color: var(--color-text-muted); margin-top: .1rem; }
 .imt-session-dur  { font-weight: 600; white-space: nowrap; }
 .imt-session-pages { color: var(--color-text-muted); font-size: .78rem; white-space: nowrap; min-width: 3.5rem; text-align: right; }
+/* BookOrbit's session table has a 4th column (reader/source) next to date, duration and progress. */
+.imt-bo-sessions .imt-session-header,
+.imt-bo-sessions .imt-session-row { grid-template-columns: 1fr auto auto auto; }
+.imt-session-src { color: var(--color-text-muted); font-size: .78rem; white-space: nowrap; }
+.imt-bo-sessions .imt-session-pages { min-width: 4rem; }
+.imt-bo-more { margin: .15rem 0 .5rem; }
+.imt-attempts .imt-session-row { grid-template-columns: 1fr auto; }
+/* Inline-SVG charts on the Reading tab (progress over time, minutes per day). */
+.imt-bo-chart { margin: .15rem 0 .4rem; }
+.imt-bo-chart svg { width: 100%; height: auto; display: block; }
+.imt-bo-chart text { fill: var(--color-text-muted); font-size: 9px; }
+.imt-bo-chart .gr  { stroke: var(--color-border); stroke-width: 1; }
+.imt-bo-chart .ln  { stroke: var(--color-accent); stroke-width: 2; fill: none; stroke-linejoin: round; }
+.imt-bo-chart .dt  { fill: var(--color-accent); }
+.imt-bo-chart .bar { fill: var(--color-accent); opacity: .85; }
+.bod-bars .bar { opacity: .5; }
+.bod-bars .bar.hl { opacity: 1; }
+.imt-bo-chart .ln.tgt { stroke: var(--color-text-muted); stroke-dasharray: 4 3; stroke-width: 1.5; }
+
+/* BookOrbit Dash tabs (Overview / Activity) — same look as the info-modal tabs. */
+.bod-tabs { display: flex; border-bottom: 1px solid var(--color-border); margin: .25rem 0 1rem; }
+.bod-tab {
+  flex-shrink: 0; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--color-text-muted); cursor: pointer; font-size: .9rem; font-weight: 600;
+  padding: .5rem 1rem; margin-bottom: -1px; transition: color .15s, border-color .15s;
+}
+.bod-tab:hover { color: var(--color-text); }
+.bod-tab.active { color: var(--color-accent); border-bottom-color: var(--color-accent); }
+
+/* Activity tab: year heatmap (intensity = stepped opacity of the accent, so it stays legible in
+   the monochrome e-ink theme), legend, day drill-down, small widgets. */
+.bod-heat-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .25rem; }
+.bod-year-nav { display: flex; align-items: center; gap: .5rem; }
+.bod-heat-scroll { overflow-x: auto; padding-bottom: .25rem; }
+.bod-heat svg { display: block; max-width: none; }
+.bod-heat text, .bod-heat-legend text { fill: var(--color-text-muted); font-size: 9px; }
+.hc { fill: var(--color-surface2); }
+.hc.h1 { fill: var(--color-accent); fill-opacity: .25; }
+.hc.h2 { fill: var(--color-accent); fill-opacity: .45; }
+.hc.h3 { fill: var(--color-accent); fill-opacity: .7; }
+.hc.h4 { fill: var(--color-accent); fill-opacity: 1; }
+.hc.f  { fill: none; stroke: var(--color-border); stroke-width: .5; }
+.hc[data-day] { cursor: pointer; }
+.hc.sel { stroke: var(--color-text); stroke-width: 1.5; }
+.bod-heat-legend { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; font-size: .75rem; color: var(--color-text-muted); margin-top: .25rem; }
+.bod-day-detail { margin-top: .25rem; }
+.bod-day-list .imt-session-date a { color: var(--color-accent); }
+.bod-delta { font-size: .7rem; font-weight: 600; color: var(--color-text-muted); }
+.bod-src-row { margin-bottom: .55rem; }
+.bod-src-label { display: flex; justify-content: space-between; font-size: .82rem; margin-bottom: .2rem; }
+.bod-key { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--color-accent); vertical-align: middle; }
+.bod-key-target { border-top: 2px dashed var(--color-text-muted); }
 .imt-reading-row {
   display: flex;
   align-items: center;
@@ -1772,6 +1928,10 @@ html[data-lib-theme="eink"] .imt-related-bo-badge {
   background: #e8650a;
   color: #fff;
 }
+.book-format-badge--pdf {
+  background: #b3221c;
+  color: #fff;
+}
 /* ── Book card status / rating badges ───────────────────────────────────────── */
 .book-status-badge {
   display: inline-block;
@@ -1785,6 +1945,9 @@ html[data-lib-theme="eink"] .imt-related-bo-badge {
 .book-status-badge--reading      { background: #2196f3; }
 .book-status-badge--read         { background: #4caf50; }
 .book-status-badge--abandoned    { background: #b0653a; }
+.book-status-badge--rereading    { background: #7e57c2; }
+.book-status-badge--on_hold      { background: #d99a1e; }
+.book-status-badge--skimmed      { background: #26a69a; }
 .book-rating-badge  { font-size: .75rem; letter-spacing: -1px; }
 .book-rating-filled { color: #f5c518; }
 .book-rating-empty  { color: #ccc; }
@@ -2567,9 +2730,11 @@ html[data-lib-theme="eink"] .book-series-badge,
      in landscape, under the notch cutout on the left edge). Matches .app-sidebar's own
      unconditional top/left padding (~line 968-969): harmless on desktop/non-notched screens since
      --sat/--sal are 0px there. Shared by both OPDS and BookOrbit (BookOrbit reuses this exact
-     class), so this one rule fixes both panels' drawers. */
+     class), so this one rule fixes both panels' drawers. The bottom padding is for Android's nav
+     bar (shown outside the reader), which overlays the last server/sublist rows otherwise. */
   padding-top: var(--sat, env(safe-area-inset-top, 0px));
   padding-left: var(--sal, env(safe-area-inset-left, 0px));
+  padding-bottom: var(--sab, env(safe-area-inset-bottom, 0px));
 }
 .opds-sidebar-header {
   padding: .75rem 1rem; border-bottom: 1px solid var(--color-border);
@@ -2674,6 +2839,9 @@ html[data-lib-theme="eink"] .nav-tile-count,
   justify-content: center;
   gap: .75rem;
   padding: .5rem 1rem;
+  /* Android's system nav bar (now shown outside the reader) overlays the bottom of the WebView
+     edge-to-edge — --sab (injected by MainActivity.kt) keeps prev/next clear of it. */
+  padding-bottom: calc(.5rem + var(--sab, env(safe-area-inset-bottom, 0px)));
   border-top: 1px solid var(--color-border);
   flex-shrink: 0;
 }
@@ -2832,7 +3000,7 @@ html[data-lib-theme="eink"] .opds-card-series-badge,
   #catalog-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
   .nav-tile-grid { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); }
   .opds-toolbar { flex-wrap: wrap; gap: .35rem; }
-  #opds-pagination { flex-wrap: wrap; gap: .4rem; padding: .4rem .75rem; }
+  #opds-pagination { flex-wrap: wrap; gap: .4rem; padding: .4rem .75rem calc(.4rem + var(--sab, env(safe-area-inset-bottom, 0px))); }
 
   /* Off-canvas drawer for the server list + folder tree, replacing the old "always stacked
      above the catalog" layout — mirrors BookOrbit's panel (~line 2900). */
@@ -3030,6 +3198,7 @@ html[data-lib-theme="eink"] .bookorbit-card-series-badge,
 #bookorbit-pagination {
   display: flex; align-items: center; justify-content: center; gap: .75rem;
   padding: .5rem 1rem; border-top: 1px solid var(--color-border); flex-shrink: 0;
+  padding-bottom: calc(.5rem + var(--sab, env(safe-area-inset-bottom, 0px))); /* see #opds-pagination */
 }
 /* This is the actual bug: selectSection() sets paginationEl.hidden = true when switching
    sections, but this rule's own `display` (higher-specificity author rule) overrode the UA
@@ -3064,7 +3233,7 @@ html[data-lib-theme="eink"] .bookorbit-card-series-badge,
      a flex child defaults to min-width:auto and the compact 3-column layout overflows
      instead of shrinking, clipping the last card (mirrors #catalog-grid's fix above). */
   #bookorbit-grid { overflow: visible; min-width: 0; } /* column sizing comes from .book-grid/.density-* — see ~2647 */
-  #bookorbit-pagination { flex-wrap: wrap; gap: .4rem; padding: .4rem .75rem; }
+  #bookorbit-pagination { flex-wrap: wrap; gap: .4rem; padding: .4rem .75rem calc(.4rem + var(--sab, env(safe-area-inset-bottom, 0px))); }
 
   /* The sidebar (section nav + sublist) used to permanently stack above the grid, leaving only
      a sliver of screen for actual books. It's now an off-canvas drawer instead: hidden by
@@ -3177,23 +3346,28 @@ html[data-lib-theme="eink"] .bookorbit-card-series-badge,
   flex-shrink: 0;
 }
 .dict-lang-inputs input[type="text"] {
-  width: 3.2rem;
+  width: 4.75rem;
   padding: .15rem .3rem;
   font-size: .78rem;
   border: 1px solid var(--color-border);
   border-radius: 4px;
   background: var(--color-surface2);
   color: var(--color-text);
-  text-align: center;
   text-transform: lowercase;
 }
 .dict-lang-sep { font-size: .75rem; color: var(--color-text-muted); }
 
 .admin-user-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .5rem 0; border-bottom: 1px solid var(--color-border); }
 .admin-user-row:last-child { border-bottom: none; }
-.admin-user-info { display: flex; flex-direction: column; gap: .1rem; min-width: 0; }
+.admin-user-info { display: flex; flex-direction: column; gap: .1rem; min-width: 0; flex: 1; }
 .admin-user-name { font-size: .875rem; font-weight: 500; color: var(--color-text); }
 .admin-user-meta { font-size: .75rem; color: var(--color-text-muted); }
+/* Per-user 7-day reading-activity dots — visually modeled on .bod-streak-dots (BookOrbit
+   Dash) but a separate class: different data source (this instance's own reading_sessions,
+   not a BookOrbit account) and audience (admin-only, not the reading user themself). */
+.admin-activity-dots { display: flex; gap: .2rem; margin-top: .2rem; }
+.admin-activity-dot { width: .4rem; height: .4rem; border-radius: 50%; background: var(--color-border); display: inline-block; }
+.admin-activity-dot.filled { background: var(--color-accent); }
 .admin-upload-btn {
   display: inline-flex;
   align-items: center;
@@ -3329,7 +3503,10 @@ html[data-lib-theme="eink"] #edit-remove-btn,
 html[data-lib-theme="eink"] .opds-card-cover,
 .sidebar-layout[data-lib-theme="eink"] .opds-card-cover,
 html[data-lib-theme="eink"] .bookorbit-card-cover,
-.sidebar-layout[data-lib-theme="eink"] .bookorbit-card-cover { filter: grayscale(100%); }
+.sidebar-layout[data-lib-theme="eink"] .bookorbit-card-cover {
+  -webkit-filter: grayscale(100%) invert(1) brightness(0.78) invert(1);
+  filter: grayscale(100%) invert(1) brightness(0.78) invert(1);
+}
 
 /* Book info: genre tags */
 html[data-lib-theme="eink"] .genre-pill,
@@ -3346,11 +3523,37 @@ html[data-lib-theme="eink"] .btn-read,
   color: #fff;
 }
 
-/* Book info / edit mode: native checkboxes */
+/* Book info / edit mode: native checkboxes.
+   accent-color only themes the OS-native widget and isn't supported on WebView
+   older than Chromium 93, so on old WebView the checkbox falls back to the
+   stock control whose checkmark is barely visible on e-ink. Draw a fully
+   custom box + checkmark instead (appearance:none + background-image), a
+   technique that predates accent-color and works on ancient WebView too. */
 html[data-lib-theme="eink"] .info-modal-shelf-row input[type="checkbox"],
 html[data-lib-theme="eink"] .book-card-checkbox,
 .sidebar-layout[data-lib-theme="eink"] .info-modal-shelf-row input[type="checkbox"],
-.sidebar-layout[data-lib-theme="eink"] .book-card-checkbox { accent-color: #111; }
+.sidebar-layout[data-lib-theme="eink"] .book-card-checkbox {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0;
+  border: 2px solid #111;
+  border-radius: 2px;
+  background-color: #fff;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 70% 70%;
+  vertical-align: middle;
+  cursor: pointer;
+}
+html[data-lib-theme="eink"] .info-modal-shelf-row input[type="checkbox"]:checked,
+html[data-lib-theme="eink"] .book-card-checkbox:checked,
+.sidebar-layout[data-lib-theme="eink"] .info-modal-shelf-row input[type="checkbox"]:checked,
+.sidebar-layout[data-lib-theme="eink"] .book-card-checkbox:checked {
+  background-color: #111;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23fff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' d='M3 8.5l3.2 3.2L13 4.8'/%3E%3C/svg%3E");
+}
 
 /* No spinning animation on e-ink displays — matches .book-card's animation:none treatment
    (~line 640). A spinning ring is wasted motion on a slow-refresh screen and can look like a

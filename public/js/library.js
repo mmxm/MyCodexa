@@ -2,8 +2,10 @@ import { apiFetch } from './api.js';
 import { toast, confirmDialog, setButtonLoading, showProgressToast, initSortMenuFor, resyncSortMenu } from './ui.js';
 import { reloadShelves, getShelves, setActive, updateDownloadedCount, updateNavCounts, setShelfBadge, setBookorbitNavVisible } from './sidebar.js';
 import { t } from './i18n.js';
+import { mountBoSessions, fmtOn } from './bookorbitSessions.js';
 import { showPanel } from './router.js';
 import { openSyncModal, openOpdsBrowserAtFolder } from './opds.js';
+import { renderPdfCoverBlobFromBytes, uploadPdfCover } from './pdf-cover.js';
 import { openBookorbitSyncModal, openBookorbitBrowserAt, openBookorbitStaleDialog } from './bookorbit.js';
 import { clearProgress } from './progress-outbox.js';
 import {
@@ -388,6 +390,7 @@ function updateEditToolbar() {
   }
   if (reextractBtn) {
     reextractBtn.classList.toggle('hidden', currentShelfId !== 'all');
+    reextractBtn.disabled = count === 0;
   }
   if (selectAllBtn) {
     const visibleIds = [...document.querySelectorAll('.book-card[data-id]')].map(c => Number(c.dataset.id));
@@ -460,7 +463,10 @@ function renderCardBadges(book) {
   const labels = {
     want_to_read: t('library.status_want'),
     reading:      t('library.status_reading'),
+    rereading:    t('library.status_rereading'),
+    on_hold:      t('library.status_on_hold'),
     read:         t('library.status_finished'),
+    skimmed:      t('library.status_skimmed'),
     abandoned:    t('library.status_abandoned'),
   };
   const parts = [];
@@ -530,7 +536,7 @@ function openCardMenu(book, btn) {
     </button>
     ${offlineItem}
     ${isOfflineMode ? '' : `
-    <a class="bcm-item" href="/api/books/${book.id}/file?download=1&token=${getToken()}" download>
+    <a class="bcm-item bcm-download-file" href="/api/books/${book.id}/file?download=1&token=${getToken()}" download>
       <img src="/images/download.svg" class="nav-icon bcm-icon nav-icon-download" alt="">
       ${t('library.btn_download')}
     </a>
@@ -598,6 +604,14 @@ function openCardMenu(book, btn) {
       downloadingIds.delete(book.id);
       applyFilter();
     }
+  });
+
+  // A plain <a download> click never navigates away and fires no completion event of its own
+  // (the browser's Save-As dialog, or the Android app's DownloadManager, runs independently of
+  // this page from here on) — same as every other item above, close on click rather than trying
+  // to detect an actual finish/cancel that isn't reliably observable from JS either way.
+  popup.querySelector('.bcm-download-file')?.addEventListener('click', () => {
+    closeCardMenu();
   });
 
   popup.querySelector('.bcm-offline-delete')?.addEventListener('click', () => {
@@ -742,7 +756,10 @@ export async function openInfoModal(book, startTab = '') {
                 <option value="">${t('library.status_none')}</option>
                 <option value="want_to_read">${t('library.status_want')}</option>
                 <option value="reading">${t('library.status_reading')}</option>
+                <option value="rereading">${t('library.status_rereading')}</option>
+                <option value="on_hold">${t('library.status_on_hold')}</option>
                 <option value="read">${t('library.status_finished')}</option>
+                <option value="skimmed">${t('library.status_skimmed')}</option>
                 <option value="abandoned">${t('library.status_abandoned')}</option>
               </select>
               <button type="button" id="imt-status-menu-btn" class="sort-menu-btn" aria-haspopup="listbox" aria-expanded="false" aria-controls="imt-status-menu-list" title="${escHtml(t('library.status_title'))}">
@@ -1228,13 +1245,25 @@ export async function openInfoModal(book, startTab = '') {
   async function loadReadingTab() {
     const inner = backdrop.querySelector('#imt-reading-inner');
     try {
-      const [sessions, bookmarks, annotations] = await Promise.all([
+      const [sessions, bookmarks, annotations, bo] = await Promise.all([
         apiFetch(`/stats/sessions/${fullBook.id}`).catch(() => []),
         apiFetch(`/bookmarks/${fullBook.id}`).catch(() => []),
         apiFetch(`/annotations/${fullBook.id}`).catch(() => []),
+        // null when BookOrbit is off or this book isn't in it; a failure just hides the block.
+        apiFetch(`/bookorbit/book-stats/${fullBook.id}`).catch(() => null),
       ]);
 
       const totalSecs = sessions.reduce((s, r) => s + ((r.end_ts || 0) - (r.start_ts || 0)), 0);
+
+      // BookOrbit's totals cover every device/reader on the account (KOReader, Kobo, its own web
+      // reader, ...) and already include the sessions Codexa pushed — shown as its own block, not
+      // merged into Codexa's list below.
+      const boSourceLabel = b => { const k = `stats.source_${b}`; const v = t(k); return v === k ? b : v; };
+      const boHtml = bo && bo.totalSessions ? `
+        <div class="imt-section-title" style="margin-top:.75rem">${t('library.reading_bo_title')}</div>
+        <div class="imt-reading-summary">${t('library.reading_total_time')}: <strong>${fmtTime(bo.totalSeconds)}</strong> &nbsp;&middot;&nbsp; ${bo.totalSessions} ${t('library.reading_sessions').toLowerCase()}${bo.firstSessionAt ? ` &nbsp;&middot;&nbsp; ${fmtDate(bo.firstSessionAt)}${bo.lastSessionAt && fmtDate(bo.lastSessionAt) !== fmtDate(bo.firstSessionAt) ? ` – ${fmtDate(bo.lastSessionAt)}` : ''}` : ''}</div>
+        ${bo.bySource?.length > 1 ? `<div class="imt-reading-summary" style="opacity:.8">${bo.bySource.map(x => `${escHtml(boSourceLabel(x.bucket))}: ${fmtTime(x.totalSeconds)}`).join(' &nbsp;&middot;&nbsp; ')}</div>` : ''}
+        ${bo.stale ? `<div class="imt-empty">${t('library.reading_bo_stale')}</div>` : `<div id="imt-bo-sessions"></div>`}` : '';
 
       inner.innerHTML = `
         <div class="imt-section-title">${t('library.reading_bookmarks')}</div>
@@ -1270,6 +1299,7 @@ export async function openInfoModal(book, startTab = '') {
           : `<div class="imt-empty">${t('library.reading_no_highlights')}</div>`}
         </div>
 
+        ${boHtml}
         <div class="imt-section-title" style="margin-top:.75rem">${t('library.reading_sessions')}</div>
         ${sessions.length ? `
           <div class="imt-reading-summary">${t('library.reading_total_time')}: <strong>${fmtTime(totalSecs)}</strong> &nbsp;&middot;&nbsp; ${sessions.length} ${t('library.reading_sessions').toLowerCase()}</div>
@@ -1287,6 +1317,11 @@ export async function openInfoModal(book, startTab = '') {
               </div>`).join('')}
           </div>`
           : `<div class="imt-empty">${t('library.reading_no_sessions')}</div>`}`;
+
+      // The per-session rows behind BookOrbit's totals (all devices) — the summary is already above.
+      mountBoSessions(inner.querySelector('#imt-bo-sessions'),
+        p => apiFetch(`/bookorbit/book-sessions/${fullBook.id}?page=${p}`),
+        { summary: false, attempts: async () => (await apiFetch(`/bookorbit/book-attempts/${fullBook.id}`))?.items || [] });
 
       inner.addEventListener('click', async e => {
         const btn = e.target.closest('.imt-del-btn');
@@ -1343,7 +1378,7 @@ export async function openInfoModal(book, startTab = '') {
 
       const sections = [];
 
-      if (fullBook.read_status === 'read' && data.nextInSeries) {
+      if ((fullBook.read_status === 'read' || fullBook.read_status === 'skimmed') && data.nextInSeries) {
         sections.push(`
           <div class="imt-section-title">${t('library.related_next_in_series')}</div>
           <div class="imt-related-scroller">${cardHtml(data.nextInSeries)}</div>`);
@@ -1353,6 +1388,12 @@ export async function openInfoModal(book, startTab = '') {
         sections.push(`
           <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_series')}</div>
           <div class="imt-related-scroller">${data.seriesBooks.map(cardHtml).join('')}</div>`);
+      }
+
+      if (data.authorBooks?.length) {
+        sections.push(`
+          <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_by_author')}</div>
+          <div class="imt-related-scroller">${data.authorBooks.map(cardHtml).join('')}</div>`);
       }
 
       if (data.recommendations?.length) {
@@ -1551,9 +1592,11 @@ let _applyFilterTimer = null;
 // makePct()) is a page-fraction that never actually reaches 1.0 for paginated content, so a
 // truly-finished book would otherwise stay stuck here forever (see maybeMarkBookFinished in
 // server/utils/bookCompletion.js, which auto-sets read_status once progress crosses 95%).
+// 'on_hold' (paused) and 'skimmed' (deliberately not read in full) are out too; 'rereading' stays in.
+const NOT_CURRENTLY_READING = ['read', 'abandoned', 'on_hold', 'skimmed'];
 function isCurrentlyReading(b) {
   const p = b.percentage || 0;
-  return p > 0 && p < 1 && b.read_status !== 'read' && b.read_status !== 'abandoned';
+  return p > 0 && p < 1 && !NOT_CURRENTLY_READING.includes(b.read_status);
 }
 
 function applyFilter() {
@@ -1609,10 +1652,13 @@ async function openStatsDialog() {
 
   let stats = null;
   let history = [];
+  let finished = [];
   try {
-    [stats, history] = await Promise.all([
+    [stats, history, finished] = await Promise.all([
       apiFetch('/stats'),
       apiFetch('/stats/history'),
+      // A failure here shouldn't block the rest of the dialog — it's an add-on list.
+      apiFetch('/stats/completions').catch(() => []),
     ]);
   } catch (err) {
     toast.error(t('common.err_prefix') + err.message);
@@ -1658,6 +1704,39 @@ async function openStatsDialog() {
         </div>`).join('')}
     </div>` : '';
 
+  // Finished books come from the permanent completion log, so books since deleted from the library
+  // still appear (no cover then — the file is gone — just the placeholder). Rows the one-time
+  // backfill created for books already deleted before the log existed have no recoverable title.
+  const finishedHtml = finished.length ? `
+    <details class="stats-history-book" style="margin-top:1.25rem">
+      <summary class="stats-history-summary">
+        <span class="stats-history-book-title stats-section-title" style="margin:0">${t('stats.finished_books')}</span>
+        <span class="stats-history-count">${finished.length}</span>
+      </summary>
+      <div class="stats-top-books" style="margin-top:.5rem">
+        ${finished.map(b => {
+          const unknown = b.title === 'Unknown' && !b.author;
+          const meta = [
+            b.author ? escHtml(b.author) : '',
+            // BookOrbit's own finish date when it has one (Codexa's completed_at is just when progress
+            // crossed the threshold — often the day a KOReader position finally synced).
+            t('stats.finished_on', { date: fmtOn(b.bo_finished_on) || new Date(b.completed_at * 1000).toLocaleDateString() }),
+            b.total_secs ? fmtDuration(b.total_secs) : '',
+            b.bo_total_secs > 0 ? t('stats.all_devices', { time: fmtDuration(b.bo_total_secs) }) : '',
+            b.times > 1 ? `×${b.times}` : '',
+          ].filter(Boolean).join(' · ');
+          return `
+          <div class="stats-book-row">
+            ${b.cover_path ? `<img src="/covers/${escHtml(b.cover_path)}" class="stats-book-cover" alt="">` : '<div class="stats-book-cover-ph">📖</div>'}
+            <div class="stats-book-info">
+              <div class="stats-book-title">${escHtml(unknown ? t('stats.unknown_book') : b.title)}</div>
+              <div class="stats-book-meta">${meta}</div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </details>` : '';
+
   const historyHtml = history.length ? `
     <div class="stats-section-title" style="margin-top:1.25rem">${t('stats.chapter_history')}</div>
     <div class="stats-history-list">
@@ -1690,6 +1769,7 @@ async function openStatsDialog() {
       </h3>
       ${summaryHtml}
       ${topBooksHtml}
+      ${finishedHtml}
       ${historyHtml}
       <div class="stats-footer">
         <button class="btn btn-secondary" id="stats-clear-history-btn">${t('stats.clear_history')}</button>
@@ -2077,25 +2157,83 @@ async function deleteBook(id) {
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
-let dropZone, fileInput, uploadBtn, uploadMenu, uploadStatus;
+let dropZone, fileInput, uploadBtn, uploadMenu;
 
 function showDropZone() {
   dropZone.classList.toggle('hidden');
   if (!dropZone.classList.contains('hidden')) dropZone.scrollIntoView({ behavior: 'smooth' });
 }
 
+// Modal shown the instant files are picked/dropped, listing one row per file.
+// Rows start as a spinner and are updated live via setRow() as each upload
+// settles — success gets a green check + a link into that book's info modal,
+// failure gets a red cross + the translated error message. Closing early
+// doesn't cancel in-flight uploads; setRow() on a detached dialog is a no-op.
+function openUploadStatusModal(fileNames) {
+  document.getElementById('upload-status-modal')?.remove();
+  const backdrop = document.createElement('div');
+  backdrop.id        = 'upload-status-modal';
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true" style="max-width:460px">
+      <button class="modal-close" id="upload-modal-close" aria-label="${t('common.close')}">&times;</button>
+      <h2 id="upload-modal-title">${t('library.upload_modal_title')}</h2>
+      <div class="upload-status-list">
+        ${fileNames.map((name, i) => `
+          <div class="upload-status-row" id="upload-status-row-${i}">
+            <span class="upload-status-icon"><span class="spinner"></span></span>
+            <span class="upload-status-name">${escHtml(name)}</span>
+          </div>`).join('')}
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="upload-modal-done">${t('common.close')}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+  const close = () => backdrop.remove();
+  backdrop.querySelector('#upload-modal-close').addEventListener('click', close);
+  backdrop.querySelector('#upload-modal-done').addEventListener('click', close);
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) close(); });
+
+  return {
+    setRow(i, status, extra) {
+      const row = backdrop.querySelector(`#upload-status-row-${i}`);
+      if (!row) return; // dialog was closed
+      if (status === 'ok') {
+        row.querySelector('.upload-status-icon').innerHTML = '<span class="upload-status-ok">✓</span>';
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.className = 'upload-status-link';
+        link.textContent = t('library.btn_cover_info');
+        link.addEventListener('click', () => openInfoModal({ id: extra }));
+        row.appendChild(link);
+      } else {
+        row.classList.add('upload-status-row-fail');
+        row.querySelector('.upload-status-icon').innerHTML = '<span class="upload-status-fail">✗</span>';
+        const msg = document.createElement('span');
+        msg.className = 'upload-status-error';
+        msg.textContent = extra;
+        row.appendChild(msg);
+      }
+    },
+    finish(uploaded, failed) {
+      const h2 = backdrop.querySelector('#upload-modal-title');
+      if (h2) h2.textContent = t('library.upload_result', { uploaded, failed });
+    },
+  };
+}
+
 async function handleFiles(fileList) {
-  const epubs = [...fileList].filter(f => f.name.endsWith('.epub') || f.name.endsWith('.cbz') || f.name.endsWith('.cbr'));
+  const epubs = [...fileList].filter(f => f.name.endsWith('.epub') || f.name.endsWith('.kepub') || f.name.endsWith('.cbz') || f.name.endsWith('.cbr') || f.name.endsWith('.pdf'));
   if (!epubs.length) { toast.error(t('library.err_not_epub')); return; }
 
-  setButtonLoading(uploadBtn, true, '+ Dodaj knjigo ▾');
-  uploadStatus.classList.remove('hidden');
+  setButtonLoading(uploadBtn, true);
   dropZone.classList.add('hidden');
+  const modal = openUploadStatusModal(epubs.map(f => f.name));
 
   let uploaded = 0, failed = 0;
-  for (const file of epubs) {
-    uploadStatus.innerHTML = `<div class="alert alert-info" style="background:var(--color-surface2)">
-      ${t('library.upload_progress', { name: escHtml(file.name), n: uploaded + failed + 1, total: epubs.length })}</div>`;
+  for (let i = 0; i < epubs.length; i++) {
+    const file = epubs[i];
     const formData = new FormData();
     formData.append('epub', file);
     try {
@@ -2110,15 +2248,47 @@ async function handleFiles(fileList) {
         const translated = t(code);
         throw new Error((translated !== code && code) ? translated : (code || t('error.http_error', { status: r.status })));
       }
+      const book = await r.json();
       uploaded++;
-    } catch (err) { failed++; console.error('Upload failed:', file.name, err.message); }
+      modal.setRow(i, 'ok', book.id);
+      // Uploading while a shelf is open should land the book on that shelf — /api/books has
+      // no concept of "current shelf" (it always adds to the plain, unfiled library), so that
+      // membership has to be added explicitly here, same as the "add to shelf" checklist does
+      // (see the toAdd loop above) — otherwise the book only ever shows up in All Books.
+      if (typeof currentShelfId === 'number') {
+        try {
+          await apiFetch(`/shelves/${currentShelfId}/books`, { method: 'POST', body: JSON.stringify({ bookId: book.id }) });
+        } catch (shelfErr) {
+          console.error('[library] failed to add uploaded book to shelf:', shelfErr.message);
+        }
+      }
+      // PDFs get no cover at import time (server-side rendering was tried and rejected — see
+      // pdf-cover.js's header comment). Render + upload it here, awaited, so the loadBooks()
+      // call right after this loop already shows it — not fire-and-forget, since a PDF's cover
+      // is otherwise missing until the book is next opened in the reader (see reader.js's own
+      // backfill for books that arrived via OPDS/BookOrbit instead of a manual upload like this).
+      if (file.name.toLowerCase().endsWith('.pdf')) {
+        try {
+          const blob = await renderPdfCoverBlobFromBytes(await file.arrayBuffer());
+          if (blob) await uploadPdfCover(apiFetch, book.id, blob);
+        } catch (coverErr) {
+          console.error('[library] PDF cover generation failed:', file.name, coverErr?.message);
+        }
+      }
+    } catch (err) {
+      failed++;
+      console.error('Upload failed:', file.name, err.message);
+      modal.setRow(i, 'fail', err.message);
+    }
   }
 
-  uploadStatus.innerHTML = `<div class="alert alert-${failed ? 'error' : 'success'}">
-    ${t('library.upload_result', { uploaded, failed })}</div>`;
-  setTimeout(() => { uploadStatus.classList.add('hidden'); uploadStatus.innerHTML = ''; }, 4000);
-  setButtonLoading(uploadBtn, false, '+ Dodaj knjigo ▾');
+  modal.finish(uploaded, failed);
+  setButtonLoading(uploadBtn, false);
   fileInput.value = '';
+  // Refresh the shelf-membership set before loadBooks()'s own applyFilter() runs, so a book
+  // just added to the current shelf (above) shows up immediately instead of only after the
+  // next shelf switch.
+  if (typeof currentShelfId === 'number') await refreshShelfFilter(false);
   await loadBooks();
   await reloadShelves();
 }
@@ -2355,7 +2525,6 @@ export async function initLibrary() {
   fileInput    = document.getElementById('file-input');
   uploadBtn    = document.getElementById('upload-btn');
   uploadMenu   = document.getElementById('upload-menu');
-  uploadStatus = document.getElementById('upload-status');
 
   // Sort
   const savedSort = localStorage.getItem('library-sort');
@@ -2448,14 +2617,18 @@ export async function initLibrary() {
   });
 
   document.getElementById('edit-reextract-btn').addEventListener('click', () => {
+    if (!selectedBooks.size) return;
     confirmDialog(
-      t('library.confirm_reextract'),
+      t('library.confirm_reextract', { n: selectedBooks.size }),
       async () => {
         const btn = document.getElementById('edit-reextract-btn');
         const origText = btn.textContent;
         setButtonLoading(btn, true);
         try {
-          const result = await apiFetch('/books/reextract-all', { method: 'POST' });
+          const result = await apiFetch('/books/reextract-all', {
+            method: 'POST',
+            body: JSON.stringify({ bookIds: [...selectedBooks] }),
+          });
           toast.success(t('library.toast_reextract_done', { updated: result.updated, total: result.total }));
           await loadBooks();
         } catch (err) {

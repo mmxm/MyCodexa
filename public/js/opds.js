@@ -1,5 +1,5 @@
 import { apiFetch } from './api.js';
-import { toast, setButtonLoading } from './ui.js';
+import { toast, setButtonLoading, showBlockingOverlay, scrollCatalogToTop } from './ui.js';
 import { t, applyTranslations } from './i18n.js';
 import { reloadShelves } from './sidebar.js';
 import { reloadLibrary, openInfoModal } from './library.js';
@@ -239,6 +239,7 @@ async function gotoPage(url) {
     currentFeed  = feed;
     renderFeed(feed);
     renderPagination();
+    scrollCatalogToTop();
   } catch (err) {
     toast.error(t('opds.err_browse', { msg: err.message }));
   } finally {
@@ -465,17 +466,37 @@ function renderPeekButton(coverWrapEl, entry) {
       e.stopPropagation();
       btn.disabled = true;
       btn.classList.add('opds-btn-busy');
+      // See bookorbit.js's identical peek handler for why this needs a blocking overlay instead
+      // of real byte progress: the download happens server-side (OPDS acquisition), so the
+      // client only sees a single request resolve at the end, with no intermediate progress.
+      let cancelled = false;
+      const overlay = showBlockingOverlay(t('bookorbit.peek_downloading'), () => {
+        cancelled = true;
+        btn.disabled = false;
+        btn.classList.remove('opds-btn-busy');
+      });
+      const slowTimer = setTimeout(() => overlay.setMessage(t('common.download_slow_hint')), 8000);
       try {
         const result = await apiFetch(`/opds/peek/${currentServer.id}`, {
           method: 'POST',
           body: JSON.stringify({ href: entry.acqHref, title: entry.title, author: entry.author }),
         });
+        clearTimeout(slowTimer);
+        if (cancelled) {
+          apiFetch(`/books/${result.id}/peek-cleanup`, { method: 'POST' }).catch(() => {});
+          return;
+        }
+        overlay.dismiss();
         saveResumeState();
         window.location.href = `/reader.html?id=${result.id}&peek=1&from=opds`;
       } catch (err) {
-        toast.error(err.message);
-        btn.disabled = false;
-        btn.classList.remove('opds-btn-busy');
+        clearTimeout(slowTimer);
+        if (!cancelled) {
+          overlay.dismiss();
+          toast.error(err.message);
+          btn.disabled = false;
+          btn.classList.remove('opds-btn-busy');
+        }
       }
     });
   }
@@ -521,7 +542,7 @@ function renderCardActions(actionsEl, entry) {
       try {
         const data = await apiFetch(`/opds/download/${currentServer.id}`, {
           method: 'POST',
-          body: JSON.stringify({ href: entry.acqHref, title: entry.title, author: entry.author }),
+          body: JSON.stringify({ href: entry.acqHref, title: entry.title, author: entry.author, cover: entry.cover }),
         });
         toast.success(t('opds.toast_book_added', { title: entry.title }));
         entry.localBookId = data.id;
@@ -824,11 +845,14 @@ export function openSyncModal(folderUrl, folderTitle, existingShelfId = null, se
         es.close();
         reloadShelves();
         reloadLibrary();
-        const summary = msg.refreshed
+        let summary = msg.refreshed
           ? t('opds.sync_done_force', { added: msg.added, refreshed: msg.refreshed, errors: msg.errors || 0 })
           : msg.errors
             ? t('opds.sync_done_errors', { added: msg.added, skipped: msg.skipped, errors: msg.errors })
             : t('opds.sync_done', { added: msg.added, skipped: msg.skipped });
+        // Books auto-unlinked from this shelf because they're still present on another one
+        // (e.g. moved to a different linked shelf) — no dialog needed, just note it happened.
+        if (msg.autoRemoved) summary += ' ' + t('opds.stale_auto_removed', { n: msg.autoRemoved });
         if (msg.staleBooks && msg.staleBooks.length > 0) {
           const stale = msg.staleBooks;
           close();
@@ -1091,8 +1115,12 @@ export async function initOpds() {
   drawerOverlay.addEventListener('click', closeDrawer);
 
   await loadServers();
-  if (!(await restoreResumeState()) && servers.length > 0) {
-    await openServer(servers[0]);
+  const restored = await restoreResumeState();
+  if (!restored) {
+    if (servers.length > 0) await openServer(servers[0]);
+    // Start open on mobile — nothing to browse yet until a server/folder is picked. Skipped on a
+    // successful resume (returning from a peek in the reader): we're already landing on a
+    // specific folder, so re-opening the drawer would just cover the results we're returning to.
+    openDrawer();
   }
-  openDrawer(); // start open on mobile — nothing to browse yet until a server/folder is picked
 }

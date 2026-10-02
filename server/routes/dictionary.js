@@ -39,9 +39,8 @@ function findAllIfo(dir = DICT_DIR, base = '') {
   return results;
 }
 
-function loadDict(id) {
-  if (cache.has(id)) return cache.get(id);
-  // Resolve to an absolute path, then verify it's still inside DICT_DIR (no traversal)
+// Resolve a dictionary id to its .ifo path, verifying it's still inside DICT_DIR (no traversal).
+function resolveIfoPath(id) {
   const resolved = path.resolve(DICT_DIR, id + '.ifo');
   if (!resolved.startsWith(path.resolve(DICT_DIR) + path.sep) && resolved !== path.resolve(DICT_DIR)) {
     const err = new Error('Invalid dictionary id: ' + id);
@@ -53,9 +52,28 @@ function loadDict(id) {
     err.status = 404;
     throw err;
   }
-  const d        = new StarDict(resolved);
+  return resolved;
+}
+
+function loadDict(id) {
+  if (cache.has(id)) return cache.get(id);
+  const d = new StarDict(resolveIfoPath(id));
   d.load();
   cache.set(id, d);
+  return d;
+}
+
+// Lightweight variant for listing: only reads the .ifo file (name/wordcount are both declared
+// there directly), never the .idx/.syn — those can be genuinely large for CJK dictionaries
+// (hundreds of thousands of entries) and fully parsing every installed dictionary just to list
+// them was blocking/crashing the Settings → Dictionaries tab on some setups. Reuses an
+// already-fully-loaded instance from `cache` when one exists (nothing extra to do), but never
+// caches a meta-only instance under the same key — that would poison later lookups by making
+// them think the dictionary is already loaded when it never parsed the actual index.
+function loadDictMeta(id) {
+  if (cache.has(id)) return cache.get(id);
+  const d = new StarDict(resolveIfoPath(id));
+  d.loadMeta();
   return d;
 }
 
@@ -75,9 +93,9 @@ function inferDictLangs(id) {
 router.get('/', authenticateToken, (req, res) => {
   ensureDictDir();
   try {
-    const dicts = findAllIfo().map(({ id, ifoPath }) => {
+    const dicts = findAllIfo().map(({ id }) => {
       try {
-        const d    = loadDict(id);
+        const d    = loadDictMeta(id);
         const langs = inferDictLangs(id);
         return { id, name: d.name, wordcount: d.wordcount, ...langs };
       } catch { return null; }
@@ -148,8 +166,11 @@ router.post('/', authenticateToken, uploadDict.array('dict', 10), (req, res) => 
   res.json({ results });
 });
 
-// ── DELETE /api/dictionary/* — remove a dictionary folder ────────────────────
-// id may be a slash-separated path like "en-en/merriam-webster"
+// ── DELETE /api/dictionary/* — remove a dictionary's files ───────────────────
+// id may be a slash-separated path like "en-en/merriam-webster" — but that's
+// "<subdirectory>/<basename>" (see findAllIfo), not a real path on disk. A StarDict
+// dictionary is several sibling files sharing that basename (.ifo/.idx/.dict[.dz]/.syn)
+// inside the subdirectory, so removing `id` itself as a single file/directory always 404'd.
 router.delete('/*', authenticateToken, (req, res) => {
   const id       = req.params[0];
   const resolved = path.resolve(DICT_DIR, id);
@@ -159,9 +180,68 @@ router.delete('/*', authenticateToken, (req, res) => {
   for (const k of cache.keys()) {
     if (k === id || k.startsWith(id + '/')) cache.delete(k);
   }
-  if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'error.not_found' });
-  fs.rmSync(resolved, { recursive: true, force: true });
+  const dir  = path.dirname(resolved);
+  const stem = path.basename(resolved);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'error.not_found' });
+  const siblings = fs.readdirSync(dir).filter(f => f === stem || f.startsWith(stem + '.'));
+  if (!siblings.length) return res.status(404).json({ error: 'error.not_found' });
+  for (const f of siblings) fs.rmSync(path.join(dir, f), { force: true });
+  // Upload creates one folder per ZIP (see POST above) — clean it up once its last
+  // dictionary is gone instead of leaving an empty folder behind in the listing.
+  try { if (!fs.readdirSync(dir).length) fs.rmdirSync(dir); } catch { /* not empty, leave it */ }
   res.json({ ok: true });
+});
+
+// ── PUT /api/dictionary/* — set/clear a dictionary's default language pair ───
+// Reuses the same folder-based convention findAllIfo()/inferDictLangs() already read from
+// (see above) instead of adding new storage: moves the dictionary's sibling files into (or out
+// of) a "<lang_from>-<lang_to>/" folder, keeping its own basename intact so two dictionaries
+// sharing a language pair (e.g. two different en-sl dictionaries) never collide — same as how
+// manually-placed dictionaries already coexist under one lang-pair folder today.
+// body: { lang_from, lang_to } — both optional/nullable; omitting both moves it back to a bare
+// "<basename>/" folder (no inferred language, same shape as a fresh, never-tagged upload).
+// Returns the new id, since renaming/moving inherently changes it.
+const LANG_CODE_RE = /^[a-z]{2,3}$/i;
+
+router.put('/*', authenticateToken, (req, res) => {
+  const id       = req.params[0];
+  const resolved = path.resolve(DICT_DIR, id);
+  if (!resolved.startsWith(path.resolve(DICT_DIR) + path.sep)) {
+    return res.status(400).json({ error: 'error.invalid_path' });
+  }
+
+  const oldDir = path.dirname(resolved);
+  const stem   = path.basename(resolved);
+  if (!fs.existsSync(oldDir)) return res.status(404).json({ error: 'error.not_found' });
+  const siblings = fs.readdirSync(oldDir).filter(f => f === stem || f.startsWith(stem + '.'));
+  if (!siblings.length) return res.status(404).json({ error: 'error.not_found' });
+
+  let { lang_from, lang_to } = req.body || {};
+  lang_from = lang_from ? String(lang_from).trim().toLowerCase() : null;
+  lang_to   = lang_to   ? String(lang_to).trim().toLowerCase()   : null;
+  if ((lang_from && !LANG_CODE_RE.test(lang_from)) || (lang_to && !LANG_CODE_RE.test(lang_to))) {
+    return res.status(400).json({ error: 'error.invalid_lang_code' });
+  }
+
+  const newDirName = (lang_from && lang_to) ? `${lang_from}-${lang_to}` : stem;
+  const newDir     = path.join(DICT_DIR, newDirName);
+
+  if (path.resolve(newDir) !== path.resolve(oldDir)) {
+    fs.mkdirSync(newDir, { recursive: true });
+    for (const f of siblings) {
+      if (fs.existsSync(path.join(newDir, f))) {
+        return res.status(409).json({ error: 'error.dict_name_conflict' });
+      }
+    }
+    for (const f of siblings) fs.renameSync(path.join(oldDir, f), path.join(newDir, f));
+    try { if (!fs.readdirSync(oldDir).length) fs.rmdirSync(oldDir); } catch { /* not empty, leave it */ }
+  }
+
+  for (const k of cache.keys()) {
+    if (k === id || k.startsWith(id + '/')) cache.delete(k);
+  }
+
+  res.json({ id: `${newDirName}/${stem}`, lang_from, lang_to });
 });
 
 module.exports = router;

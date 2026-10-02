@@ -4,11 +4,12 @@
 // renderer) rather than reusing library.js's book-card component, which isn't
 // parameterized for a different data source / action set.
 import { apiFetch } from './api.js';
-import { toast, setButtonLoading, initSortMenuFor, resyncSortMenu } from './ui.js';
+import { toast, setButtonLoading, initSortMenuFor, resyncSortMenu, showBlockingOverlay, scrollCatalogToTop } from './ui.js';
 import { t } from './i18n.js';
 import { reloadLibrary, openInfoModal, sanitizeHtml } from './library.js';
 import { reloadShelves } from './sidebar.js';
 import { showPanel } from './router.js';
+import { mountBoSessions } from './bookorbitSessions.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let _initialized  = false;
@@ -97,6 +98,7 @@ async function selectSection(section) {
     searchRow.hidden = false;
     searchInput.value = '';
     searchInput.placeholder = t('bookorbit.search_books_ph');
+    closeDrawer();
     searchInput.focus();
     return;
   }
@@ -318,6 +320,12 @@ async function loadBooks(page) {
   } finally {
     setLoading(false);
   }
+  // Must run after setLoading(false) un-hides gridEl (setLoading(true) above sets
+  // gridEl.hidden, i.e. display:none) — scrollTo() on a display:none element is a
+  // no-op in every browser, so calling this any earlier silently did nothing and the
+  // grid kept whatever scroll position it had before the page change. OPDS's own
+  // setLoading() never hides its grid, which is why this bug was BookOrbit-only.
+  scrollCatalogToTop();
 }
 
 function renderGrid(items) {
@@ -364,6 +372,29 @@ function renderGrid(items) {
 
     gridEl.appendChild(card);
   });
+}
+
+// In-place cover download-progress overlay, driven by the import-sse route below — the exact
+// same markup/CSS classes as public/js/library.js's offline-download progress bar
+// (.book-download-progress / -pct / -track / -bar) so "Add to Codexa" and "download for
+// offline" look identical, just anchored to a .bookorbit-card-cover-wrap instead of a
+// .book-card. CSS is shared/generic already, so no new styles are needed.
+function showCoverProgress(coverWrapEl) {
+  coverWrapEl.querySelector('.book-download-progress')?.remove();
+  const el = document.createElement('div');
+  el.className = 'book-download-progress';
+  el.innerHTML = `<span class="book-download-progress-pct">0%</span><div class="book-download-progress-track"><div class="book-download-progress-bar" style="width:0%"></div></div>`;
+  coverWrapEl.appendChild(el);
+  return el;
+}
+function updateCoverProgress(el, loaded, total) {
+  if (!el?.isConnected) return;
+  const pct = total ? Math.round((loaded / total) * 100) : 0;
+  el.querySelector('.book-download-progress-pct').textContent = pct + '%';
+  el.querySelector('.book-download-progress-bar').style.width = pct + '%';
+}
+function hideCoverProgress(el) {
+  el?.remove();
 }
 
 // "Already in your Codexa library" badge — same visual treatment as the main library grid's
@@ -417,6 +448,18 @@ function renderPeekButton(coverWrapEl, book) {
       e.stopPropagation();
       btn.disabled = true;
       btn.classList.add('bookorbit-btn-busy');
+      // The server does the actual download from BookOrbit here — this request only resolves
+      // once that finishes, so there's no client-visible byte progress to show (unlike the
+      // reader's own file fetch, which streams and reports %). A blocking overlay at least makes
+      // it clear something is happening and blocks other taps while it's in flight; the slow-
+      // download message kicks in if it's still running after a few seconds.
+      let cancelled = false;
+      const overlay = showBlockingOverlay(t('bookorbit.peek_downloading'), () => {
+        cancelled = true;
+        btn.disabled = false;
+        btn.classList.remove('bookorbit-btn-busy');
+      });
+      const slowTimer = setTimeout(() => overlay.setMessage(t('common.download_slow_hint')), 8000);
       try {
         const result = await apiFetch(`/bookorbit/books/${book.boBookId}/peek`, {
           method: 'POST',
@@ -427,12 +470,24 @@ function renderPeekButton(coverWrapEl, book) {
             language: book.language,
           }),
         });
+        clearTimeout(slowTimer);
+        if (cancelled) {
+          // User already backed out — don't yank them into the reader. The server did finish the
+          // download though, so clean up the ephemeral row now instead of waiting for the TTL sweep.
+          apiFetch(`/books/${result.id}/peek-cleanup`, { method: 'POST' }).catch(() => {});
+          return;
+        }
+        overlay.dismiss();
         saveResumeState(); // let the reader send us back here on close
         window.location.href = `/reader.html?id=${result.id}&peek=1&from=bookorbit`;
       } catch (err) {
-        toast.error(err.message);
-        btn.disabled = false;
-        btn.classList.remove('bookorbit-btn-busy');
+        clearTimeout(slowTimer);
+        if (!cancelled) {
+          overlay.dismiss();
+          toast.error(err.message);
+          btn.disabled = false;
+          btn.classList.remove('bookorbit-btn-busy');
+        }
       }
     });
   }
@@ -469,33 +524,58 @@ function renderCardActions(actionsEl, book) {
     addBtn.title = t('bookorbit.no_file');
   } else {
     addBtn.title = t('bookorbit.btn_add');
-    addBtn.addEventListener('click', async e => {
+    addBtn.addEventListener('click', e => {
       e.stopPropagation();
       addBtn.disabled = true;
       addBtn.classList.add('bookorbit-btn-busy');
-      try {
-        const result = await apiFetch(`/bookorbit/books/${book.boBookId}/import`, {
-          method: 'POST',
-          body: JSON.stringify({ fileId: primaryFile.id, format: primaryFile.format, title: book.title, author: book.authors?.[0] }),
-        });
-        toast.success(t('opds.toast_book_added', { title: book.title }));
-        book.localBookId = result.id;
-        renderCardActions(actionsEl, book);
-        renderDownloadedBadge(actionsEl.closest('.bookorbit-card-cover-wrap'), book);
-        reloadLibrary().catch(e2 => console.error('[bookorbit] reloadLibrary failed:', e2));
-      } catch (err) {
-        const bookId = err.data?.id;
-        if (bookId) {
-          toast.info(t('opds.err_already_in_library'));
-          book.localBookId = bookId;
+      const coverWrapEl  = actionsEl.closest('.bookorbit-card-cover-wrap');
+      const progressEl   = showCoverProgress(coverWrapEl);
+
+      const finish = () => {
+        hideCoverProgress(progressEl);
+        addBtn.disabled = false;
+        addBtn.classList.remove('bookorbit-btn-busy');
+      };
+
+      const params = new URLSearchParams({
+        fileId: primaryFile.id, format: primaryFile.format || '',
+        title: book.title || '', author: book.authors?.[0] || '',
+        seriesName: book.seriesName || '', seriesIndex: book.seriesIndex ?? '',
+        language: book.language || '', token: localStorage.getItem('br_token') || '',
+      });
+      const es = new EventSource(`/api/bookorbit/books/${book.boBookId}/import-sse?${params}`);
+
+      es.onmessage = evt => {
+        let data;
+        try { data = JSON.parse(evt.data); } catch { return; }
+        if (data.type === 'progress') {
+          updateCoverProgress(progressEl, data.loaded, data.total);
+        } else if (data.type === 'done') {
+          es.close();
+          finish();
+          toast.success(t('opds.toast_book_added', { title: book.title }));
+          book.localBookId = data.id;
           renderCardActions(actionsEl, book);
-          renderDownloadedBadge(actionsEl.closest('.bookorbit-card-cover-wrap'), book);
-        } else {
-          toast.error(err.message);
-          addBtn.disabled = false;
-          addBtn.classList.remove('bookorbit-btn-busy');
+          renderDownloadedBadge(coverWrapEl, book);
+          reloadLibrary().catch(e2 => console.error('[bookorbit] reloadLibrary failed:', e2));
+        } else if (data.type === 'error') {
+          es.close();
+          finish();
+          if (data.id) {
+            toast.info(t('opds.err_already_in_library'));
+            book.localBookId = data.id;
+            renderCardActions(actionsEl, book);
+            renderDownloadedBadge(coverWrapEl, book);
+          } else {
+            toast.error(t(data.message));
+          }
         }
-      }
+      };
+      es.onerror = () => {
+        es.close();
+        finish();
+        toast.error(t('bookorbit.import_failed'));
+      };
     });
   }
   actionsEl.appendChild(addBtn);
@@ -628,6 +708,25 @@ function openBookorbitCoverPreview(book) {
 // GET /api/books/:id, which doesn't exist until the book is imported. This is the BookOrbit-side
 // equivalent: same visual language (reuses .info-modal-* / .imt-meta-* classes) but sourced
 // entirely from BookOrbit's GET /books/:id via our /bookorbit/books/:id/detail proxy.
+// Related-tab card renderer, same shape as library.js's own loadRelatedTab() card builder —
+// links out to BookOrbit itself (no recursive modal-opening) when the server URL is known.
+function relatedCardHtml(b) {
+  const boLink = bookorbitUrl ? `${bookorbitUrl.replace(/\/+$/, '')}/book/${b.boBookId}` : null;
+  const inner = `
+    <div class="imt-related-cover-wrap">
+      ${b.hasCover
+        ? `<img class="imt-related-cover" src="${coverSrc(b.boBookId)}" alt="" loading="lazy" />`
+        : `<div class="imt-related-cover imt-related-cover-ph">\u{1F4D6}</div>`}
+      ${b.seriesIndex != null ? `<span class="imt-related-series-badge">#${escHtml(String(b.seriesIndex))}</span>` : ''}
+    </div>
+    <div class="imt-related-title">${escHtml(b.title || '')}</div>
+    ${b.authors?.length ? `<div class="imt-related-author">${escHtml(b.authors.join(', '))}</div>` : ''}`;
+
+  return boLink
+    ? `<a class="imt-related-card" href="${escHtml(boLink)}" target="_blank" rel="noopener" title="${escHtml(b.title || '')}">${inner}</a>`
+    : `<div class="imt-related-card" title="${escHtml(b.title || '')}">${inner}</div>`;
+}
+
 async function openBookorbitDetailModal(book) {
   document.getElementById('bookorbit-detail-modal')?.remove();
 
@@ -652,7 +751,18 @@ async function openBookorbitDetailModal(book) {
           </div>` : ''}
         </div>
       </div>
-      <div id="bod-body" class="info-modal-tab-content"><div class="imt-empty" style="padding:1rem 0">${t('opds.loading')}</div></div>
+
+      <div class="info-modal-tabs" role="tablist">
+        <button class="imt-tab active" data-tab="details" role="tab">${t('library.tab_details')}</button>
+        <button class="imt-tab" data-tab="related" role="tab">${t('library.tab_related')}</button>
+        <button class="imt-tab" data-tab="reading" role="tab">${t('library.tab_reading')}</button>
+      </div>
+
+      <div class="info-modal-tab-content">
+        <div class="imt-panel" id="bod-details"><div class="imt-empty" style="padding:1rem 0">${t('opds.loading')}</div></div>
+        <div class="imt-panel" id="bod-related" style="display:none"><div id="bod-related-inner"><div class="imt-empty" style="padding:1rem 0">${t('opds.loading')}</div></div></div>
+        <div class="imt-panel" id="bod-reading" style="display:none"><div id="bod-reading-inner"></div></div>
+      </div>
     </div>`;
   document.body.appendChild(backdrop);
 
@@ -664,7 +774,8 @@ async function openBookorbitDetailModal(book) {
     openBookorbitCoverPreview(book);
   });
 
-  const bodyEl = backdrop.querySelector('#bod-body');
+  // ── Details tab (loads immediately) ─────────────────────────────────────────
+  const detailsEl = backdrop.querySelector('#bod-details');
   try {
     const d = await apiFetch(`/bookorbit/books/${book.boBookId}/detail`);
     const seriesLabel = d.seriesName ? `${d.seriesName}${d.seriesIndex != null ? ` #${d.seriesIndex}` : ''}` : '';
@@ -676,15 +787,60 @@ async function openBookorbitDetailModal(book) {
       d.publishedYear  && [t('bookorbit.info_published_year'), escHtml(String(d.publishedYear))],
     ].filter(Boolean);
 
-    bodyEl.innerHTML = `
+    detailsEl.innerHTML = `
       ${seriesLabel ? `<div class="info-modal-series">${escHtml(seriesLabel)}</div>` : ''}
       ${d.genres?.length ? `<div class="info-modal-genres" style="margin-top:.3rem">${d.genres.map(g => `<span class="genre-pill">${escHtml(g)}</span>`).join('')}</div>` : ''}
       ${metaRows.length ? `<div class="imt-meta-grid" style="margin-top:.75rem">${metaRows.map(([label, val]) => `<div class="imt-meta-pair"><span class="imt-meta-label">${label}</span><span>${val}</span></div>`).join('')}</div>` : ''}
       ${d.description ? `<div class="info-modal-section-title" style="margin-top:.75rem">${t('library.info_desc')}</div><div class="info-modal-desc">${sanitizeHtml(d.description)}</div>` : ''}
     `;
   } catch (err) {
-    bodyEl.innerHTML = `<div class="imt-empty">${escHtml(t('common.err_prefix') + err.message)}</div>`;
+    detailsEl.innerHTML = `<div class="imt-empty">${escHtml(t('common.err_prefix') + err.message)}</div>`;
   }
+
+  // ── Related tab (lazy — same recommendation engine as library.js's own Related tab) ──────────
+  let relatedLoaded = false;
+  let readingLoaded = false;
+  async function loadRelatedTab() {
+    const inner = backdrop.querySelector('#bod-related-inner');
+    try {
+      const data = await apiFetch(`/bookorbit/books/${book.boBookId}/related`);
+      const sections = [];
+      if (data.seriesBooks?.length) {
+        sections.push(`
+          <div class="imt-section-title">${t('library.related_series')}</div>
+          <div class="imt-related-scroller">${data.seriesBooks.map(relatedCardHtml).join('')}</div>`);
+      }
+      if (data.authorBooks?.length) {
+        sections.push(`
+          <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_by_author')}</div>
+          <div class="imt-related-scroller">${data.authorBooks.map(relatedCardHtml).join('')}</div>`);
+      }
+      if (data.recommendations?.length) {
+        sections.push(`
+          <div class="imt-section-title" style="margin-top:.75rem">${t('library.related_more_like_this')}</div>
+          <div class="imt-related-scroller">${data.recommendations.map(relatedCardHtml).join('')}</div>`);
+      }
+      inner.innerHTML = sections.length ? sections.join('') : `<div class="imt-empty">${t('library.related_empty')}</div>`;
+    } catch (err) {
+      inner.innerHTML = `<div class="imt-empty">${escHtml(t('common.err_prefix') + err.message)}</div>`;
+    }
+  }
+
+  backdrop.querySelectorAll('.imt-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.tab;
+      backdrop.querySelectorAll('.imt-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
+      backdrop.querySelectorAll('.imt-panel').forEach(p => { p.style.display = p.id === `bod-${id}` ? '' : 'none'; });
+      if (id === 'related' && !relatedLoaded) { relatedLoaded = true; loadRelatedTab(); }
+      if (id === 'reading' && !readingLoaded) {
+        readingLoaded = true;
+        // BookOrbit's own per-session rows for this book, from every device on the account.
+        mountBoSessions(backdrop.querySelector('#bod-reading-inner'),
+          p => apiFetch(`/bookorbit/books/${book.boBookId}/sessions?page=${p}`),
+          { attempts: async () => (await apiFetch(`/bookorbit/books/${book.boBookId}/attempts`))?.items || [] });
+      }
+    });
+  });
 }
 
 // ── Sync a collection/smart-scope into a Codexa shelf (SSE progress) ─────────
@@ -806,9 +962,13 @@ export function openBookorbitSyncModal(source, id, name, existingShelfId = null)
         es.close();
         reloadShelves();
         reloadLibrary();
-        const summary = msg.errors
+        let summary = msg.errors
           ? t('opds.sync_done_errors', { added: msg.added, skipped: msg.skipped, errors: msg.errors })
           : t('opds.sync_done', { added: msg.added, skipped: msg.skipped });
+        // Books auto-unlinked from this shelf because they're still present on another one
+        // (e.g. moved to a different linked collection/smart scope) — no dialog needed, just
+        // note it happened.
+        if (msg.autoRemoved) summary += ' ' + t('opds.stale_auto_removed', { n: msg.autoRemoved });
         if (msg.staleBooks && msg.staleBooks.length > 0) {
           const stale = msg.staleBooks;
           close();
@@ -1010,6 +1170,11 @@ async function restoreResumeState() {
       b.classList.toggle('active', Number(b.dataset.id) === Number(state.itemId));
     });
     loadBooks(state.page || 0);
+    // Mirrors selectItem()'s closeDrawer() — we're restoring straight to an already-picked
+    // item (returning from a peek in the reader), so the mobile drawer that init's openDrawer()
+    // forces open by default should stay closed instead of re-covering the book grid we're
+    // landing back on.
+    closeDrawer();
   }
   return true;
 }

@@ -6,7 +6,7 @@
 import { apiFetch, requireAuth, clearToken } from './api.js';
 import { t, initIconLangPicker } from './i18n.js';
 import { showPanel, getCurrentPanel } from './router.js';
-import { confirmDialog } from './ui.js';
+import { confirmDialog, syncStatusBarAppearance, attachUpdateCheckHandler } from './ui.js';
 
 const LIB_THEME_KEY = 'br_library_theme';
 const LIB_THEMES = new Set(['system', 'day', 'night', 'eink']);
@@ -22,6 +22,19 @@ let _shelfEditMode    = false;
 let _bookorbitVisible = false;
 let _bookorbitWarning = false;
 let _opdsVisible      = false;
+
+// Self-healing connectivity signal for gating actions that need the live API (settings/OPDS/
+// BookOrbit/stats panels, shelf navigation, add-shelf, logout warning). Raw navigator.onLine is
+// known-unreliable in this app (see app.js's own comment: it can get stuck reporting false after
+// a VPN toggle, adapter change, or sleep/resume, with no guaranteed matching 'online' event) — a
+// sidebar action gated on it directly could go silently, permanently dead (no error, just does
+// nothing on click) until a full page reload. app:network-restored is dispatched app-wide only
+// after library.js actually confirms the API is reachable (not just the browser's flag), so
+// trusting it here self-heals the stuck-offline case the same way app.js/reader.js already do.
+let _sidebarOnline = navigator.onLine;
+window.addEventListener('online',  () => { _sidebarOnline = true; });
+window.addEventListener('offline', () => { _sidebarOnline = false; });
+document.addEventListener('app:network-restored', () => { _sidebarOnline = true; });
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -43,6 +56,7 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
   initLibraryThemeControls(sidebar);
   initDisplaySizeControls(sidebar);
   initSidebarLangPicker(sidebar.querySelector('#sidebar-lang-picker'));
+  _attachLogoUpdateHandler(sidebar);
 
   // BookOrbit + Online library nav item visibility — fetched here (not left to library.js's own
   // /settings fetch) so both are correct even when the app opens directly into a non-library
@@ -83,7 +97,7 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
 
   // Logout
   sidebar.querySelector('#sidebar-logout-btn').addEventListener('click', () => {
-    if (!navigator.onLine) {
+    if (!_sidebarOnline) {
       confirmDialog(t('sidebar.logout_offline_warning'), () => { clearToken(); window.location.href = '/login.html'; }, t('sidebar.logout'), false);
       return;
     }
@@ -111,7 +125,7 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
 
   // Add shelf button
   sidebar.querySelector('#add-shelf-btn').addEventListener('click', () => {
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     document.dispatchEvent(new CustomEvent('sidebar:addshelf'));
   });
 
@@ -120,23 +134,28 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
   // Nav: Settings and OPDS panels — blocked when offline (both require live API)
   sidebar.querySelector('#nav-settings')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('settings'); closeSidebar();
   });
   sidebar.querySelector('#nav-opds')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('opds'); closeSidebar();
   });
   sidebar.querySelector('#nav-bookorbit')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('bookorbit'); closeSidebar();
+  });
+  sidebar.querySelector('#nav-bookorbit-dash')?.addEventListener('click', e => {
+    e.preventDefault();
+    if (!_sidebarOnline) return;
+    showPanel('bookorbit-dash'); closeSidebar();
   });
 
   // Statistics button
   sidebar.querySelector('#sidebar-stats-btn')?.addEventListener('click', () => {
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     document.dispatchEvent(new CustomEvent('sidebar:stats'));
   });
 
@@ -148,6 +167,8 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
     sidebar.querySelector('#nav-opds')?.classList.add('sidebar-item-active');
   } else if (currentPanel === 'bookorbit') {
     sidebar.querySelector('#nav-bookorbit')?.classList.add('sidebar-item-active');
+  } else if (currentPanel === 'bookorbit-dash') {
+    sidebar.querySelector('#nav-bookorbit-dash')?.classList.add('sidebar-item-active');
   } else {
     setActive(activeShelfId);
   }
@@ -156,21 +177,26 @@ export async function initSidebar({ onShelfSelect = null, activeShelfId = 'all' 
   document.addEventListener('panelchange', e => {
     _activePage = e.detail.panel;
     if (_activePage === 'settings') {
-      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-opds, #nav-bookorbit')
+      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-opds, #nav-bookorbit, #nav-bookorbit-dash')
         .forEach(el => el.classList.remove('sidebar-item-active'));
       document.getElementById('nav-settings')?.classList.add('sidebar-item-active');
     } else if (_activePage === 'opds') {
-      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-bookorbit')
+      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-bookorbit, #nav-bookorbit-dash')
         .forEach(el => el.classList.remove('sidebar-item-active'));
       document.getElementById('nav-opds')?.classList.add('sidebar-item-active');
     } else if (_activePage === 'bookorbit') {
-      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-opds')
+      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-opds, #nav-bookorbit-dash')
         .forEach(el => el.classList.remove('sidebar-item-active'));
       document.getElementById('nav-bookorbit')?.classList.add('sidebar-item-active');
+    } else if (_activePage === 'bookorbit-dash') {
+      document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-opds, #nav-bookorbit')
+        .forEach(el => el.classList.remove('sidebar-item-active'));
+      document.getElementById('nav-bookorbit-dash')?.classList.add('sidebar-item-active');
     } else {
       document.getElementById('nav-settings')?.classList.remove('sidebar-item-active');
       document.getElementById('nav-opds')?.classList.remove('sidebar-item-active');
       document.getElementById('nav-bookorbit')?.classList.remove('sidebar-item-active');
+      document.getElementById('nav-bookorbit-dash')?.classList.remove('sidebar-item-active');
       setActive(_activeShelfId);
     }
   });
@@ -208,7 +234,7 @@ export function getShelves() { return shelves; }
 
 export function setActive(shelfId) {
   _activeShelfId = shelfId;
-  document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-opds, #nav-bookorbit')
+  document.querySelectorAll('#nav-all-books, #nav-currently-reading, #nav-downloaded, .sidebar-shelf-item, #nav-settings, #nav-opds, #nav-bookorbit, #nav-bookorbit-dash')
     .forEach(el => el.classList.remove('sidebar-item-active'));
 
   if (shelfId === 'all') {
@@ -240,10 +266,14 @@ export function updateDownloadedCount(n) {
   if (countEl) countEl.textContent = n > 0 ? String(n) : '';
 }
 
+// Also gates #nav-bookorbit-dash — same "valid BookOrbit credentials" condition as the library
+// browser nav item, so no separate server flag/fetch is needed for it.
 export function setBookorbitNavVisible(visible) {
   _bookorbitVisible = !!visible;
   const el = document.getElementById('nav-bookorbit');
   if (el) el.style.display = _bookorbitVisible ? '' : 'none';
+  const dashEl = document.getElementById('nav-bookorbit-dash');
+  if (dashEl) dashEl.style.display = _bookorbitVisible ? '' : 'none';
 }
 
 export function setOpdsNavVisible(visible) {
@@ -287,6 +317,18 @@ function initSidebarLangPicker(container) {
   initIconLangPicker(container);
 }
 
+// Tapping the Codexa title/logo asks before doing a full unregister+reload (see ui.js's
+// hardRefreshApp) instead of just letting the <a href="/"> navigate normally — a plain
+// navigation would still be answered by the cache-first service worker with whatever's already
+// cached, which is exactly the "stuck on an old version" case this exists to get out of.
+// Shared between initSidebar and the langchange rebuild below since both rebuild this DOM node
+// from scratch. login.js wires the same ui.js helper onto the sign-in screen's own logo.
+function _attachLogoUpdateHandler(sidebar) {
+  // Let the "new version available" badge (app.js's checkForUpdate) keep linking out to the
+  // GitHub releases page normally — only the logo itself triggers the reload dialog.
+  attachUpdateCheckHandler(sidebar.querySelector('.logo'), { skipSelector: '.update-badge' });
+}
+
 function buildSidebarHtml() {
   return `
     <div class="sidebar-header">
@@ -324,6 +366,10 @@ function buildSidebarHtml() {
         <span class="sidebar-item-icon"><img src="/images/bookorbit.svg" class="nav-icon nav-icon-bookorbit" alt=""></span>
         <span class="sidebar-item-label">${t('sidebar.bookorbit')}</span>
         <span class="sidebar-item-warning hidden" id="nav-bookorbit-warning" title="${t('sidebar.bookorbit_unreachable')}">⚠</span>
+      </a>
+      <a href="/?panel=bookorbit-dash" class="sidebar-item" id="nav-bookorbit-dash" style="${_bookorbitVisible ? '' : 'display:none'}">
+        <span class="sidebar-item-icon"><img src="/images/bookorbit.svg" class="nav-icon nav-icon-bookorbit" alt=""></span>
+        <span class="sidebar-item-label">${t('sidebar.bookorbit_dash')}</span>
       </a>
       <a href="/?panel=opds" class="sidebar-item" id="nav-opds" style="${_opdsVisible ? '' : 'display:none'}">
         <span class="sidebar-item-icon"><img src="/images/online_library.svg" class="nav-icon nav-icon-online-library" alt=""></span>
@@ -396,12 +442,12 @@ function renderShelves() {
 
     item.addEventListener('click', e => {
       if (e.target.closest('.shelf-edit-btn')) return;
-      if (!navigator.onLine) return;
+      if (!_sidebarOnline) return;
       navigate(shelf.id);
     });
     item.querySelector('.shelf-edit-btn').addEventListener('click', e => {
       e.stopPropagation();
-      if (!navigator.onLine) return;
+      if (!_sidebarOnline) return;
       document.dispatchEvent(new CustomEvent('sidebar:editshelf', { detail: shelf }));
     });
 
@@ -474,6 +520,7 @@ document.addEventListener('langchange', () => {
   initLibraryThemeControls(sidebar);
   initDisplaySizeControls(sidebar);
   initSidebarLangPicker(sidebar.querySelector('#sidebar-lang-picker'));
+  _attachLogoUpdateHandler(sidebar);
   const unameEl = sidebar.querySelector('#sidebar-username');
   if (unameEl) unameEl.textContent = username;
   setBookorbitWarning(_bookorbitWarning);
@@ -482,6 +529,10 @@ document.addEventListener('langchange', () => {
     sidebar.querySelector('#nav-settings')?.classList.add('sidebar-item-active');
   } else if (_activePage === 'opds') {
     sidebar.querySelector('#nav-opds')?.classList.add('sidebar-item-active');
+  } else if (_activePage === 'bookorbit') {
+    sidebar.querySelector('#nav-bookorbit')?.classList.add('sidebar-item-active');
+  } else if (_activePage === 'bookorbit-dash') {
+    sidebar.querySelector('#nav-bookorbit-dash')?.classList.add('sidebar-item-active');
   } else {
     setActive(_activeShelfId);
   }
@@ -506,7 +557,7 @@ document.addEventListener('langchange', () => {
     localStorage.setItem('sidebarCollapsed', collapsed ? '1' : '0');
   });
   sidebar.querySelector('#sidebar-logout-btn')?.addEventListener('click', () => {
-    if (!navigator.onLine) {
+    if (!_sidebarOnline) {
       confirmDialog(t('sidebar.logout_offline_warning'), () => { clearToken(); window.location.href = '/login.html'; }, t('sidebar.logout'), false);
       return;
     }
@@ -522,27 +573,32 @@ document.addEventListener('langchange', () => {
     e.preventDefault(); navigate('all');
   });
   sidebar.querySelector('#add-shelf-btn')?.addEventListener('click', () => {
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     document.dispatchEvent(new CustomEvent('sidebar:addshelf'));
   });
   _attachShelfEditBtn();
   sidebar.querySelector('#nav-settings')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('settings'); closeSidebar();
   });
   sidebar.querySelector('#nav-opds')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('opds'); closeSidebar();
   });
   sidebar.querySelector('#nav-bookorbit')?.addEventListener('click', e => {
     e.preventDefault();
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     showPanel('bookorbit'); closeSidebar();
   });
+  sidebar.querySelector('#nav-bookorbit-dash')?.addEventListener('click', e => {
+    e.preventDefault();
+    if (!_sidebarOnline) return;
+    showPanel('bookorbit-dash'); closeSidebar();
+  });
   sidebar.querySelector('#sidebar-stats-btn')?.addEventListener('click', () => {
-    if (!navigator.onLine) return;
+    if (!_sidebarOnline) return;
     document.dispatchEvent(new CustomEvent('sidebar:stats'));
   });
 });
@@ -585,6 +641,7 @@ function applyLibraryTheme(theme) {
     body.setAttribute('data-lib-theme', resolved);
     html.setAttribute('data-lib-theme', resolved);
   }
+  syncStatusBarAppearance(getComputedStyle(html).getPropertyValue('--color-bg'));
 }
 
 // Generic dropdown styled exactly like the language picker (reuses .lang-menu-* CSS):

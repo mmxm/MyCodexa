@@ -10,9 +10,9 @@
 const fs   = require('fs');
 const path = require('path');
 const { getDb, DATA_DIR } = require('../db');
+const { removeCoverIfUnused } = require('./covers');
 
 const PEEK_DIR         = path.join(DATA_DIR, 'tmp', 'peek');
-const COVERS_DIR       = path.join(DATA_DIR, 'covers');
 const PEEK_TTL_SECONDS = 3 * 60 * 60; // 3h — generous since the file is fetched once per reader open, no heartbeat
 
 function peekFilePath(userId, filename) {
@@ -24,10 +24,8 @@ function peekFilePath(userId, filename) {
 // this stays defensive in case that ever changes.
 function deletePeekRow(db, row) {
   try { fs.unlinkSync(peekFilePath(row.user_id, row.filename)); } catch { /* already gone */ }
-  if (row.cover_path) {
-    try { fs.unlinkSync(path.join(COVERS_DIR, row.cover_path)); } catch { /* already gone */ }
-  }
   db.prepare('DELETE FROM books WHERE id = ?').run(row.id);
+  removeCoverIfUnused(db, row.cover_path);
 }
 
 // Two passes:

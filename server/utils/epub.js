@@ -16,7 +16,7 @@ const xmlParser = new XMLParser({
   allowBooleanAttributes: true,
   parseAttributeValue:  false,
   processEntities:      false,   // decode manually so entity-encoded HTML doesn't confuse the parser
-  isArray: (name) => ['item', 'meta', 'opf:meta', 'dc:creator', 'dc:title'].includes(name),
+  isArray: (name) => ['item', 'opf:item', 'meta', 'opf:meta', 'dc:creator', 'dc:title'].includes(name),
 });
 
 // Decode standard XML/HTML entities (manual, since processEntities is off)
@@ -75,7 +75,13 @@ function dcText(val) {
 
 // ── Main extraction function ──────────────────────────────────────────────────
 function extractEpubMetadata(epubPath, coversDir, fileHash) {
-  const result = { title: path.basename(epubPath, '.epub'), author: '', cover_path: '', series_name: '', series_number: '', description: '', publisher: '', language: '', isbn: '', genres: '', pages: '' };
+  // title deliberately starts empty rather than falling back to the filename — epubPath is
+  // always the hash-renamed destination file (e.g. "<hash>.epub") by the time this runs in
+  // every caller, so a filename-derived fallback here would just be the hash, masking the
+  // fact that no real title was found and preventing callers (BookOrbit/OPDS import, upload)
+  // from falling back to a better source (the catalog entry's own title, the original upload
+  // filename). Callers are responsible for the final "nothing found at all" fallback.
+  const result = { title: '', author: '', cover_path: '', series_name: '', series_number: '', description: '', publisher: '', language: '', isbn: '', genres: '', pages: '' };
 
   try {
     const zip = new AdmZip(epubPath);
@@ -94,9 +100,26 @@ function extractEpubMetadata(epubPath, coversDir, fileHash) {
     const opfEntry = zip.getEntry(opfPath);
     if (!opfEntry) return result;
 
-    const opf      = xmlParser.parse(opfEntry.getData().toString('utf8'));
-    const metadata = opf?.package?.metadata;
-    if (!metadata) return result;
+    const opf = xmlParser.parse(opfEntry.getData().toString('utf8'));
+    // Some EPUB2 files (real-world example: an older publish, later metadata-edited by
+    // Calibre, which preserves the prefixed form) put a namespace prefix directly on the
+    // package/metadata/manifest/item elements themselves (<opf:package>, <opf:metadata>, ...)
+    // instead of leaving them unprefixed under a default xmlns — fast-xml-parser keeps
+    // whatever prefix the source XML actually used (no removeNSPrefix here, same as the
+    // dc:*/opf:meta handling throughout this function), so both spellings need checking at
+    // each level. Confirmed via a real reported file: without this, opf?.package is
+    // undefined, extraction silently returns empty, and the book imports with no metadata
+    // or cover at all despite the file itself having complete metadata.
+    const pkg      = opf?.package ?? opf?.['opf:package'];
+    const metadata = pkg?.metadata ?? pkg?.['opf:metadata'];
+    if (!metadata) {
+      // Distinguishes "this file genuinely has no OPF metadata" from "the parser didn't
+      // recognise this file's structure" — the latter used to fail silently here, which is
+      // exactly what made the namespace-prefix case above hard to tell apart from a real
+      // empty file until someone dug into the parsed object by hand.
+      console.warn(`[epub] no <metadata> found in OPF (unrecognised structure?): ${opfPath}`);
+      return result;
+    }
 
     // Title
     const titleVal = dcText(metadata['dc:title']);
@@ -188,7 +211,8 @@ function extractEpubMetadata(epubPath, coversDir, fileHash) {
     }
     // 3. Find cover image in manifest
     const opfDir   = path.posix.dirname(opfPath); // e.g. "OEBPS" or "."
-    const manifest = opf?.package?.manifest?.item || [];
+    const manifestNode = pkg?.manifest ?? pkg?.['opf:manifest'];
+    const manifest      = manifestNode?.item ?? manifestNode?.['opf:item'] ?? [];
     const items    = Array.isArray(manifest) ? manifest : [manifest];
 
     // Determine cover item ID from <meta name="cover"> or <meta property="cover-image">
@@ -212,6 +236,15 @@ function extractEpubMetadata(epubPath, coversDir, fileHash) {
     if (!coverItem && coverId) {
       const byId = items.find(i => i['@_id'] === coverId);
       if (byId && isImageItem(byId)) coverItem = byId;
+    }
+
+    // 2b. Some non-compliant EPUB2 files put the image's href directly in <meta name="cover">
+    // content= instead of an item id (spec violation, but seen from real-world converters —
+    // confirmed on a book whose cover was otherwise undetectable: content="Images/xyz.jpg"
+    // with no item id or filename containing "cover" at all). Match content against href too.
+    if (!coverItem && coverId) {
+      const byHref = items.find(i => (i['@_href'] || '').toLowerCase() === coverId.toLowerCase());
+      if (byHref && isImageItem(byHref)) coverItem = byHref;
     }
 
     // 3. Item with id="cover" or id="cover-image" that is an image
@@ -259,8 +292,9 @@ function extractEpubMetadata(epubPath, coversDir, fileHash) {
 // ── CBZ metadata extraction ───────────────────────────────────────────────────
 function extractCbzMetadata(cbzPath, coversDir, fileHash) {
   const IMAGE_EXT = /\.(jpe?g|png|webp|gif|avif)$/i;
+  // See extractEpubMetadata's comment above — title starts empty, not filename-derived.
   const result = {
-    title: path.basename(cbzPath, '.cbz'), author: '', cover_path: '',
+    title: '', author: '', cover_path: '',
     series_name: '', series_number: '', description: '', publisher: '',
     language: '', isbn: '', genres: '', pages: '',
   };

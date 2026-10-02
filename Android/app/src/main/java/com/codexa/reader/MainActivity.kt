@@ -2,6 +2,7 @@ package com.codexa.reader
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -12,13 +13,16 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -30,6 +34,11 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
@@ -42,6 +51,28 @@ class MainActivity : AppCompatActivity() {
     // Track back-press timing: second back press within 2 s opens server select
     private var lastBackPressTime = 0L
 
+    // True while an SSO/OIDC login redirect chain is in flight — set explicitly by the JS
+    // bridge's oidcFlowStarting() (called from login.js) and by shouldOverrideUrlLoading's own
+    // same-host /api/auth/oidc/ detection as a fallback. See shouldOverrideUrlLoading below for
+    // why this exists: it's what keeps IdP-hosted redirect hops inside the WebView instead of
+    // bouncing to the system browser, where a resulting session would be stranded in different
+    // storage. @Volatile because it's written from the JS bridge's own thread (JavascriptInterface
+    // methods don't run on the UI thread) and read from shouldOverrideUrlLoading.
+    @Volatile
+    private var oidcFlowActive = false
+
+    // True once a same-host page has ever finished loading in this session. A reverse-proxy
+    // auth gate (Authelia, Pangolin, Cloudflare Access — anything sitting in front of the
+    // *entire* site, not just Codexa's own /api/auth/oidc/ feature) can redirect cross-host on
+    // the very first request, before Codexa's own login page (or any of its JS, including the
+    // oidcFlowStarting() bridge call) has ever loaded — neither of oidcFlowActive's detection
+    // mechanisms can see that coming, since nothing Codexa-specific has run yet. While this is
+    // false, ANY cross-host redirect is assumed to be part of such a gate and stays in-WebView;
+    // once true, cross-host navigation reverts to normal (system browser), since we've now
+    // proven we're actually past whatever gate exists.
+    @Volatile
+    private var hasLoadedOwnContent = false
+
     // Launcher for ServerSelectActivity — handles both first-run and change-server flows
     private val serverSelectLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -49,7 +80,16 @@ class MainActivity : AppCompatActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             val url = result.data?.getStringExtra(ServerSelectActivity.RESULT_URL) ?: return@registerForActivityResult
             saveUrl(url)
-            webView.loadUrl(url)
+            // Reset in case a previous SSO attempt never made it back to serverHost (e.g. the
+            // user backed out mid-flow instead) — a stale true here would wrongly let the next
+            // genuine external link stay in-WebView instead of opening the system browser.
+            oidcFlowActive = false
+            // New/changed server — haven't proven we're past its auth gate (if any) yet.
+            hasLoadedOwnContent = false
+            // Re-register the header-injection script in case the user just changed it
+            // (or the server itself) in ServerSelectActivity, before loading the new URL.
+            injectCustomHeadersScript()
+            webView.loadUrl(url, getCustomHeaders())
         } else if (getSavedUrl() == null) {
             // First run and user somehow cancelled — show it again (non-cancellable)
             openServerSelect(cancellable = false)
@@ -129,6 +169,38 @@ class MainActivity : AppCompatActivity() {
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit().putBoolean("eink_mode", enabled).apply()
         }
+
+        /**
+         * Called by web JS whenever it applies/resolves a theme, so the system status bar
+         * and navigation bar icon color can be flipped to match. The WebView content's theme
+         * (day/night/eink/sepia/...) is decided entirely in CSS/JS and the native shell has no
+         * other way to learn it — without this, system bar icons stay whatever color they
+         * defaulted to (independent of the in-app theme) and can become invisible against it
+         * (e.g. light system icons on a bright in-app background).
+         */
+        @JavascriptInterface
+        fun setStatusBarAppearance(light: Boolean) {
+            runOnUiThread {
+                val controller = WindowInsetsControllerCompat(window, window.decorView)
+                controller.isAppearanceLightStatusBars = light
+                controller.isAppearanceLightNavigationBars = light
+            }
+        }
+
+        /**
+         * Called by login.js right before it navigates to /api/auth/oidc/.../start (an explicit
+         * signal from the one place that actually knows an SSO flow is beginning), so the
+         * cross-host IdP redirect that follows stays inside this WebView instead of bouncing to
+         * the system browser. Replaces an earlier attempt at inferring this purely from
+         * inspecting URLs inside shouldOverrideUrlLoading, which turned out not to be reliable
+         * enough on its own (a real-world report showed the external-browser bounce still
+         * happening) — an explicit signal from the page itself, at the exact moment intent is
+         * known, removes that guesswork entirely. See oidcFlowActive below.
+         */
+        @JavascriptInterface
+        fun oidcFlowStarting() {
+            oidcFlowActive = true
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -159,7 +231,7 @@ class MainActivity : AppCompatActivity() {
 
         val savedUrl = getSavedUrl()
         if (savedUrl != null) {
-            webView.loadUrl(savedUrl)
+            webView.loadUrl(savedUrl, getCustomHeaders())
         } else {
             openServerSelect(cancellable = false)
         }
@@ -186,6 +258,18 @@ class MainActivity : AppCompatActivity() {
         (webView.parent as? android.view.ViewGroup)?.removeView(webView)
         webView.destroy()
         super.onDestroy()
+    }
+
+    // The system can re-show the status/nav bars on its own whenever this window regains
+    // focus (backgrounding via home button / recents / notification shade / a system dialog,
+    // then returning) — hiding them once in onPageStarted/onPageFinished isn't enough to keep
+    // them hidden across that. Reasserting here on every focus-regain is the documented fix
+    // for immersive mode "not sticking" after the app comes back from the background.
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            setImmersiveMode(isOnReader())
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -293,6 +377,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.addJavascriptInterface(JsBridge(), "AndroidCodexa")
+        injectCustomHeadersScript()
+        // Without this, any navigation the WebView can't render itself — the book-info dialog's
+        // "Download" link (<a href=".../file?download=1&token=..." download>) chief among them —
+        // is silently dropped: Chromium's WebView only hands such navigations off to
+        // DownloadManager when a DownloadListener is actually registered, otherwise the tap
+        // visibly does nothing at all (confirmed live: this is exactly the reported bug).
+        webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            downloadFile(url, contentDisposition, mimeType)
+        }
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(
                 webView: WebView?,
@@ -347,10 +440,20 @@ class MainActivity : AppCompatActivity() {
                 }
                 // Any navigation to a host other than the configured Codexa server
                 // (e.g. a "View on BookOrbit" link) should open in the system browser
-                // instead of loading inside this app's WebView.
+                // instead of loading inside this app's WebView — UNLESS it's part of an
+                // auth flow, which legitimately hops through one or more external domains
+                // before landing back on our own server. Two different cases, see the two
+                // flags' own doc comments: oidcFlowActive (Codexa's own OIDC "Sign in" button)
+                // and hasLoadedOwnContent (a reverse-proxy auth gate — Authelia, Pangolin,
+                // Cloudflare Access — redirecting before Codexa itself ever loads at all).
                 val serverHost = getSavedUrl()?.let { Uri.parse(it).host }
                 val targetHost = request.url.host
                 if (serverHost != null && targetHost != null && !targetHost.equals(serverHost, ignoreCase = true)) {
+                    // Mid-flow: bouncing this to the system browser would let the login finish
+                    // there instead, stranding the resulting session in the system browser's
+                    // separate cookie/storage — the WebView never sees it, so login looks like
+                    // it silently does nothing. Stay in-WebView instead.
+                    if (oidcFlowActive || !hasLoadedOwnContent) return false
                     try {
                         startActivity(Intent(Intent.ACTION_VIEW, request.url))
                     } catch (e: Exception) {
@@ -359,7 +462,53 @@ class MainActivity : AppCompatActivity() {
                     }
                     return true
                 }
+                // Same host (or server URL not yet known). oidcFlowStarting() (JS bridge, called
+                // from login.js right before it navigates to /start) is the primary signal that
+                // an SSO flow is beginning — this URL-pattern check is a fallback/safety net for
+                // the same thing, and also what detects the flow has concluded: any same-host
+                // page other than our own oidc start/callback endpoint means it's over,
+                // successfully or not (/oidc-callback.html and /login.html?error=... after a
+                // failed attempt both land here).
+                oidcFlowActive = url.contains("/api/auth/oidc/")
+                // Same-host navigation: loadUrl(url, headers) only ever applies to the
+                // exact call it was passed to — it does not carry over to navigations the
+                // page itself triggers afterwards (e.g. window.location.href after login).
+                // Under zero-trust proxies using static service-token headers (Cloudflare
+                // Access, Pangolin), there's no session-cookie fallback, so every
+                // navigation genuinely needs the header re-attached. Safe against
+                // recursion: this callback only fires for renderer-initiated navigations,
+                // never for loadUrl() calls the app makes itself — the same asymmetry the
+                // mailto/tel and cross-host branches above already rely on.
+                val headers = getCustomHeaders()
+                if (headers.isNotEmpty()) {
+                    view.loadUrl(url, headers)
+                    return true
+                }
                 return false
+            }
+
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ): WebResourceResponse? {
+                // loadUrl(url, headers) and shouldOverrideUrlLoading's own re-attachment above
+                // both only ever apply headers to one explicit request — WebView does not
+                // resurrect them on any 3xx redirect the server sends back, even a same-host
+                // one (a real-world report confirmed this: headers worked on the very first
+                // request, then went missing on the redirect that followed, leaving a blank
+                // screen). shouldInterceptRequest is the only WebViewClient callback that sees
+                // every individual network request/redirect hop, so it's the only place this
+                // can actually be fixed. Scoped narrowly on purpose: only the top-level document
+                // GET to our own configured server, only when custom headers are configured —
+                // everything else (sub-resources, POST/PUT — which can't safely be re-issued
+                // here anyway since WebResourceRequest exposes no body — third-party hosts) is
+                // left to the WebView exactly as before.
+                if (!request.isForMainFrame || request.method != "GET") return null
+                val headers = getCustomHeaders()
+                if (headers.isEmpty()) return null
+                val serverHost = getSavedUrl()?.let { Uri.parse(it).host }
+                if (serverHost == null || !request.url.host.equals(serverHost, ignoreCase = true)) return null
+                return fetchFollowingRedirects(request.url.toString(), headers, serverHost)
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
@@ -368,10 +517,21 @@ class MainActivity : AppCompatActivity() {
                 // Exit immersive mode when navigating away from reader
                 val isReader = url.contains("/reader.html", ignoreCase = true)
                 runOnUiThread { setImmersiveMode(isReader) }
+                // Fallback for WebView builds that don't support addDocumentStartJavaScript
+                // (see injectCustomHeadersScript()'s doc comment for why this ordering is
+                // safe for this app specifically, unlike as a general-purpose mechanism).
+                pendingHeaderScript?.let { view.evaluateJavascript(it, null) }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                // Any page that finishes loading on our own host is proof we're past whatever
+                // reverse-proxy auth gate (if any) sits in front of it — see hasLoadedOwnContent.
+                val finishedHost = Uri.parse(url).host
+                val serverHost = getSavedUrl()?.let { Uri.parse(it).host }
+                if (finishedHost != null && serverHost != null && finishedHost.equals(serverHost, ignoreCase = true)) {
+                    hasLoadedOwnContent = true
+                }
                 val isReader = url.contains("/reader.html", ignoreCase = true)
                 runOnUiThread {
                     setImmersiveMode(isReader)
@@ -394,7 +554,14 @@ class MainActivity : AppCompatActivity() {
                                     null
                                 )
                             }
-                            val nav = rootInsets.getInsets(WindowInsetsCompat.Type.navigationBars())
+                            // getInsetsIgnoringVisibility, not getInsets: setImmersiveMode(false) above
+                            // only *requests* the nav bar be shown, and that's asynchronous — read
+                            // via getInsets() right here it still reports 0 (the bar was hidden a
+                            // moment ago, on the reader page or the previous load), so --sab never
+                            // got set and bottom-anchored library UI (OPDS/BookOrbit prev/next
+                            // pagination) ended up underneath the bar. This reports the bar's size
+                            // regardless of its current visibility.
+                            val nav = rootInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.navigationBars())
                             if (nav.bottom > 0) {
                                 val v = String.format(java.util.Locale.ROOT, "%.2f", nav.bottom / density)
                                 view.evaluateJavascript(
@@ -418,17 +585,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     // -------------------------------------------------------------------------
-    // Immersive mode (hide system navigation bar in reader)
+    // Immersive mode (hide system navigation bar everywhere; status bar in reader only)
     // -------------------------------------------------------------------------
 
+    // `enable` = true on reader pages, false everywhere else (library, BookOrbit, settings...)
+    // — see every call site below (onPageStarted/onPageFinished/onWindowFocusChanged all pass
+    // isOnReader()/isReader, and the JS bridge's setReaderMode() passes the reader's own flag).
     private fun setImmersiveMode(enable: Boolean) {
         val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        // Both bars now follow the same reader/non-reader split (confirmed live regression:
+        // hiding the nav bar unconditionally on every screen, library included, meant reaching
+        // Home required a swipe-up first — reported friction for users with 3-button nav who
+        // don't use it as an immersive-reading gesture the way reader-mode swipe-reveal is meant
+        // to). Only the reader itself needs both bars hidden; library/BookOrbit/etc. keep the nav
+        // bar visible like status bar already did.
         if (enable) {
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.hide(WindowInsetsCompat.Type.statusBars())
+            controller.hide(WindowInsetsCompat.Type.navigationBars())
         } else {
-            controller.show(WindowInsetsCompat.Type.systemBars())
+            controller.show(WindowInsetsCompat.Type.statusBars())
+            controller.show(WindowInsetsCompat.Type.navigationBars())
         }
     }
 
@@ -453,6 +631,186 @@ class MainActivity : AppCompatActivity() {
             .edit()
             .putString(PREF_URL, url)
             .apply()
+
+    // -------------------------------------------------------------------------
+    // File downloads (book-info dialog's "Download" link, OPDS/BookOrbit acquisition
+    // links, ...) — handed off to Android's own DownloadManager so it lands in the
+    // system Downloads folder with a normal completion notification, exactly like it
+    // would in a full browser. See setDownloadListener in configureWebView() for why
+    // this is needed at all.
+    // -------------------------------------------------------------------------
+
+    private fun downloadFile(url: String, contentDisposition: String?, mimeType: String?) {
+        try {
+            val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                // The download URL already carries its own auth (?token=... — see
+                // library.js's download link), but a zero-trust proxy in front of the whole
+                // server (Cloudflare Access, Pangolin) needs its headers here too, same as
+                // every other request this app makes — DownloadManager runs as a separate
+                // process/request, so it never inherits the WebView's own header injection.
+                for ((k, v) in getCustomHeaders()) addRequestHeader(k, v)
+                // Only set when non-blank — DownloadManager falls back to sniffing the response's
+                // own Content-Type when this is left unset, which is safer than risking whatever
+                // setMimeType(null) actually does (undocumented for that case).
+                if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                setTitle(filename)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+                // No WRITE_EXTERNAL_STORAGE permission needed for this on any supported API
+                // level: DownloadManager writes to the public Downloads dir itself, as its own
+                // system process — the long-standing exception to scoped storage/legacy
+                // permission rules that's specific to this API, unlike raw File I/O there.
+            }
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            Toast.makeText(this, getString(R.string.download_started, filename), Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.download_failed), Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Custom HTTP headers (Settings → Server select → Advanced) — for headless auth
+    // behind a zero-trust reverse proxy (Cloudflare Access, Pangolin, ...) in front of
+    // the configured Codexa server. See HeaderUtils for the parsing format.
+    // -------------------------------------------------------------------------
+
+    private fun getCustomHeaders(): Map<String, String> =
+        HeaderUtils.parse(
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(ServerSelectActivity.PREF_HEADERS, "") ?: ""
+        )
+
+    /**
+     * Manually resolves a GET request with the given headers attached, following any 3xx
+     * redirect chain ourselves — re-attaching the same headers to each hop — instead of handing
+     * it back to WebView's own redirect handling, which drops them (see shouldInterceptRequest
+     * above). Runs on shouldInterceptRequest's own background thread, so blocking I/O here is
+     * fine/expected. Stops and returns null (falling back to normal WebView loading) if a
+     * redirect ever leaves our own server's host — these headers are only ever meant for our
+     * own server, never a third party — or on any error, rather than risk a permanently blank
+     * WebView with no way to retry.
+     */
+    private fun fetchFollowingRedirects(
+        startUrl: String,
+        headers: Map<String, String>,
+        serverHost: String,
+        maxHops: Int = 10
+    ): WebResourceResponse? {
+        var currentUrl = startUrl
+        try {
+            repeat(maxHops) {
+                val conn = URL(currentUrl).openConnection() as HttpURLConnection
+                conn.instanceFollowRedirects = false
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                conn.requestMethod = "GET"
+                for ((k, v) in headers) conn.setRequestProperty(k, v)
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val location = conn.getHeaderField("Location")
+                    conn.disconnect()
+                    if (location.isNullOrEmpty()) return null
+                    val next = java.net.URI(currentUrl).resolve(location).toString()
+                    val nextHost = Uri.parse(next).host
+                    if (nextHost == null || !nextHost.equals(serverHost, ignoreCase = true)) return null
+                    currentUrl = next
+                    return@repeat
+                }
+                val contentType = conn.contentType ?: "text/html"
+                val mimeType = contentType.substringBefore(';').trim().ifEmpty { "text/html" }
+                val charset = if (contentType.contains("charset=", ignoreCase = true))
+                    contentType.substringAfter("charset=").trim() else "utf-8"
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                return WebResourceResponse(mimeType, charset, stream)
+            }
+        } catch (e: Exception) {
+            // Network error, malformed redirect, etc. — fall back to letting WebView try
+            // loading it normally rather than risk a permanently blank, unretriable WebView.
+        }
+        return null
+    }
+
+    // Handle to the currently-registered document-start script, so it can be replaced
+    // (not stacked) if the user edits the headers via ServerSelectActivity mid-session.
+    private var headerScriptHandler: ScriptHandler? = null
+
+    // Fallback injection path for WebView builds predating DOCUMENT_START_SCRIPT support,
+    // evaluated on every onPageStarted since each top-level navigation gets a fresh JS
+    // global context (the previous page's monkey-patched fetch/XHR don't carry over).
+    private var pendingHeaderScript: String? = null
+
+    private fun injectCustomHeadersScript() {
+        headerScriptHandler?.remove()
+        headerScriptHandler = null
+        pendingHeaderScript = null
+
+        val headers = getCustomHeaders()
+        if (headers.isEmpty()) return
+
+        val script = buildHeaderInjectionScript(headers)
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            // Runs before any page script, on every future navigation in this WebView —
+            // a hard guarantee, no race. This is what lets fetch()/XHR calls made by the
+            // very first script the page runs already carry the configured headers.
+            headerScriptHandler = WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
+        } else {
+            // No formal ordering guarantee against the page's own scripts in general — but
+            // every one of this app's own scripts is <script type="module">, which the spec
+            // defers until after the document is parsed, well after onPageStarted (fired at
+            // navigation-commit, before body parsing even begins) already ran. So this
+            // fallback is race-free for this app's specific script-loading strategy, even
+            // though it would not be safe as a general-purpose mechanism.
+            pendingHeaderScript = script
+        }
+    }
+
+    /**
+     * Monkey-patches window.fetch and XMLHttpRequest to attach the configured headers to
+     * every same-origin request the page's own JS makes. Deliberately origin-gated so a
+     * configured header (e.g. a Cloudflare Access secret) is never sent to a third-party
+     * host the page might also fetch from.
+     *
+     * Doesn't cover declarative subresource loads (<link>, <img>, fonts) or the initial
+     * top-level navigation — those are handled separately via loadUrl(url, headers) and
+     * shouldOverrideUrlLoading() above.
+     */
+    private fun buildHeaderInjectionScript(headers: Map<String, String>): String {
+        val json = HeaderUtils.toJsonLiteral(headers)
+        return """
+            (function(){
+              var EXTRA = $json;
+              function sameOrigin(u){ try { return new URL(u, location.href).origin === location.origin; } catch(e){ return false; } }
+              var origFetch = window.fetch;
+              if (origFetch) {
+                window.fetch = function(input, init){
+                  var url = (typeof input === 'string') ? input : (input && input.url);
+                  if (url && sameOrigin(url)) {
+                    var h = new Headers((init && init.headers) || (input && input.headers) || {});
+                    for (var k in EXTRA) { if (Object.prototype.hasOwnProperty.call(EXTRA, k)) h.set(k, EXTRA[k]); }
+                    init = Object.assign({}, init, { headers: h });
+                  }
+                  return origFetch.call(this, input, init);
+                };
+              }
+              var origOpen = XMLHttpRequest.prototype.open;
+              var origSend = XMLHttpRequest.prototype.send;
+              XMLHttpRequest.prototype.open = function(method, url){
+                this.__codexaUrl = url;
+                return origOpen.apply(this, arguments);
+              };
+              XMLHttpRequest.prototype.send = function(){
+                if (this.__codexaUrl && sameOrigin(this.__codexaUrl)) {
+                  for (var k in EXTRA) { if (Object.prototype.hasOwnProperty.call(EXTRA, k)) {
+                    try { this.setRequestHeader(k, EXTRA[k]); } catch(e){}
+                  }}
+                }
+                return origSend.apply(this, arguments);
+              };
+            })();
+        """.trimIndent()
+    }
 
     companion object {
         private const val PREFS_NAME = "codexa_prefs"

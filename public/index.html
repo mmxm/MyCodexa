@@ -187,7 +187,7 @@
         <button id="edit-assign-btn" class="btn btn-secondary btn-sm" disabled data-i18n="library.btn_assign">Dodeli polici</button>
         <button id="edit-remove-btn" class="btn btn-secondary btn-sm hidden" disabled data-i18n="library.btn_remove">Odstrani iz police</button>
         <button id="edit-delete-btn" class="btn btn-danger btn-sm" disabled data-i18n="library.btn_delete">Izbriši</button>
-        <button id="edit-reextract-btn" class="btn btn-secondary btn-sm hidden" data-i18n="library.btn_reextract">&#x21BA; Osveži metapodatke</button>
+        <button id="edit-reextract-btn" class="btn btn-secondary btn-sm hidden" disabled data-i18n="library.btn_reextract">&#x21BA; Osveži metapodatke</button>
       </div>
 
       <!-- Series filter chip -->
@@ -204,11 +204,8 @@
           <p style="margin-bottom:.5rem" data-i18n="library.drop_hint1">Povlecite EPUB datoteke sem</p>
           <p style="font-size:.85rem" data-i18n="library.drop_hint2">ali kliknite za izbiro</p>
         </label>
-        <input type="file" id="file-input" accept=".epub,.cbz,.cbr" multiple />
+        <input type="file" id="file-input" accept=".epub,.kepub,.cbz,.cbr,.pdf" multiple />
       </div>
-
-      <!-- Upload progress -->
-      <div id="upload-status" class="hidden" style="margin-bottom:1rem"></div>
 
       <!-- Book grid -->
       <div id="book-grid" class="book-grid"></div>
@@ -251,6 +248,41 @@
 
         <hr class="section-divider" style="margin-top:1.25rem">
 
+        <div style="font-size:.875rem;font-weight:600;margin-bottom:.25rem" data-i18n="settings.progress_thresholds_title">Auto-status thresholds</div>
+        <div class="settings-hint" style="margin-bottom:.75rem" data-i18n="settings.progress_thresholds_hint">Controls when a book's status automatically switches, based on your reading progress in it.</div>
+        <div class="form-group">
+          <label for="reading-start-pct" data-i18n="settings.progress_start_label">Mark as "Reading" at</label>
+          <div class="settings-pct-input">
+            <input type="number" id="reading-start-pct" min="0" max="100" step="1" />
+            <span>%</span>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="reading-finish-pct" data-i18n="settings.progress_finish_label">Mark as "Read" at</label>
+          <div class="settings-pct-input">
+            <input type="number" id="reading-finish-pct" min="0" max="100" step="1" />
+            <span>%</span>
+          </div>
+        </div>
+        <div class="setting-toggle-hint" style="margin-bottom:.75rem" data-i18n="settings.progress_thresholds_footnote">Progress is weighted by content, not raw page count, so books with a lot of back matter (acknowledgments, author's notes, previews) may reach a high percentage before the story itself ends — lower the finish threshold if a book gets marked "Read" too early.</div>
+        <div class="card-actions">
+          <button id="btn-save-progress-thresholds" class="btn btn-primary btn-sm" data-i18n="settings.progress_thresholds_save_btn">Save thresholds</button>
+        </div>
+
+        <hr class="section-divider" style="margin-top:1.25rem">
+
+        <div style="font-size:.875rem;font-weight:600;margin-bottom:.75rem" data-i18n="settings.email_title">E-pošta</div>
+        <div class="form-group">
+          <label for="account-email" data-i18n="settings.email_label">E-poštni naslov</label>
+          <input type="email" id="account-email" autocomplete="email" placeholder="ime@primer.com" />
+        </div>
+        <div class="setting-toggle-hint" style="margin-bottom:.75rem" data-i18n="settings.email_hint">Neobvezno. Omogoča prijavo z e-pošto in samodejno povezavo z OIDC prijavo (Google, Apple, samostojni ponudnik), če se e-pošta ujema.</div>
+        <div class="card-actions">
+          <button id="btn-save-email" class="btn btn-primary btn-sm" data-i18n="settings.email_save_btn">Shrani e-pošto</button>
+        </div>
+
+        <hr class="section-divider" style="margin-top:1.25rem">
+
         <div style="font-size:.875rem;font-weight:600;margin-bottom:.75rem" data-i18n="settings.change_pw_title">Sprememba gesla</div>
         <div class="form-group">
           <label for="pw-new" data-i18n="settings.change_pw_new">Novo geslo</label>
@@ -272,6 +304,16 @@
         <h2 data-i18n="settings.kosync_title">Sinhronizacija KOReader</h2>
         <div class="kosync-info-box" data-i18n-html="settings.kosync_info_html"></div>
         <div id="kosync-status" class="kosync-status"></div>
+        <div style="display:flex;align-items:flex-start;gap:.85rem;margin-bottom:1rem">
+          <label class="toggle" style="flex-shrink:0;margin-top:.15rem">
+            <input type="checkbox" id="kosync-external-enabled" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <div>
+            <div style="font-size:.875rem;font-weight:600;margin-bottom:.2rem" data-i18n="settings.external_enabled_title">Omogočena sinhronizacija</div>
+            <div class="settings-hint" style="margin:0" data-i18n="settings.external_enabled_hint">Izklopite za začasno ustavitev sinhronizacije s tem strežnikom, ne da bi izbrisali shranjeni URL in poverilnice.</div>
+          </div>
+        </div>
         <div class="form-group">
           <label for="kosync-url" data-i18n="settings.kosync_url_label">URL kosync strežnika</label>
           <input type="url" id="kosync-url" data-i18n-placeholder="settings.kosync_url_ph" placeholder="https://grimmory.domena.si" autocomplete="off" />
@@ -409,6 +451,22 @@
         <div class="card-actions" style="margin-top:.5rem">
           <button id="btn-save-reg" class="btn btn-primary btn-sm" data-i18n="common.save">Shrani</button>
         </div>
+        <hr class="section-divider">
+        <div style="font-size:.875rem;font-weight:600;margin-bottom:.25rem" data-i18n="settings.admin_invite_title">Invite a user</div>
+        <div class="settings-hint" style="margin-bottom:.6rem" data-i18n="settings.admin_invite_hint">Create a single-use link for an email address. It expires after seven days.</div>
+        <div class="form-group" style="margin-bottom:.5rem">
+          <label for="admin-invite-email" data-i18n="settings.admin_invite_email">Email address</label>
+          <input type="email" id="admin-invite-email" autocomplete="email" />
+        </div>
+        <div class="card-actions">
+          <button id="btn-create-invite" class="btn btn-secondary btn-sm" data-i18n="settings.admin_invite_create">Create invitation link</button>
+        </div>
+        <div id="admin-invite-result" hidden style="margin-top:.75rem">
+          <label for="admin-invite-link" data-i18n="settings.admin_invite_link">Send this link</label>
+          <input type="text" id="admin-invite-link" readonly />
+        </div>
+        <div style="font-size:.8rem;font-weight:600;margin-top:.85rem;margin-bottom:.5rem" data-i18n="settings.admin_invite_pending_title">Pending invitations</div>
+        <div id="admin-invitations-list"></div>
         <hr class="section-divider">
         <div style="font-size:.875rem;font-weight:600;margin-bottom:.75rem" data-i18n="settings.admin_users_title">Upravljanje uporabnikov</div>
         <div id="admin-users-list"></div>
@@ -569,6 +627,29 @@
           <div id="bookorbit-pagination" hidden></div>
         </div>
 
+      </div>
+    </div>
+
+    <div id="panel-bookorbit-dash" class="app-panel app-main" hidden>
+      <div class="bookorbit-dash-wrap">
+        <h2 class="bookorbit-dash-title" data-i18n="bookorbit_dash.title">BookOrbit Dash</h2>
+        <div class="bod-tabs" role="tablist">
+          <button type="button" class="bod-tab active" role="tab" data-dtab="overview" data-i18n="bookorbit_dash.tab_overview">Overview</button>
+          <button type="button" class="bod-tab" role="tab" data-dtab="activity" data-i18n="bookorbit_dash.tab_activity">Activity</button>
+        </div>
+        <div id="bod-pane-overview">
+          <div id="bookorbit-dash-loading">
+            <span class="spinner"></span>
+            <span style="display:block;margin-top:.5rem;font-size:.85rem" data-i18n="opds.loading">Nalagam…</span>
+          </div>
+          <div id="bookorbit-dash-error" class="alert alert-error" hidden></div>
+          <div id="bookorbit-dash-content" hidden>
+            <div class="stats-summary-grid" id="bookorbit-dash-cards"></div>
+            <div class="bookorbit-dash-section" id="bookorbit-dash-reading"></div>
+            <div class="bookorbit-dash-section" id="bookorbit-dash-highlight"></div>
+          </div>
+        </div>
+        <div id="bod-pane-activity" hidden></div>
       </div>
     </div>
 

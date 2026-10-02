@@ -1,18 +1,20 @@
 // Codexa Service Worker
 // Caches app shell for offline use. EPUBs are cached on demand in BOOKS_CACHE.
 
-const CACHE_VERSION = 'br-v20260717002';
+const CACHE_VERSION = 'br-v20260926002';
 const BOOKS_CACHE   = 'codexa-books-v2';
 const APP_SHELL = [
   '/',
   '/index.html',
   '/login.html',
+  '/oidc-callback.html',
   '/reader.html',
   '/settings.html',
   '/opds.html',
   '/css/main.css',
   '/css/reader.css',
   '/js/app.js',
+  '/js/logger.js',
   '/js/login.js',
   '/js/router.js',
   '/js/settings.js',
@@ -21,12 +23,31 @@ const APP_SHELL = [
   '/js/api.js',
   '/js/ui.js',
   '/js/library.js',
+  '/js/pdf-cover.js',
   '/js/sidebar.js',
   '/js/i18n.js',
   '/js/opds.js',
   '/js/bookorbit.js',
+  '/js/bookorbitSessions.js',
+  '/js/bookorbitDash.js',
+  '/js/bookorbitActivity.js',
   '/js/reader.js',
+  '/js/comic-viewer.js',
+  '/js/img-bg-fix.js',
+  // Dynamically imported by reader.js (await import('./cxreader/index.js')) when opening a
+  // book. Inlined already when serving the bundled dist/js/reader.js, but reader.js is loaded
+  // unbundled straight from here when dist/ isn't in use — must be precached for that path too.
+  '/js/cxreader/index.js',
+  '/js/cxreader/epub-parser.js',
+  '/js/cxreader/renderer.js',
+  '/js/cxreader/column-paginator.js',
+  '/js/cxreader/fixed-paginator.js',
+  '/js/cxreader/cbz-parser.js',
+  '/js/cxreader/pdf-parser.js',
+  '/js/cxreader/scroll-paginator.js',
   '/js/vendor/jszip.min.js',
+  '/js/vendor/pdf.min.mjs',
+  '/js/vendor/pdf.worker.min.mjs',
   '/locales/en.json',
   '/locales/de.json',
   '/locales/es.json',
@@ -34,6 +55,7 @@ const APP_SHELL = [
   '/locales/it.json',
   '/locales/pt.json',
   '/locales/sl.json',
+  '/locales/zh-CN.json',
   '/images/codexa.svg',
   '/images/codexa_bw.svg',
   '/images/all_library.svg',
@@ -140,10 +162,21 @@ const APP_SHELL = [
   '/images/density_normal_bw.svg',
   '/images/density_large.svg',
   '/images/density_large_bw.svg',
+  '/images/appearance.svg',
+  '/images/appearance_bw.svg',
+  '/images/display_size.svg',
+  '/images/display_size_bw.svg',
+  '/images/bookorbit.svg',
+  '/images/bookorbit_bw.svg',
+  '/images/add_to_codexa.svg',
+  '/images/collections.svg',
+  '/images/github.svg',
   '/icons/android-chrome-192x192.png',
   '/icons/android-chrome-512x512.png',
   '/icons/apple-touch-icon.png',
   '/icons/favicon-32x32.png',
+  '/icons/favicon-16x16.png',
+  '/icons/favicon.ico',
   '/manifest.json',
 ];
 
@@ -176,9 +209,18 @@ self.addEventListener('fetch', (e) => {
   if (__DEBUG && !_swVersionLogged) { _swVersionLogged = true; console.log('[sw] fetch version:', CACHE_VERSION); }
   const url = new URL(e.request.url);
 
-  // Intercept EPUB file requests — serve from books cache when available
+  // Intercept EPUB file requests — serve from books cache when available. NOT for
+  // ?download=1 (the "Save to device" link in the card menu / book-info dialog) — that
+  // request needs the network's own response regardless of any offline copy: the offline
+  // cache is filled by a bare fetch with no query string (see handleCacheBook below), so
+  // its stored Response never carries the Content-Disposition header the server only adds
+  // for ?download=1, and this same pathname-only match used to catch that request too —
+  // silently swapping in the header-less cached copy, which is why a book downloaded for
+  // offline reading saved to disk as a generic "file.epub" instead of the real name
+  // (confirmed live: reproducible only for a book already cached offline, which is exactly
+  // why it "worked" for one tester and not another testing with a different book).
   const fileMatch = url.pathname.match(/^\/api\/books\/(\d+)\/file$/);
-  if (fileMatch && url.hostname === self.location.hostname) {
+  if (fileMatch && url.hostname === self.location.hostname && url.searchParams.get('download') !== '1') {
     const bookId = parseInt(fileMatch[1], 10);
     e.respondWith(
       caches.open(BOOKS_CACHE).then(c =>
@@ -188,12 +230,29 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // Intercept cover requests — serve from books cache when available
+  // Intercept cover requests — serve from books cache when available, and on a cache miss,
+  // write the network response through into the cache before returning it. This is what makes
+  // a PDF's cover (generated client-side well after the book was imported/downloaded — see
+  // reader.js's _backfillPdfCover, unlike EPUB/CBZ whose cover is extracted synchronously at
+  // import time) end up cached for offline use: downloadBook()'s CACHE_BOOK message below only
+  // snapshots whatever cover_path exists at the moment "download for offline" was clicked, with
+  // no way to notice a cover that's set later — but the very next time the library grid (or
+  // anything else) loads that cover's <img> while online, this write-through catches it.
+  // Confirmed live: a PDF downloaded for offline before its cover existed showed no cover at
+  // all when reopened offline, even though cover_path was already correctly set server-side.
   if (url.pathname.startsWith('/covers/') && url.hostname === self.location.hostname) {
     e.respondWith(
-      caches.open(BOOKS_CACHE).then(c =>
-        c.match(e.request).then(cached => cached || fetch(e.request).catch(() => Response.error()))
-      )
+      caches.open(BOOKS_CACHE).then(async c => {
+        const cached = await c.match(e.request);
+        if (cached) return cached;
+        try {
+          const res = await fetch(e.request);
+          if (res.ok) c.put(e.request, res.clone());
+          return res;
+        } catch {
+          return Response.error();
+        }
+      })
     );
     return;
   }
@@ -208,8 +267,11 @@ self.addEventListener('fetch', (e) => {
         if (response.ok) {
           const clone = response.clone();
           caches.open(BOOKS_CACHE).then(c => c.put(e.request, clone));
+          return response;
         }
-        return response;
+        // Non-ok (e.g. a proxy's own error page when the origin server is down) is a
+        // resolved fetch(), not a rejection — fall back to cache same as a real failure.
+        return caches.open(BOOKS_CACHE).then(c => c.match(e.request)).then(r => r || response);
       }).catch(() => caches.open(BOOKS_CACHE).then(c => c.match(e.request)).then(r => r || Response.error()))
     );
     return;
@@ -250,8 +312,17 @@ self.addEventListener('fetch', (e) => {
         if (response.ok && e.request.method === 'GET') {
           const clone = response.clone();
           caches.open(CACHE_VERSION).then(cache => cache.put(e.request, clone));
+          return response;
         }
-        return response;
+        // A non-ok response is still a *successful* fetch() as far as the browser is
+        // concerned — it does NOT reject, so the .catch() below never runs. Confirmed live:
+        // when the whole physical server (not just the app) is down, Cloudflare answers
+        // navigations itself with a real HTTP response (a 521/522/523 "origin unreachable"
+        // page) instead of the connection failing outright. Passing that straight through
+        // showed Cloudflare's own error page instead of the fully offline-capable, already
+        // cached app shell sitting right there unused. Treat it the same as a network
+        // failure and fall back to cache.
+        return cached || response;
       }).catch(() => cached || Response.error());
       return cached || networkFetch;
     })
@@ -310,9 +381,18 @@ async function handleCacheBook(e) {
     const booksCache = await caches.open(BOOKS_CACHE);
     await booksCache.put(
       `/offline/books/${bookId}/epub`,
+      // The cache KEY stays the generic "/epub" suffix regardless of actual format (same
+      // historical, format-agnostic convention as the 'epub' multer field name / IndexedDB
+      // downloadStatus — this already works for CBZ today) — but the stored Content-TYPE should
+      // reflect the real format, forwarded from the network response (already correct per-format
+      // there, see books.js's GET /:id/file) rather than hardcoded, so anything that later reads
+      // it back via .headers instead of raw bytes sees the right value. Reading code itself
+      // (fetchOfflineBookFile → .arrayBuffer()) doesn't care either way — content-sniffed by
+      // CXReader.open(), not by this header — so this was a latent inconsistency, not a bug that
+      // actually broke offline PDF/CBZ reading, but worth being correct about while auditing this.
       new Response(buf.buffer, {
         headers: {
-          'Content-Type':   'application/epub+zip',
+          'Content-Type':   res.headers.get('content-type') || 'application/epub+zip',
           'Content-Length': String(loaded),
         },
       })

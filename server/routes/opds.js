@@ -4,6 +4,7 @@
 
 const express    = require('express');
 const jwt        = require('jsonwebtoken');
+const crypto     = require('crypto');
 const { XMLParser } = require('fast-xml-parser');
 const { getDb }             = require('../db');
 const { authenticateToken } = require('../middleware/auth');
@@ -24,9 +25,11 @@ router.get('/cover', (req, res) => {
 
   const servers = getServers(user.id);
   const server  = getServerById(servers, req.query.server);
-  const headers = server ? buildAuthHeaders(server.username, server.password) : {};
+  const fetchPromise = server
+    ? opdsFetch(server, coverUrl, { signal: AbortSignal.timeout(8000) })
+    : fetch(coverUrl, { signal: AbortSignal.timeout(8000) });
 
-  fetch(coverUrl, { headers, signal: AbortSignal.timeout(8000) })
+  fetchPromise
     .then(async r => {
       if (!r.ok) return res.status(404).end();
       const ct = r.headers.get('content-type') || '';
@@ -106,6 +109,7 @@ router.get('/sync-sse', async (req, res) => {
     const { DATA_DIR }                                                           = require('../db');
     const { computeFileHash, computeFileMd5, extractEpubMetadata, extractCbzMetadata } = require('../utils/epub');
     const { isCbrBuffer, convertCbrToCbz }                                      = require('../utils/cbr');
+    const { isPdfBuffer, extractPdfMetadata }                                   = require('../utils/pdf');
     const db         = getDb();
     const TMP_DIR    = path.join(DATA_DIR, 'tmp');
     const BOOKS_DIR  = path.join(DATA_DIR, 'books');
@@ -140,7 +144,6 @@ router.get('/sync-sse', async (req, res) => {
     db.prepare('UPDATE shelves SET opds_server_id = ?, opds_folder_url = ?, last_synced_at = ? WHERE id = ?')
       .run(parseInt(serverId, 10), folderUrl || null, Math.floor(Date.now() / 1000), shelf.id);
 
-    const headers = buildAuthHeaders(server.username, server.password);
     let added = 0, skipped = 0, refreshed = 0, errors = 0;
     const syncedBookIds = new Set(); // track all book IDs touched by this sync
     // All acquisition URLs present in the feed (full list, not the limited slice) — used for stale detection fallback
@@ -162,13 +165,15 @@ router.get('/sync-sse', async (req, res) => {
           }
         }
 
-        const r = await fetch(entry.acqHref, { headers, signal: AbortSignal.timeout(60000) });
+        const r = await opdsFetch(server, entry.acqHref, { signal: AbortSignal.timeout(60000) });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         let buf = Buffer.from(await r.arrayBuffer());
         if (buf.length < 100) throw new Error('error.file_empty');
 
         let format = 'epub';
-        if (isCbrBuffer(buf)) {
+        if (isPdfBuffer(buf)) {
+          format = 'pdf';
+        } else if (isCbrBuffer(buf)) {
           console.log('[opds/sse] converting CBR → CBZ:', entry.title);
           buf = await convertCbrToCbz(buf);
           format = 'cbz';
@@ -189,10 +194,15 @@ router.get('/sync-sse', async (req, res) => {
                 const destPath = path.join(userDir, existingBook.filename || (existingBook.file_hash + '.epub'));
                 try { fs.renameSync(tmpPath, destPath); }
                 catch { fs.copyFileSync(tmpPath, destPath); fs.unlinkSync(tmpPath); }
+                const isPdfExisting = format === 'pdf' || existingBook.format === 'pdf' || existingBook.filename?.endsWith('.pdf');
                 const isCbzExisting = existingBook.format === 'cbz' || existingBook.filename?.endsWith('.cbz');
-                const meta = isCbzExisting
+                const meta = isPdfExisting ? await extractPdfMetadata(destPath, COVERS_DIR, existingBook.file_hash)
+                  : isCbzExisting
                   ? extractCbzMetadata(destPath, COVERS_DIR, existingBook.file_hash)
                   : extractEpubMetadata(destPath, COVERS_DIR, existingBook.file_hash);
+                if (!meta.cover_path && entry.cover) {
+                  meta.cover_path = await fetchCoverToFile(resolveUrl(entry.cover, targetUrl), server, COVERS_DIR, existingBook.file_hash);
+                }
                 db.prepare(`UPDATE books SET
                   file_hash_md5 = ?, kosync_hash = '',
                   cover_path  = ?,
@@ -223,14 +233,18 @@ router.get('/sync-sse', async (req, res) => {
 
           let book = db.prepare('SELECT id FROM books WHERE user_id = ? AND file_hash = ?').get(user.id, fileHash);
           if (!book) {
-            const ext      = format === 'cbz' ? '.cbz' : '.epub';
+            const ext      = format === 'pdf' ? '.pdf' : format === 'cbz' ? '.cbz' : '.epub';
             const filename = `${fileHash}${ext}`;
             const destPath = path.join(userDir, filename);
             try { fs.renameSync(tmpPath, destPath); }
             catch { fs.copyFileSync(tmpPath, destPath); fs.unlinkSync(tmpPath); }
-            const meta = format === 'cbz'
+            const meta = format === 'pdf' ? await extractPdfMetadata(destPath, COVERS_DIR, fileHash)
+              : format === 'cbz'
               ? extractCbzMetadata(destPath, COVERS_DIR, fileHash)
               : extractEpubMetadata(destPath, COVERS_DIR, fileHash);
+            if (!meta.cover_path && entry.cover) {
+              meta.cover_path = await fetchCoverToFile(resolveUrl(entry.cover, targetUrl), server, COVERS_DIR, fileHash);
+            }
             const bookTitle  = meta.title  || entry.title  || 'Unknown';
             const bookAuthor = meta.author || entry.author || '';
             const fileSize   = fs.statSync(destPath).size;
@@ -267,7 +281,9 @@ router.get('/sync-sse', async (req, res) => {
     // Detect stale books: in shelf before sync but NOT touched by this sync.
     // Skipped for silent (background) syncs — only shown on manual sync.
     const staleBooks = [];
+    let autoRemoved = 0;
     if (!silent && preExistingBookIds.size > 0) {
+      const unlinkFromShelf = db.prepare('DELETE FROM book_shelves WHERE shelf_id = ? AND book_id = ?');
       for (const bookId of preExistingBookIds) {
         if (syncedBookIds.has(bookId)) continue;
         // Fallback: check if any known acq_href for this book is in the current feed
@@ -275,16 +291,24 @@ router.get('/sync-sse', async (req, res) => {
         const appearsInFeed = sources.some(s => feedAcqHrefs.has(s.acq_href));
         if (appearsInFeed) continue;
         const b = db.prepare('SELECT id, title, author FROM books WHERE id = ?').get(bookId);
-        if (b) {
-          const { cnt: otherShelfCount } = db.prepare(
-            'SELECT COUNT(*) AS cnt FROM book_shelves WHERE book_id = ? AND shelf_id != ?'
-          ).get(bookId, shelf.id) || { cnt: 0 };
-          staleBooks.push({ ...b, otherShelfCount });
+        if (!b) continue;
+        const { cnt: otherShelfCount } = db.prepare(
+          'SELECT COUNT(*) AS cnt FROM book_shelves WHERE book_id = ? AND shelf_id != ?'
+        ).get(bookId, shelf.id) || { cnt: 0 };
+        if (otherShelfCount > 0) {
+          // Still present on at least one other shelf — unlinking from just THIS shelf is always
+          // safe (nothing is lost), so do it automatically instead of making the user click
+          // through a "Delete" dialog for a book they may still be actively reading elsewhere.
+          // See the identical fix + rationale in server/routes/bookorbit.js's own sync-sse.
+          unlinkFromShelf.run(shelf.id, bookId);
+          autoRemoved++;
+          continue;
         }
+        staleBooks.push({ ...b, otherShelfCount });
       }
     }
 
-    done({ type: 'done', added, skipped, refreshed, errors, shelfId: shelf.id, staleBooks });
+    done({ type: 'done', added, skipped, refreshed, errors, shelfId: shelf.id, staleBooks, autoRemoved });
   } catch (err) {
     console.error('[opds] sync-sse error:', err.message);
     done({ type: 'error', message: err.message });
@@ -300,13 +324,141 @@ function getServers(userId) {
   try { return JSON.parse(row?.opds_servers || '[]'); } catch { return []; }
 }
 
-function buildAuthHeaders(username, password) {
-  const headers = { 'Accept': 'application/atom+xml, application/xml, application/json, */*' };
-  if (username) {
-    const creds = Buffer.from(`${username}:${password || ''}`).toString('base64');
-    headers['Authorization'] = `Basic ${creds}`;
+// ── HTTP Digest authentication (RFC 2617) ──────────────────────────────────────
+// Calibre's content server defaults to Digest auth for its OPDS catalog — reported as a
+// plain "error 400" trying to browse one here, and reproduced against a local mock server:
+// sending it Basic outright doesn't get a clean 401 back, just a 400 with no
+// WWW-Authenticate at all (Calibre's digest-auth middleware chokes trying to parse a Basic
+// header as digest fields — see the fallback probe in opdsFetch() below for how that's
+// handled). Every other OPDS server this app supports uses Basic (or no auth), so
+// opdsFetch() always tries Basic first — zero extra round-trips for the common case — and
+// only computes+retries with Digest once a server actually needs it. The resulting digest
+// context (realm/nonce/qop/opaque) is cached per server so a whole OPDS sync (which can mean
+// dozens of file downloads) only pays that discovery round-trip once, not once per request.
+const _digestCache = new Map(); // "<url>::<username>" -> { realm, nonce, qop, opaque, algorithm, nc }
+
+// Keyed on url+username rather than a stable server id: opds_servers has no such id (the
+// "id" exposed over the API is just its array index, which shifts on delete/reorder) — url+
+// username is good enough for a cache whose only job is avoiding a redundant round trip, not
+// anything security-sensitive (the actual credentials always come from the server object
+// itself, never from this cache).
+function _digestCacheKey(server) {
+  return `${server.url}::${server.username || ''}`;
+}
+
+function _md5(s) { return crypto.createHash('md5').update(s, 'utf8').digest('hex'); }
+
+// Parses a `WWW-Authenticate: Digest realm="...", nonce="...", qop="auth", ...` header into
+// { realm, nonce, qop, opaque, algorithm }. Returns null for anything else (e.g. `Basic ...`,
+// or no header at all) — that's a genuine auth failure, not a scheme this app can retry with.
+function _parseDigestChallenge(wwwAuth) {
+  if (!wwwAuth || !/^Digest\s/i.test(wwwAuth)) return null;
+  const out = {};
+  const re = /(\w+)=(?:"([^"]*)"|([^,\s]+))/g;
+  let m;
+  while ((m = re.exec(wwwAuth))) out[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  return (out.realm && out.nonce) ? out : null;
+}
+
+// Builds the `Authorization: Digest ...` header for one request. The response hash depends
+// on the method+URI, so this must be recomputed per request even when reusing a cached
+// nonce — only nc (the nonce's use count) and a fresh cnonce need to change between calls
+// that share one nonce.
+function _digestHeader(server, method, urlObj, challenge, nc) {
+  const uri = urlObj.pathname + urlObj.search;
+  const ha1 = _md5(`${server.username}:${challenge.realm}:${server.password || ''}`);
+  const ha2 = _md5(`${method}:${uri}`);
+  const qop = challenge.qop ? challenge.qop.split(',')[0].trim() : null;
+  const cnonce = crypto.randomBytes(8).toString('hex');
+  const ncStr  = String(nc).padStart(8, '0');
+  const response = qop
+    ? _md5(`${ha1}:${challenge.nonce}:${ncStr}:${cnonce}:${qop}:${ha2}`)
+    : _md5(`${ha1}:${challenge.nonce}:${ha2}`);
+  const parts = [
+    `username="${server.username}"`, `realm="${challenge.realm}"`, `nonce="${challenge.nonce}"`,
+    `uri="${uri}"`, `response="${response}"`,
+  ];
+  if (qop) parts.push(`qop=${qop}`, `nc=${ncStr}`, `cnonce="${cnonce}"`);
+  if (challenge.opaque)    parts.push(`opaque="${challenge.opaque}"`);
+  if (challenge.algorithm) parts.push(`algorithm=${challenge.algorithm}`);
+  return 'Digest ' + parts.join(', ');
+}
+
+// Drop-in replacement for fetch(url, options) against an OPDS server that transparently
+// upgrades to Digest auth when needed (see comment above) — every other option (method,
+// signal, body, ...) passes straight through. `server` needs { url, username, password }.
+async function opdsFetch(server, url, options = {}) {
+  const method = (options.method || 'GET').toUpperCase();
+  const key    = _digestCacheKey(server);
+  const cached = server.username ? _digestCache.get(key) : null;
+
+  const doFetch = (authHeader) => fetch(url, {
+    ...options,
+    headers: {
+      'Accept': 'application/atom+xml, application/xml, application/json, */*',
+      ...(options.headers || {}),
+      ...(authHeader ? { Authorization: authHeader } : {}),
+    },
+  });
+
+  if (cached) {
+    cached.nc += 1;
+    const res = await doFetch(_digestHeader(server, method, new URL(url), cached, cached.nc));
+    if (res.status !== 401) return res;
+    _digestCache.delete(key); // stale/rejected nonce — fall through and re-discover below
   }
-  return headers;
+
+  const basicHeader = server.username
+    ? `Basic ${Buffer.from(`${server.username}:${server.password || ''}`).toString('base64')}`
+    : null;
+  let res = await doFetch(basicHeader);
+  if (res.ok || !server.username) return res;
+
+  // An unrecognised Authorization scheme (Basic, on a digest-only endpoint) can get a bare
+  // 400 with no WWW-Authenticate at all — confirmed by reproducing the reported behaviour
+  // against a local mock digest server, matching this app's own report of a plain 400 from a
+  // real Calibre instance. The real challenge only comes back on a 401 to a genuinely
+  // *unauthenticated* request, so a non-401 failure, or a 401 whose WWW-Authenticate doesn't
+  // parse as Digest, gets one more attempt with no Authorization header before giving up —
+  // that's what actually surfaces the challenge.
+  let challenge = res.status === 401 ? _parseDigestChallenge(res.headers.get('www-authenticate')) : null;
+  if (!challenge) {
+    const probe = await doFetch(null);
+    challenge = _parseDigestChallenge(probe.headers.get('www-authenticate'));
+    if (!challenge) return res; // not a Digest server — return the original Basic attempt's response
+  }
+
+  const ctx = { ...challenge, nc: 1 };
+  _digestCache.set(key, ctx);
+  return doFetch(_digestHeader(server, method, new URL(url), ctx, ctx.nc));
+}
+
+// Fallback cover source for a freshly-downloaded book: used only when our own extraction
+// (extractEpubMetadata/extractCbzMetadata — and PDF, which never even attempts extraction, see
+// server/utils/pdf.js) came back with no cover_path. The OPDS server already serves a cover for
+// every catalog entry (that's what renders the browse-grid thumbnails via the /cover proxy
+// above), so this is strictly additive, not a replacement for extraction — an embedded cover is
+// still preferred when we can get one, since it's guaranteed to match the actual downloaded file.
+// Same content-type/size/timeout guards as the /cover proxy route, just persisted to disk
+// instead of streamed to the browser. Failure is always silent (return '') — a missing cover
+// here just falls back to the placeholder, same as any book with no cover_path.
+async function fetchCoverToFile(coverUrl, server, coversDir, fileHash) {
+  if (!coverUrl) return '';
+  try {
+    const r = await opdsFetch(server, coverUrl, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return '';
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.startsWith('image/') && !ct.startsWith('application/octet-stream') && ct !== '') return '';
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length < 100) return ''; // too small to be a real cover — likely an error page/pixel
+    const ext = ct.includes('png') ? '.png' : ct.includes('webp') ? '.webp' : '.jpg';
+    const filename = `${fileHash}${ext}`;
+    require('fs').writeFileSync(require('path').join(coversDir, filename), buf);
+    return filename;
+  } catch (err) {
+    console.warn('[opds] cover fallback fetch failed:', err.message);
+    return '';
+  }
 }
 
 function getServerById(servers, id) {
@@ -460,8 +612,7 @@ function normaliseOpds2Feed(data) {
 
 // ── Proxy fetch helper ────────────────────────────────────────────────────────
 async function fetchOpds(url, server) {
-  const headers = buildAuthHeaders(server.username, server.password);
-  const res     = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+  const res = await opdsFetch(server, url, { signal: AbortSignal.timeout(10000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ct   = res.headers.get('content-type') || '';
   const buf  = await res.arrayBuffer();
@@ -564,10 +715,7 @@ router.get('/health', async (req, res) => {
   const checkedAt = Date.now();
   const results = await Promise.all(servers.map(async (s, i) => {
     try {
-      const r = await fetch(s.url, {
-        headers: buildAuthHeaders(s.username, s.password),
-        signal:  AbortSignal.timeout(5000),
-      });
+      const r = await opdsFetch(s, s.url, { signal: AbortSignal.timeout(5000) });
       return [i, { reachable: r.ok, checkedAt }];
     } catch {
       return [i, { reachable: false, checkedAt }];
@@ -665,11 +813,9 @@ router.get('/search/:id', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'error.search_query_required' });
 
-  const headers = buildAuthHeaders(server.username, server.password);
-
   try {
     // Step 1: fetch root feed to find the search link
-    const rootRes    = await fetch(server.url, { headers, signal: AbortSignal.timeout(8000) });
+    const rootRes    = await opdsFetch(server, server.url, { signal: AbortSignal.timeout(8000) });
     const rootText   = await rootRes.text();
     const rootParsed = xmlParser.parse(rootText);
     const rootLinks  = rootParsed?.feed?.link || [];
@@ -685,7 +831,7 @@ router.get('/search/:id', async (req, res) => {
       if (searchType.includes('opensearchdescription') || searchHref.endsWith('.opds') || searchHref.endsWith('.xml')) {
         // It's an OpenSearch description document — fetch it to get the actual template
         try {
-          const osRes    = await fetch(searchHref, { headers, signal: AbortSignal.timeout(8000) });
+          const osRes    = await opdsFetch(server, searchHref, { signal: AbortSignal.timeout(8000) });
           const osText   = await osRes.text();
           const osParsed = xmlParser.parse(osText);
           // <Url type="application/atom+xml" template="..."/>
@@ -767,6 +913,7 @@ router.post('/sync', async (req, res) => {
     const { DATA_DIR }                                                           = require('../db');
     const { computeFileHash, computeFileMd5, extractEpubMetadata, extractCbzMetadata } = require('../utils/epub');
     const { isCbrBuffer, convertCbrToCbz }                                      = require('../utils/cbr');
+    const { isPdfBuffer, extractPdfMetadata }                                   = require('../utils/pdf');
     const db        = getDb();
     const TMP_DIR   = path.join(DATA_DIR, 'tmp');
     const BOOKS_DIR = path.join(DATA_DIR, 'books');
@@ -786,7 +933,6 @@ router.post('/sync', async (req, res) => {
       shelf = { id: r.lastInsertRowid };
     }
 
-    const headers = buildAuthHeaders(server.username, server.password);
     let added = 0, skipped = 0, errors = 0;
 
     for (const entry of bookEntries) {
@@ -801,13 +947,15 @@ router.post('/sync', async (req, res) => {
           }
         }
 
-        const r = await fetch(entry.acqHref, { headers, signal: AbortSignal.timeout(60000) });
+        const r = await opdsFetch(server, entry.acqHref, { signal: AbortSignal.timeout(60000) });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         let buf = Buffer.from(await r.arrayBuffer());
         if (buf.length < 100) throw new Error('error.file_empty');
 
         let format = 'epub';
-        if (isCbrBuffer(buf)) {
+        if (isPdfBuffer(buf)) {
+          format = 'pdf';
+        } else if (isCbrBuffer(buf)) {
           console.log('[opds/sync] converting CBR → CBZ:', entry.title);
           buf = await convertCbrToCbz(buf);
           format = 'cbz';
@@ -825,15 +973,19 @@ router.post('/sync', async (req, res) => {
           ).get(req.user.id, fileHash);
 
           if (!book) {
-            const ext      = format === 'cbz' ? '.cbz' : '.epub';
+            const ext      = format === 'pdf' ? '.pdf' : format === 'cbz' ? '.cbz' : '.epub';
             const filename = `${fileHash}${ext}`;
             const destPath = path.join(userDir, filename);
             try { fs.renameSync(tmpPath, destPath); }
             catch { fs.copyFileSync(tmpPath, destPath); fs.unlinkSync(tmpPath); }
 
-            const meta = format === 'cbz'
+            const meta = format === 'pdf' ? await extractPdfMetadata(destPath, COVERS_DIR, fileHash)
+              : format === 'cbz'
               ? extractCbzMetadata(destPath, COVERS_DIR, fileHash)
               : extractEpubMetadata(destPath, COVERS_DIR, fileHash);
+            if (!meta.cover_path && entry.cover) {
+              meta.cover_path = await fetchCoverToFile(resolveUrl(entry.cover, targetUrl), server, COVERS_DIR, fileHash);
+            }
             const bookTitle  = meta.title  || entry.title  || 'Unknown';
             const bookAuthor = meta.author || entry.author || '';
             const fileSize   = fs.statSync(destPath).size;
@@ -877,27 +1029,27 @@ router.post('/sync', async (req, res) => {
 });
 
 // ── POST /api/opds/download/:id — download epub to user library ───────────────
-// body: { href, title, author }
+// body: { href, title, author, cover }
 router.post('/download/:id', async (req, res) => {
   const servers = getServers(req.user.id);
   const server  = getServerById(servers, req.params.id);
   if (!server) return res.status(404).json({ error: 'error.server_not_found' });
 
-  const { href, title, author } = req.body || {};
+  const { href, title, author, cover } = req.body || {};
   if (!href) return res.status(400).json({ error: 'error.href_required' });
 
   const resolvedHref = resolveUrl(href, server.url);
 
   try {
-    const headers = buildAuthHeaders(server.username, server.password);
-    const r       = await fetch(resolvedHref, { headers, signal: AbortSignal.timeout(60000) });
+    const r = await opdsFetch(server, resolvedHref, { signal: AbortSignal.timeout(60000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
 
     const ct    = r.headers.get('content-type') || '';
     const ctLow = ct.toLowerCase();
     if (!ctLow.includes('epub') && !ctLow.includes('octet') &&
         !ctLow.includes('zip')  && !ctLow.includes('rar')   &&
-        !ctLow.includes('cbr')  && !ctLow.includes('cbz')) {
+        !ctLow.includes('cbr')  && !ctLow.includes('cbz')   &&
+        !ctLow.includes('pdf')) {
       console.warn('[opds] unexpected content-type:', ct);
       throw new Error('error.unexpected_content_type');
     }
@@ -907,6 +1059,7 @@ router.post('/download/:id', async (req, res) => {
     const { DATA_DIR }                                                      = require('../db');
     const { computeFileHash, computeFileMd5, extractEpubMetadata, extractCbzMetadata } = require('../utils/epub');
     const { isCbrBuffer, convertCbrToCbz }                                 = require('../utils/cbr');
+    const { isPdfBuffer, extractPdfMetadata }                              = require('../utils/pdf');
     const db       = getDb();
     const TMP_DIR  = path.join(DATA_DIR, 'tmp');
     const BOOKS_DIR = path.join(DATA_DIR, 'books');
@@ -918,7 +1071,9 @@ router.post('/download/:id', async (req, res) => {
     if (buf.length < 100) throw new Error('error.file_empty');
 
     let format = 'epub';
-    if (isCbrBuffer(buf)) {
+    if (isPdfBuffer(buf)) {
+      format = 'pdf';
+    } else if (isCbrBuffer(buf)) {
       console.log('[opds] converting CBR → CBZ...');
       buf = await convertCbrToCbz(buf);
       format = 'cbz';
@@ -945,15 +1100,19 @@ router.post('/download/:id', async (req, res) => {
         return res.status(409).json({ error: 'error.book_already_in_library', id: existing.id });
       }
 
-      const ext      = format === 'cbz' ? '.cbz' : '.epub';
+      const ext      = format === 'pdf' ? '.pdf' : format === 'cbz' ? '.cbz' : '.epub';
       const filename = `${fileHash}${ext}`;
       const destPath = path.join(userDir, filename);
       try { fs.renameSync(tmpPath, destPath); }
       catch { fs.copyFileSync(tmpPath, destPath); fs.unlinkSync(tmpPath); }
 
-      const meta = format === 'cbz'
+      const meta = format === 'pdf' ? await extractPdfMetadata(destPath, COVERS_DIR, fileHash)
+        : format === 'cbz'
         ? extractCbzMetadata(destPath, COVERS_DIR, fileHash)
         : extractEpubMetadata(destPath, COVERS_DIR, fileHash);
+      if (!meta.cover_path && cover) {
+        meta.cover_path = await fetchCoverToFile(resolveUrl(cover, server.url), server, COVERS_DIR, fileHash);
+      }
       const bookTitle  = meta.title  || title  || 'Unknown';
       const bookAuthor = meta.author || author || '';
       const fileSize   = fs.statSync(destPath).size;
@@ -995,14 +1154,14 @@ router.post('/download/:id', async (req, res) => {
 // client already has title/author from the browse/search entry it rendered.
 async function createOpdsPeek(userId, server, { href, title, author }) {
   const resolvedHref = resolveUrl(href, server.url);
-  const headers = buildAuthHeaders(server.username, server.password);
-  const r = await fetch(resolvedHref, { headers, signal: AbortSignal.timeout(60000) });
+  const r = await opdsFetch(server, resolvedHref, { signal: AbortSignal.timeout(60000) });
   if (!r.ok) return { ok: false, status: 502, error: `HTTP ${r.status}` };
 
   const ct = (r.headers.get('content-type') || '').toLowerCase();
   if (!ct.includes('epub') && !ct.includes('octet') &&
       !ct.includes('zip')  && !ct.includes('rar')   &&
-      !ct.includes('cbr')  && !ct.includes('cbz')) {
+      !ct.includes('cbr')  && !ct.includes('cbz')   &&
+      !ct.includes('pdf')) {
     return { ok: false, status: 502, error: 'error.unexpected_content_type' };
   }
 
@@ -1011,6 +1170,7 @@ async function createOpdsPeek(userId, server, { href, title, author }) {
   const { DATA_DIR }                      = require('../db');
   const { computeFileHash }               = require('../utils/epub');
   const { isCbrBuffer, convertCbrToCbz }  = require('../utils/cbr');
+  const { isPdfBuffer }                   = require('../utils/pdf');
   const { peekFilePath, PEEK_TTL_SECONDS } = require('../utils/peekCleanup');
   const db      = getDb();
   const TMP_DIR = path.join(DATA_DIR, 'tmp');
@@ -1020,7 +1180,9 @@ async function createOpdsPeek(userId, server, { href, title, author }) {
   if (buf.length < 100) return { ok: false, status: 502, error: 'error.file_empty' };
 
   let format = 'epub';
-  if (isCbrBuffer(buf)) {
+  if (isPdfBuffer(buf)) {
+    format = 'pdf';
+  } else if (isCbrBuffer(buf)) {
     buf = await convertCbrToCbz(buf);
     format = 'cbz';
   } else if (ct.includes('cbz') || ct.includes('comicbook+zip')) {
@@ -1048,7 +1210,7 @@ async function createOpdsPeek(userId, server, { href, title, author }) {
     // UNIQUE(user_id, file_hash) against a real book, even from a concurrent second peek of the
     // same book (each gets its own timestamp+random suffix). Mirrors createBookOrbitPeek exactly.
     const peekHash = `peek_opds_${Date.now()}_${userId}_${Math.random().toString(36).slice(2)}`;
-    const ext      = format === 'cbz' ? '.cbz' : '.epub';
+    const ext      = format === 'pdf' ? '.pdf' : format === 'cbz' ? '.cbz' : '.epub';
     const filename = `${peekHash}${ext}`;
     const destPath = peekFilePath(userId, filename);
     fs.mkdirSync(path.dirname(destPath), { recursive: true });

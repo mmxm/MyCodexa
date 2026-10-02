@@ -22,16 +22,23 @@
 const crypto = require('crypto');
 const { getDb } = require('../db');
 const { runWithUser } = require('../utils/logger');
+const { logCompletion } = require('../utils/completions');
 
 const TIMEOUT_MS = 15000;
+// Idle timeout for fetchAssetStream's book-file download only — a large comic/PDF can
+// legitimately take well over TIMEOUT_MS to fully transfer, so that fixed deadline (fine for
+// the quick metadata/API calls above) isn't reused there. This is reset on every chunk
+// received instead, so it only fires on a genuinely stalled connection, not a slow-but-steady
+// large download.
+const STREAM_IDLE_TIMEOUT_MS = 30000;
 const PACE_MS = 150;        // min spacing between API calls (be gentle on the throttler)
 const MAX_429_RETRIES = 4;  // back off and retry when rate-limited
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// BookOrbit web read-status vocabulary (packages/types ReadStatus); Codexa uses
-// a clean subset, sent verbatim. '' clears to 'unread'.
-const VALID_STATUS = ['want_to_read', 'reading', 'read', 'abandoned'];
+// BookOrbit web read-status vocabulary (packages/types ReadStatus) minus 'unread', which Codexa
+// models as the empty string; everything else is sent/adopted verbatim. '' clears to 'unread'.
+const VALID_STATUS = ['want_to_read', 'reading', 'rereading', 'on_hold', 'read', 'skimmed', 'abandoned'];
 
 // Codexa highlight styles -> BookOrbit annotation styles. Codexa only makes
 // color highlights, so everything maps to 'highlight'; foreign styles round-trip
@@ -158,11 +165,18 @@ async function login(userId, ctx) {
 async function refresh(userId, ctx) {
   const tok = tokens.get(userId);
   if (!tok?.refresh) return login(userId, ctx);
-  const res = await fetch(`${ctx.webBase}/auth/refresh`, {
-    method: 'POST',
-    headers: { cookie: `refresh_token=${encodeURIComponent(tok.refresh)}`, accept: 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
+  let res;
+  try {
+    res = await fetch(`${ctx.webBase}/auth/refresh`, {
+      method: 'POST',
+      headers: { cookie: `refresh_token=${encodeURIComponent(tok.refresh)}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch {
+    // Network failure (e.g. BookOrbit unreachable) — fall back to a fresh login attempt, which
+    // will itself fail cleanly (and record the real error) instead of throwing a raw fetch error.
+    return login(userId, ctx);
+  }
   if (!res.ok) return login(userId, ctx);
   const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
   const access = extractToken(setCookies, 'access_token') || tok.access;
@@ -172,7 +186,13 @@ async function refresh(userId, ctx) {
 
 // Authenticated request: paces calls, refreshes once on 401, backs off on 429.
 async function api(userId, ctx, method, path, body, state = { refreshed: false, throttled: 0 }) {
-  if (!tokens.has(userId)) await login(userId, ctx);
+  // login()/refresh() already record their own failure status; just make sure a rejection here
+  // can never escape as an unhandled promise rejection (login() throws on any network failure,
+  // e.g. DNS resolution — this used to crash the whole process on the very first BookOrbit call).
+  if (!tokens.has(userId)) {
+    try { await login(userId, ctx); }
+    catch (err) { return { ok: false, status: 0, error: err.message }; }
+  }
   const tok = tokens.get(userId);
   await sleep(PACE_MS);
   let res;
@@ -192,7 +212,8 @@ async function api(userId, ctx, method, path, body, state = { refreshed: false, 
     return { ok: false, status: 0, error: err.message };
   }
   if (res.status === 401 && !state.refreshed) {
-    await refresh(userId, ctx);
+    try { await refresh(userId, ctx); }
+    catch (err) { recordStatus(userId, false, err.message); return { ok: false, status: 0, error: err.message }; }
     return api(userId, ctx, method, path, body, { ...state, refreshed: true });
   }
   if (res.status === 429 && state.throttled < MAX_429_RETRIES) {
@@ -309,19 +330,31 @@ async function resolveBooks(db, userId, ctx, opts) {
     : db.prepare("SELECT id, file_hash_md5 FROM books WHERE user_id = ?").all(userId);
 
   const resolved = [];
-  const needHash = []; // { bookId, hash }
+  const needHash = []; // { bookId, hash, fallback: {boBookId, boFileId} | null }
   for (const b of candidates) {
     const st = db.prepare('SELECT bo_book_id, bo_file_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(userId, b.id);
-    if (st?.bo_book_id) { resolved.push({ bookId: b.id, boBookId: st.bo_book_id, boFileId: st.bo_file_id || 0 }); continue; }
+    if (st?.bo_book_id && st.bo_file_id) { resolved.push({ bookId: b.id, boBookId: st.bo_book_id, boFileId: st.bo_file_id }); continue; }
+    // A cached bo_book_id with no bo_file_id (e.g. resolved via an OPDS link that had no
+    // fileId param at the time, or a hash-match whose response omitted bookFileId) isn't
+    // good enough for anything keyed by file — progress push/pull, annotations' bookFileId
+    // — so don't treat it as final. Keep it only as a last-resort fallback and try OPDS/
+    // hash-match again below; a book_opds_sources row added or updated *after* that first,
+    // incomplete resolution can carry a real fileId today even though it didn't back then,
+    // and the old code never looked again once bo_book_id was cached at all (confirmed live:
+    // this is exactly why a real BookOrbit progress push never showed up in a pull — see the
+    // "no progress despite a real push" investigation this session).
+    const cachedFallback = st?.bo_book_id ? { boBookId: st.bo_book_id, boFileId: st.bo_file_id || 0 } : null;
     const opds = opdsIdsFor(db, userId, b.id, ctx.origin);
-    if (opds) { saveMapping(db, userId, b.id, opds.boBookId, opds.boFileId); resolved.push({ bookId: b.id, ...opds }); continue; }
-    if (b.file_hash_md5) needHash.push({ bookId: b.id, hash: String(b.file_hash_md5).toLowerCase() });
+    if (opds?.boFileId) { saveMapping(db, userId, b.id, opds.boBookId, opds.boFileId); resolved.push({ bookId: b.id, ...opds }); continue; }
+    const fallback = opds || cachedFallback;
+    if (b.file_hash_md5) { needHash.push({ bookId: b.id, hash: String(b.file_hash_md5).toLowerCase(), fallback }); continue; }
+    if (fallback) resolved.push({ bookId: b.id, ...fallback });
   }
 
   if (needHash.length) {
     const map = await matchCheckHashes(ctx, [...new Set(needHash.map(x => x.hash))]);
     for (const x of needHash) {
-      const m = map.get(x.hash);
+      const m = map.get(x.hash) || x.fallback;
       if (m) { saveMapping(db, userId, x.bookId, m.boBookId, m.boFileId); resolved.push({ bookId: x.bookId, ...m }); }
     }
   }
@@ -505,23 +538,58 @@ async function uploadSessions(userId, ctx, m, state) {
 }
 
 // ── read status + rating (push on local change; adopt remote when local empty) ─
+// A 4xx that isn't auth/timeout/throttle is BookOrbit saying "no" to this specific request (e.g. it
+// refuses 'rereading' for a book with no completed read-through, or the book isn't accessible) —
+// resending the identical request every sweep forever can't change the answer.
+const isPermanentRejection = (r) => r.status >= 400 && r.status < 500 && ![401, 408, 429].includes(r.status);
+
 async function syncBookState(userId, ctx, m, state) {
   const db = getDb();
-  const b = db.prepare('SELECT read_status, rating, status_modified FROM books WHERE id = ?').get(m.bookId);
+  const b = db.prepare('SELECT id, title, author, file_hash, read_status, rating, status_modified FROM books WHERE id = ?').get(m.bookId);
   if (!b) return;
   const wm = state.state_watermark || 0;
 
   if ((b.status_modified || 0) > wm) {
+    // Every push's result is checked before advancing the watermark — previously this ran
+    // fire-and-forget (api() never throws, it resolves {ok:false,...} on failure) and advanced
+    // the watermark unconditionally right after, so a rejected/ignored push (BookOrbit down for
+    // that request, a validation error, a transient 5xx) would look locally identical to a
+    // successful one: Codexa believed it synced, never retried, and the two sides stayed silently
+    // out of sync forever. Transient failures (network, 5xx, 429, 401) still hold the watermark
+    // back so the next sweep retries; permanent rejections are logged once and let go.
+    // 2 = accepted, 1 = permanently rejected (give up), 0 = transient failure (retry next sweep)
+    const send = async (method, path, body, what) => {
+      const res = await api(userId, ctx, method, path, body);
+      if (res.ok) return 2;
+      if (isPermanentRejection(res)) {
+        console.warn(`[bookorbit] book ${m.bookId}: ${what} rejected by BookOrbit (HTTP ${res.status}) — not retrying`);
+        return 1;
+      }
+      return 0;
+    };
+    let pushOk = true;
+    let pushedStatus; // undefined = leave the recorded value alone; only ever set from an ACCEPTED push
     if (b.read_status && VALID_STATUS.includes(b.read_status)) {
-      await api(userId, ctx, 'PATCH', `/books/${m.boBookId}/status`, { status: b.read_status });
-    } else if (!b.read_status) {
-      await api(userId, ctx, 'PATCH', `/books/${m.boBookId}/status`, { status: 'unread' });
+      const r = await send('PATCH', `/books/${m.boBookId}/status`, { status: b.read_status }, `status '${b.read_status}'`);
+      if (r === 2) pushedStatus = b.read_status;
+      if (r === 0) pushOk = false;
+    } else if (!b.read_status && state.pushed_status) {
+      // Only reset BookOrbit to 'unread' when the user CLEARED a status we had synced. An empty
+      // local status alone means "no opinion" (e.g. only a rating changed) and must not wipe
+      // whatever status BookOrbit — or a KOReader/Kobo device — has set there.
+      const r = await send('PATCH', `/books/${m.boBookId}/status`, { status: 'unread' }, "status 'unread'");
+      if (r === 2) pushedStatus = '';
+      if (r === 0) pushOk = false;
     }
     if (b.rating != null) {
-      await api(userId, ctx, 'POST', '/books/bulk-set-rating', { bookIds: [m.boBookId], rating: b.rating });
+      if ((await send('POST', '/books/bulk-set-rating', { bookIds: [m.boBookId], rating: b.rating }, 'rating')) === 0) pushOk = false;
     }
-    db.prepare('UPDATE bookorbit_sync_state SET state_watermark = ? WHERE user_id = ? AND book_id = ?')
-      .run(b.status_modified, userId, m.bookId);
+    if (pushOk) {
+      db.prepare('UPDATE bookorbit_sync_state SET state_watermark = ?, pushed_status = COALESCE(?, pushed_status) WHERE user_id = ? AND book_id = ?')
+        .run(b.status_modified, pushedStatus === undefined ? null : pushedStatus, userId, m.bookId);
+    }
+    // else: leave the watermark alone — status_modified will still be > wm next run, so this
+    // retries automatically instead of silently drifting.
   } else if (!b.read_status && b.rating == null) {
     // Local never set — adopt BookOrbit's value once.
     const res = await api(userId, ctx, 'GET', `/books/${m.boBookId}`);
@@ -531,12 +599,242 @@ async function syncBookState(userId, ctx, m, state) {
       const rsRaw = res.data.readStatus;
       const rs = typeof rsRaw === 'string' ? rsRaw : rsRaw?.status;
       const rt = res.data.rating;
-      if ((rs && VALID_STATUS.includes(rs)) || rt != null) {
+      // 'unread' (or anything Codexa doesn't model) adopts as the empty status.
+      const adopted = VALID_STATUS.includes(rs) ? rs : '';
+      if (adopted || rt != null) {
+        if (adopted === 'read') logCompletion(db, userId, b, b.file_hash);
         db.prepare('UPDATE books SET read_status = ?, rating = ?, status_modified = strftime(\'%s\',\'now\') WHERE id = ?')
-          .run(VALID_STATUS.includes(rs) ? rs : '', rt != null ? rt : null, m.bookId);
+          .run(adopted, rt != null ? rt : null, m.bookId);
+        // BookOrbit already holds this status — remember that, so clearing it locally later resets it.
+        db.prepare('UPDATE bookorbit_sync_state SET pushed_status = ? WHERE user_id = ? AND book_id = ?').run(adopted, userId, m.bookId);
       }
     }
   }
+}
+
+// ── cross-device reading totals (read-only) ───────────────────────────────────
+// BookOrbit's GET /books/:id/sessions returns, besides one page of rows, a `stats` block computed
+// over EVERY session on that book for this account: the web reader, the KOReader plugin (an
+// Xteink or any other KOReader device), Kobo, its native apps — plus the sessions Codexa itself
+// pushed (uploadSessions posts them under the default 'web' source). pageSize=1 keeps the payload
+// tiny since only `stats` is used. Because Codexa's own pushed sessions are already inside these
+// totals, they're only ever displayed as the all-devices figure, never added to Codexa's own.
+const STATS_REFRESH_SECS   = 120;        // per-book sync: don't re-fetch a book's totals more often than this
+const STATS_BACKFILL_SECS  = 24 * 3600;  // full sweep: refresh finished books' cached totals at most daily
+const STATS_BACKFILL_LIMIT = 25;         // ...and at most this many per sweep (each is one paced API call)
+
+function normalizeSessionStats(st) {
+  if (!st) return null;
+  const toSecs = (v) => {
+    const ms = v ? new Date(v).getTime() : NaN;
+    return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+  };
+  return {
+    totalSeconds:   Number(st.totalSeconds)  || 0,
+    totalSessions:  Number(st.totalSessions) || 0,
+    firstSessionAt: toSecs(st.firstSessionAt),
+    lastSessionAt:  toSecs(st.lastSessionAt),
+    bySource: Array.isArray(st.bySource)
+      ? st.bySource.map(x => ({ bucket: x.bucket, totalSeconds: Number(x.totalSeconds) || 0, totalSessions: Number(x.totalSessions) || 0 }))
+      : [],
+    // The rest of BookOrbit's per-book stats block — drives the Reading tab's charts/facts only
+    // (not cached: bookorbit_book_stats keeps just the totals the finished list needs). Days are
+    // BookOrbit's own YYYY-MM-DD buckets in the account's timezone; capped so a years-long
+    // history can't balloon the payload.
+    avgSessionSeconds:     Number(st.avgDurationSeconds) || 0,
+    longestSessionSeconds: Number(st.longestSessionSeconds) || 0,
+    longestSessionAt:      toSecs(st.longestSessionAt),
+    paceProgressDelta:     Number(st.paceProgressDelta) || 0,
+    paceDurationSeconds:   Number(st.paceDurationSeconds) || 0,
+    backtrackCount:        Number(st.backtrackCount) || 0,
+    dailySummary: Array.isArray(st.dailySummary)
+      ? st.dailySummary.filter(d => d && d.day).slice(-366).map(d => ({ day: String(d.day).slice(0, 10), totalMinutes: Number(d.totalMinutes) || 0 }))
+      : [],
+    progressSummary: Array.isArray(st.progressSummary)
+      ? st.progressSummary.filter(d => d && d.day).slice(-366).map(d => ({ day: String(d.day).slice(0, 10), endProgress: Number(d.endProgress) || 0 }))
+      : [],
+  };
+}
+
+async function fetchSessionStats(userId, ctx, boBookId) {
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=1&pageSize=1`);
+  return res.ok ? normalizeSessionStats(res.data?.stats) : null;
+}
+
+// One page of BookOrbit's per-session rows for a book (newest first) plus the totals block, for the
+// "Reading" session tables. Times stay unix seconds like everywhere else server-side; progress is
+// BookOrbit's own 0-100 percent scale (endProgress) / percentage points (progressDelta). Returns
+// null if BookOrbit doesn't answer.
+async function fetchSessionPage(userId, ctx, boBookId, page = 1, pageSize = 25) {
+  const p  = Math.max(1, parseInt(page, 10) || 1);
+  const ps = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 25));
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/sessions?page=${p}&pageSize=${ps}&sortBy=startedAt&sortDir=desc`);
+  if (!res.ok || !res.data) return null;
+  const toSecs = (v) => { const ms = v ? new Date(v).getTime() : NaN; return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
+  return {
+    items: (Array.isArray(res.data.items) ? res.data.items : []).map(r => ({
+      id:              r.id,
+      startedAt:       toSecs(r.startedAt),
+      endedAt:         toSecs(r.endedAt),
+      durationSeconds: Number(r.durationSeconds) || 0,
+      progressDelta:   r.progressDelta ?? null,
+      endProgress:     r.endProgress ?? null,
+      format:          r.format ?? null,
+      source:          r.source ?? null,
+    })),
+    total:    Number(res.data.total) || 0,
+    page:     Number(res.data.page) || p,
+    pageSize: Number(res.data.pageSize) || ps,
+    stats:    normalizeSessionStats(res.data.stats),
+  };
+}
+
+function saveBookStats(db, userId, documentHash, boBookId, stats) {
+  db.prepare(`
+    INSERT INTO bookorbit_book_stats
+      (user_id, document_hash, bo_book_id, total_seconds, total_sessions, first_session_at, last_session_at, by_source, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+    ON CONFLICT (user_id, document_hash) DO UPDATE SET
+      bo_book_id = excluded.bo_book_id, total_seconds = excluded.total_seconds,
+      total_sessions = excluded.total_sessions, first_session_at = excluded.first_session_at,
+      last_session_at = excluded.last_session_at, by_source = excluded.by_source, fetched_at = excluded.fetched_at
+  `).run(userId, documentHash, boBookId, stats.totalSeconds, stats.totalSessions,
+         stats.firstSessionAt, stats.lastSessionAt, JSON.stringify(stats.bySource));
+}
+
+// Per-book sync step: keep the cached totals of a book being read/synced fresh.
+async function refreshBookStats(db, userId, ctx, m) {
+  const book = db.prepare('SELECT file_hash FROM books WHERE id = ?').get(m.bookId);
+  if (!book?.file_hash) return;
+  const cached = db.prepare('SELECT fetched_at FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ?').get(userId, book.file_hash);
+  if (cached?.fetched_at && Date.now() / 1000 - cached.fetched_at < STATS_REFRESH_SECS) return;
+  const stats = await fetchSessionStats(userId, ctx, m.boBookId);
+  if (stats) saveBookStats(db, userId, book.file_hash, m.boBookId, stats);
+}
+
+// Full-sweep step: fill in / refresh the cross-device totals of every book the user has FINISHED,
+// including ones since deleted from the library (their BookOrbit id survives in
+// bookorbit_book_stats — see trg_books_keep_bo_mapping in db.js — since Codexa's own mapping table
+// cascades away with the book). Bounded per sweep so a big backlog spreads over several sweeps.
+async function backfillFinishedStats(userId, ctx) {
+  const db = getDb();
+  const hashes = db.prepare('SELECT DISTINCT document_hash FROM book_completions WHERE user_id = ?').all(userId).map(r => r.document_hash);
+  const getCached = db.prepare('SELECT bo_book_id, fetched_at FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ?');
+  const getLive = db.prepare(
+    `SELECT s.bo_book_id FROM books b JOIN bookorbit_sync_state s ON s.user_id = b.user_id AND s.book_id = b.id
+      WHERE b.user_id = ? AND b.file_hash = ? AND s.bo_book_id IS NOT NULL LIMIT 1`
+  );
+  const now = Date.now() / 1000;
+  let fetched = 0;
+  for (const h of hashes) {
+    if (fetched >= STATS_BACKFILL_LIMIT) break;
+    const cached = getCached.get(userId, h);
+    const boBookId = cached?.bo_book_id ?? getLive.get(userId, h)?.bo_book_id;
+    if (!boBookId) continue;
+    if (cached?.fetched_at && now - cached.fetched_at < STATS_BACKFILL_SECS) continue;
+    fetched++;
+    const stats = await fetchSessionStats(userId, ctx, boBookId);
+    if (stats) {
+      saveBookStats(db, userId, h, boBookId, stats);
+      // One more (paced) call for BookOrbit's own finish date — only for finished books, and only
+      // when the totals were just refreshed, so it's at most once a day per book.
+      const att = await fetchAttempts(userId, ctx, boBookId);
+      if (att) saveFinishedOn(db, userId, h, latestFinishedOn(att.items));
+    }
+  }
+  return fetched;
+}
+
+// ── reading attempts (read-only) ──────────────────────────────────────────────
+// BookOrbit tracks every read-through of a book as an "attempt": date-only start/end (YYYY-MM-DD,
+// either may be null), an outcome (completed | skimmed | abandoned | null while still open) and the
+// time/sessions recorded against it. Newest first. Only reading them here — creating, editing and
+// re-read starts stay in BookOrbit's own UI.
+async function fetchAttempts(userId, ctx, boBookId) {
+  const res = await api(userId, ctx, 'GET', `/books/${boBookId}/reading-attempts?page=1&pageSize=50`);
+  if (!res.ok || !res.data) return null;
+  return {
+    items: (Array.isArray(res.data.items) ? res.data.items : []).map(a => ({
+      id:            a.id,
+      startedOn:     a.startedOn ?? null,
+      endedOn:       a.endedOn ?? null,
+      outcome:       a.outcome ?? null,
+      origin:        a.origin ?? null,
+      totalSessions: Number(a.totalSessions) || 0,
+      totalSeconds:  Number(a.totalSeconds) || 0,
+    })),
+    total: Number(res.data.total) || 0,
+  };
+}
+
+// Newest first, so the first completed attempt with an end date is the most recent finish.
+function latestFinishedOn(items) {
+  return items.find(a => a.outcome === 'completed' && a.endedOn)?.endedOn ?? null;
+}
+
+function saveFinishedOn(db, userId, documentHash, finishedOn) {
+  db.prepare('UPDATE bookorbit_book_stats SET finished_on = ? WHERE user_id = ? AND document_hash = ?').run(finishedOn, userId, documentHash);
+}
+
+// For a LOCAL book (Reading tab of Codexa's own dialog). null = BookOrbit off / not mapped;
+// { unreachable: true } = mapped but BookOrbit didn't answer. Also refreshes the cached finish date
+// while it has the data in hand.
+async function getBookAttempts(userId, bookId) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  const book = db.prepare('SELECT file_hash FROM books WHERE user_id = ? AND id = ?').get(userId, bookId);
+  if (!book) return null;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
+  if (!boBookId) return null;
+  const out = await fetchAttempts(userId, ctx, boBookId);
+  if (!out) return { unreachable: true };
+  saveFinishedOn(db, userId, book.file_hash, latestFinishedOn(out.items));
+  return out;
+}
+
+// The BookOrbit id of a local book, from its sync mapping or stored OPDS link (no network).
+function boBookIdFor(db, userId, bookId, ctx) {
+  const st = db.prepare('SELECT bo_book_id FROM bookorbit_sync_state WHERE user_id = ? AND book_id = ?').get(userId, bookId);
+  return st?.bo_book_id || opdsIdsFor(db, userId, bookId, ctx.origin)?.boBookId || null;
+}
+
+// On-demand, for the book-details Reading tab: live totals for one local book (so they reflect a
+// session that ended a minute ago), falling back to the cached copy if BookOrbit is unreachable.
+// Returns null when BookOrbit isn't enabled or the book isn't mapped to it.
+async function getBookStats(userId, bookId) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  const book = db.prepare('SELECT file_hash FROM books WHERE user_id = ? AND id = ?').get(userId, bookId);
+  if (!book) return null;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
+  if (!boBookId) return null;
+  const live = await fetchSessionStats(userId, ctx, boBookId);
+  if (live) {
+    saveBookStats(db, userId, book.file_hash, boBookId, live);
+    return { ...live, stale: false };
+  }
+  const c = db.prepare('SELECT * FROM bookorbit_book_stats WHERE user_id = ? AND document_hash = ? AND fetched_at IS NOT NULL').get(userId, book.file_hash);
+  if (!c) return null;
+  return {
+    totalSeconds: c.total_seconds, totalSessions: c.total_sessions,
+    firstSessionAt: c.first_session_at, lastSessionAt: c.last_session_at,
+    bySource: JSON.parse(c.by_source || '[]'), stale: true,
+  };
+}
+
+// Same, but the per-session rows, for a local book (the BookOrbit browser's own dialog already
+// has the BookOrbit id and calls fetchSessionPage directly). null = not enabled / not mapped;
+// { unreachable: true } = mapped but BookOrbit didn't answer.
+async function getBookSessions(userId, bookId, page, pageSize) {
+  const ctx = getContext(userId);
+  if (!ctx) return null;
+  const db = getDb();
+  if (!db.prepare('SELECT 1 FROM books WHERE user_id = ? AND id = ?').get(userId, bookId)) return null;
+  const boBookId = boBookIdFor(db, userId, bookId, ctx);
+  if (!boBookId) return null;
+  return (await fetchSessionPage(userId, ctx, boBookId, page, pageSize)) || { unreachable: true };
 }
 
 // ── recommendations / series lookups (on-demand, read-only, single book) ─────
@@ -550,7 +848,30 @@ function mapRecBook(b) {
   };
 }
 
-const EMPTY_RELATED = { enabled: true, mapped: false, recommendations: [], seriesBooks: [], nextInSeries: null };
+const EMPTY_RELATED = { enabled: true, mapped: false, recommendations: [], seriesBooks: [], nextInSeries: null, authorBooks: [] };
+
+// Shared by getRecommendations() (local bookId, used by the local book info modal's Related tab)
+// and getRelatedByBoId() (direct boBookId, used by the BookOrbit library's own detail modal for
+// books that may not be imported into Codexa yet — there's no local mapping to resolve there).
+async function fetchRelated(userId, ctx, boBookId) {
+  const [recRes, seriesRes, authorRes] = await Promise.all([
+    api(userId, ctx, 'GET', `/books/${boBookId}/recommendations`),
+    api(userId, ctx, 'GET', `/books/${boBookId}/series-books`),
+    api(userId, ctx, 'GET', `/books/${boBookId}/author-books`),
+  ]);
+
+  const recommendations = (recRes.ok && Array.isArray(recRes.data) ? recRes.data : []).map(mapRecBook);
+
+  const seriesRaw = seriesRes.ok && Array.isArray(seriesRes.data) ? seriesRes.data : [];
+  const idx = seriesRaw.findIndex(b => b.id === boBookId);
+  const nextInSeries = idx >= 0 && idx + 1 < seriesRaw.length ? mapRecBook(seriesRaw[idx + 1]) : null;
+  const seriesBooks = seriesRaw.filter(b => b.id !== boBookId).map(mapRecBook);
+
+  const authorBooks = (authorRes.ok && Array.isArray(authorRes.data) ? authorRes.data : [])
+    .filter(b => b.id !== boBookId).map(mapRecBook);
+
+  return { recommendations, seriesBooks, nextInSeries, authorBooks };
+}
 
 async function getRecommendations(userId, bookId) {
   const ctx = getContext(userId);
@@ -563,25 +884,27 @@ async function getRecommendations(userId, bookId) {
   try { if (!tokens.has(userId)) await login(userId, ctx); }
   catch { return EMPTY_RELATED; }
 
-  const [recRes, seriesRes] = await Promise.all([
-    api(userId, ctx, 'GET', `/books/${m.boBookId}/recommendations`),
-    api(userId, ctx, 'GET', `/books/${m.boBookId}/series-books`),
-  ]);
+  const related = await fetchRelated(userId, ctx, m.boBookId);
+  return { enabled: true, mapped: true, ...related };
+}
 
-  const recommendations = (recRes.ok && Array.isArray(recRes.data) ? recRes.data : []).map(mapRecBook);
-
-  const seriesRaw = seriesRes.ok && Array.isArray(seriesRes.data) ? seriesRes.data : [];
-  const idx = seriesRaw.findIndex(b => b.id === m.boBookId);
-  const nextInSeries = idx >= 0 && idx + 1 < seriesRaw.length ? mapRecBook(seriesRaw[idx + 1]) : null;
-  const seriesBooks = seriesRaw.filter(b => b.id !== m.boBookId).map(mapRecBook);
-
-  return { enabled: true, mapped: true, recommendations, seriesBooks, nextInSeries };
+// For a book identified directly by its BookOrbit id (catalog browsing in bookorbit.js — the
+// caller already has boBookId in hand, no local bookId->boBookId resolution needed).
+async function getRelatedByBoId(userId, ctx, boBookId) {
+  try { if (!tokens.has(userId)) await login(userId, ctx); }
+  catch { return { recommendations: [], seriesBooks: [], nextInSeries: null, authorBooks: [] }; }
+  return fetchRelated(userId, ctx, boBookId);
 }
 
 // Fetch a BookOrbit-hosted image (thumbnail) through our own server so the browser never
 // needs BookOrbit's JWT directly. Shares the same token jar as api().
 async function fetchAsset(userId, ctx, path) {
-  if (!tokens.has(userId)) await login(userId, ctx);
+  // Same "never let login()/refresh() throw past us" guard as api() — every current caller
+  // happens to wrap this in its own try/catch, but that shouldn't be the only thing standing
+  // between a BookOrbit network failure and a process-crashing unhandled rejection.
+  if (!tokens.has(userId)) {
+    try { await login(userId, ctx); } catch { return { ok: false }; }
+  }
   const doFetch = () => {
     const tok = tokens.get(userId);
     return fetch(`${ctx.webBase}${path}`, {
@@ -592,11 +915,113 @@ async function fetchAsset(userId, ctx, path) {
   let res;
   try { res = await doFetch(); } catch { return { ok: false }; }
   if (res.status === 401) {
-    await refresh(userId, ctx);
+    try { await refresh(userId, ctx); } catch { return { ok: false }; }
     try { res = await doFetch(); } catch { return { ok: false }; }
   }
   if (!res.ok) return { ok: false, status: res.status };
-  return { ok: true, contentType: res.headers.get('content-type') || 'image/jpeg', buffer: Buffer.from(await res.arrayBuffer()) };
+  const buffer = Buffer.from(await res.arrayBuffer());
+  // See fetchAssetStream's identical check below for why this matters even here.
+  const total = Number(res.headers.get('content-length')) || 0;
+  if (total > 0 && buffer.length < total) {
+    console.warn(`[bookorbit] download incomplete: got ${buffer.length} of ${total} bytes for ${path}`);
+    return { ok: false, incomplete: true, loaded: buffer.length, total };
+  }
+  return { ok: true, contentType: res.headers.get('content-type') || 'image/jpeg', buffer };
+}
+
+// Same as fetchAsset, but reads the response body incrementally and reports {loaded, total}
+// via onProgress as chunks arrive — used for the "Add to Codexa" book-file download, where the
+// client wants a real byte progress bar (see server/routes/bookorbit.js's import-sse route).
+// fetchAsset itself stays untouched (still used for small, progress-irrelevant assets like
+// cover thumbnails) rather than growing an optional-callback parameter everywhere.
+//
+// `abandonSignal` is optional: the caller's own "client went away" signal (e.g. the import-sse
+// route's req.on('close')). Wiring it into the same controller that drives the idle timeout
+// means a client disconnect stops this download immediately, instead of it running to
+// completion in the background against nobody — which was the root cause of a real crash (see
+// import-sse's own comment).
+async function fetchAssetStream(userId, ctx, path, onProgress, abandonSignal) {
+  if (!tokens.has(userId)) {
+    try { await login(userId, ctx); } catch { return { ok: false }; }
+  }
+  // An idle timeout (armed here, re-armed on every chunk below), not AbortSignal.timeout's
+  // fixed deadline — see STREAM_IDLE_TIMEOUT_MS above for why.
+  const controller = new AbortController();
+  if (abandonSignal) {
+    if (abandonSignal.aborted) controller.abort();
+    else abandonSignal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  let idleTimer;
+  const armIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+  };
+  const doFetch = () => {
+    const tok = tokens.get(userId);
+    armIdleTimer();
+    return fetch(`${ctx.webBase}${path}`, {
+      headers: { authorization: `Bearer ${tok.access}` },
+      signal: controller.signal,
+    });
+  };
+  let res;
+  try { res = await doFetch(); } catch { clearTimeout(idleTimer); return { ok: false }; }
+  if (res.status === 401) {
+    try { await refresh(userId, ctx); } catch { clearTimeout(idleTimer); return { ok: false }; }
+    try { res = await doFetch(); } catch { clearTimeout(idleTimer); return { ok: false }; }
+  }
+  if (!res.ok) { clearTimeout(idleTimer); return { ok: false, status: res.status }; }
+
+  const total = Number(res.headers.get('content-length')) || 0;
+  const contentType = res.headers.get('content-type') || 'application/octet-stream';
+
+  if (!res.body?.getReader) {
+    // No streamable body (shouldn't happen with Node's fetch) — fall back to buffering whole.
+    const buffer = Buffer.from(await res.arrayBuffer());
+    clearTimeout(idleTimer);
+    onProgress?.(buffer.length, total || buffer.length);
+    // See the streaming path's identical check below for why this matters.
+    if (total > 0 && buffer.length < total) {
+      console.warn(`[bookorbit] download incomplete: got ${buffer.length} of ${total} bytes for ${path}`);
+      return { ok: false, incomplete: true, loaded: buffer.length, total };
+    }
+    return { ok: true, contentType, buffer };
+  }
+
+  const reader = res.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      armIdleTimer(); // got data — connection is alive, push the deadline back out
+      chunks.push(value);
+      loaded += value.length;
+      onProgress?.(loaded, total);
+    }
+  } catch {
+    return { ok: false }; // stalled connection (idle timeout) or other stream error
+  } finally {
+    clearTimeout(idleTimer);
+  }
+
+  // A response body can end "cleanly" (reader.read() reporting done:true, no error thrown) while
+  // still being short of what the server itself declared via Content-Length — confirmed live as
+  // the real shape of the "book with no cover" reports: BookOrbit's connection got torn down
+  // partway (by an intermediate proxy/CDN hop enforcing its own timeout, not necessarily
+  // BookOrbit itself) in a way Node's fetch didn't surface as a stream error, so the truncated
+  // buffer sailed straight through as a "successful" download, got written to disk, and handed
+  // to the ZIP/EPUB parser as if it were the whole file — a truncated ZIP's central directory is
+  // exactly the kind of thing that can produce a book with metadata but no cover (the cover
+  // entry, wherever it lived in the archive, never arrived), and re-parsing that same malformed
+  // file on every retry is the leading suspect for the crash it also causes. This length check
+  // is the only reliable place left to catch it before those bytes are ever written or parsed.
+  if (total > 0 && loaded < total) {
+    console.warn(`[bookorbit] download incomplete: got ${loaded} of ${total} bytes for ${path}`);
+    return { ok: false, incomplete: true, loaded, total };
+  }
+  return { ok: true, contentType, buffer: Buffer.concat(chunks.map(c => Buffer.from(c))) };
 }
 
 async function getCover(userId, boBookId) {
@@ -630,9 +1055,9 @@ async function runSync(userId, opts = {}) {
       const db = getDb();
       const books = await resolveBooks(db, userId, ctx, opts);
       if (books.length === 0) {
-        if (opts.bookId != null) console.log(`[bookorbit] book ${opts.bookId} is not in your BookOrbit library (skipping)`);
-        else console.log(`[bookorbit] user ${userId}: no books matched to this BookOrbit server`);
-        return;
+        if (opts.bookId != null) { console.log(`[bookorbit] book ${opts.bookId} is not in your BookOrbit library (skipping)`); return; }
+        // A full sweep still continues: finished-but-deleted books have cached BookOrbit ids to backfill.
+        console.log(`[bookorbit] user ${userId}: no books matched to this BookOrbit server`);
       }
       // Verify auth up front so a bad password fails loudly once, not per book.
       try { if (!tokens.has(userId)) await login(userId, ctx); }
@@ -645,8 +1070,19 @@ async function runSync(userId, opts = {}) {
           await syncBookmarks(userId, ctx, m);
           await uploadSessions(userId, ctx, m, state);
           await syncBookState(userId, ctx, m, state);
+          // Per-book syncs only (the one that follows reading a book) — a full sweep would be one
+          // extra API call for every book in the library; backfillFinishedStats covers that case.
+          if (opts.bookId != null) await refreshBookStats(db, userId, ctx, m);
         } catch (e) {
           console.warn(`[bookorbit] book ${m.bookId}:`, e.message);
+        }
+      }
+      if (opts.bookId == null) {
+        try {
+          const n = await backfillFinishedStats(userId, ctx);
+          if (n) console.log(`[bookorbit] user ${userId}: refreshed cross-device totals for ${n} finished book(s)`);
+        } catch (e) {
+          console.warn(`[bookorbit] user ${userId}: finished-book totals backfill failed:`, e.message);
         }
       }
       if (opts.bookId == null) console.log(`[bookorbit] user ${userId}: full sync complete (${books.length} books)`);
@@ -669,7 +1105,18 @@ function triggerSync(userId, bookId) {
 // endpoint (POST /books/files/:fileId/progress) — unlike uploadSessions(), this
 // doesn't wait for a closed reading_sessions row, so it can fire on every chapter
 // change / manual KOSync push, not just when the reader is closed.
-async function pushProgress(userId, bookId, percentage) {
+// `xpointer`, when given, is Codexa's own KOReader-style position string (same format/value
+// as koReaderXPointer() already sends over the KOSync protocol — see reader.js). Confirmed live
+// (2026-09-09) this matters: BookOrbit's saveFileProgress overwrites cfi/koreaderProgress with
+// null on ANY push that omits them (its DTO has no partial-update semantics), so a percentage-
+// only push here was silently blanking the xpointer that BookOrbit's own koreader module keeps
+// in sync for every OTHER KOReader-protocol client (Xteink X4 included) — those clients resolve
+// chapter/page from the xpointer, not the percentage, so once it went null they kept showing
+// whatever chapter they were last rendering, one full chapter behind, right next to a percentage
+// number that actually was fresh and correct. Not sending `cfi` here is deliberate, unlike
+// xpointer: Codexa's own CFI format (chapter-level only, epubcfi(/6/N!/4/2/1:0)) isn't something
+// BookOrbit's own web reader (or anything else reading that field) is equipped to resolve.
+async function pushProgress(userId, bookId, percentage, xpointer) {
   // Every exit point logs *why*, unlike before — this was entirely silent (no log on success,
   // and triggerProgressPush's .catch(() => {}) swallowed any failure too), so there was no way
   // to tell whether it was working, or silently skipping at one of the early returns below.
@@ -683,15 +1130,66 @@ async function pushProgress(userId, bookId, percentage) {
     try { if (!tokens.has(userId)) await login(userId, ctx); }
     catch (e) { console.warn(`[bookorbit] user ${userId}: progress push skipped for book ${bookId} — login failed: ${e.message}`); return; }
     const pct = Math.max(0, Math.min(100, Math.round(percentage * 10000) / 100));
-    await api(userId, ctx, 'POST', `/books/files/${m.boFileId}/progress`, { percentage: pct });
-    console.log(`[bookorbit] user ${userId}: pushed live progress ${pct}% for book ${bookId}`);
+    const body = { percentage: pct, ...(xpointer ? { koreaderProgress: xpointer } : {}) };
+    await api(userId, ctx, 'POST', `/books/files/${m.boFileId}/progress`, body);
+    console.log(`[bookorbit] user ${userId}: pushed live progress ${pct}% for book ${bookId}${xpointer ? ' (xpointer included)' : ''}`);
   } catch (e) {
     console.warn(`[bookorbit] user ${userId}: progress push error for book ${bookId}:`, e.message);
   }
 }
 
-function triggerProgressPush(userId, bookId, percentage) {
-  setImmediate(() => { pushProgress(userId, bookId, percentage).catch(() => {}); });
+function triggerProgressPush(userId, bookId, percentage, xpointer) {
+  setImmediate(() => { pushProgress(userId, bookId, percentage, xpointer).catch(() => {}); });
+}
+
+// ── live progress pull (BookOrbit-native, no KOSync server required) ──────────
+// Mirrors pushProgress()'s GET counterpart: BookOrbit's own SaveProgressDto endpoint
+// (GET /books/files/:fileId/progress) reflects the *shared* reading_progress row, which
+// BookOrbit's own koreader module keeps merged with whatever any KOReader-protocol
+// client (Xteink X4, or Codexa itself when kosync_url used to point here) last pushed —
+// see koreader.service.ts's applySharedProgress(). So this single native call is a
+// reasonable stand-in for the generic kosync_url "ext" source when the user has no
+// external KOSync server configured (or never configured one, and relies on BookOrbit
+// alone) — it's the same underlying position, reached through BookOrbit's own account
+// login instead of the separate KOReader-plugin sub-account.
+// Returns null (not an error) whenever there's nothing usable to report, exactly like
+// fetchRemoteProgress()'s "no kosync_url configured" case client-side.
+// NOTE (confirmed live 2026-09-09): BookOrbit's reading_progress.percentage is 0-100,
+// not 0-1 — pushProgress() above already converts the other way for the same reason.
+// NOTE: BookOrbit's saveProgress() overwrites cfi/koreaderProgress with null on any push
+// that doesn't include them — which is exactly what pushProgress() above sends (percentage
+// only) — so koreaderProgress here is frequently null right after Codexa's own push, not a
+// sign of anything wrong; callers should treat it as an optional refinement, same as the
+// kosync "ext" source already does when .progress is empty.
+async function getProgress(userId, bookId) {
+  try {
+    const ctx = getContext(userId);
+    if (!ctx) return null;
+    const db = getDb();
+    const resolved = await resolveBooks(db, userId, ctx, { bookId });
+    const m = resolved[0];
+    // These two used to return null completely silently — the only way to tell "genuinely no
+    // BookOrbit progress yet" apart from "this book isn't resolved to a fileId at all" or "the
+    // API call failed" was reading the database directly (needed exactly once, live, to track
+    // down a report of a real device push never showing up in a pull — see resolveBooks' own
+    // comment on the actual bug). A one-line log here means the next report is diagnosable from
+    // the log alone.
+    if (!m || !m.boFileId) { console.warn(`[bookorbit] user ${userId}: progress pull skipped for book ${bookId} — not resolved to a BookOrbit fileId`); return null; }
+    const res = await api(userId, ctx, 'GET', `/books/files/${m.boFileId}/progress`);
+    if (!res.ok || !res.data) { console.warn(`[bookorbit] user ${userId}: progress pull for book ${bookId} (fileId ${m.boFileId}) returned no data (HTTP ${res.status})`); return null; }
+    const pct = typeof res.data.percentage === 'number' ? res.data.percentage / 100 : 0;
+    const updatedAt = res.data.updatedAt ? Math.floor(new Date(res.data.updatedAt).getTime() / 1000) : 0;
+    return {
+      percentage: pct,
+      progress: res.data.koreaderProgress || null,
+      timestamp: updatedAt,
+      device: 'bookorbit',
+      device_id: 'bookorbit-native',
+    };
+  } catch (e) {
+    console.warn(`[bookorbit] user ${userId}: progress pull error for book ${bookId}:`, e.message);
+    return null;
+  }
 }
 
 module.exports = {
@@ -703,12 +1201,21 @@ module.exports = {
   parseBoIds,
   VALID_STATUS,
   getRecommendations,
+  getRelatedByBoId,
   getCover,
   api,
   fetchAsset,
+  fetchAssetStream,
   mapLocalBook,
   pushProgress,
   triggerProgressPush,
+  getProgress,
+  getBookStats,
+  getBookSessions,
+  fetchSessionPage,
+  getBookAttempts,
+  fetchAttempts,
+  backfillFinishedStats,
   getLastStatus,
   checkReachable,
 };

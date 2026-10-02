@@ -2,11 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const cors = require('cors');
 const compression = require('compression');
-const { initDb, DATA_DIR } = require('./db');
+const { initDb, closeDb, DATA_DIR } = require('./db');
 
 const authRoutes     = require('./routes/auth');
+const oidcRoutes     = require('./routes/oidc');
 const settingsRoutes = require('./routes/settings');
 const booksRoutes    = require('./routes/books');
 const progressRoutes = require('./routes/progress');
@@ -25,8 +27,26 @@ const { installConsolePrefix } = require('./utils/logger');
 // Prefix every log line with a local timestamp + the current user (when known).
 installConsolePrefix();
 
+// Last-resort safety net. Without this, ANY unhandled error anywhere in the app (a stray
+// write to a socket the client already closed, a rejected promise nobody attached a .catch
+// to, etc.) crashes this entire process — and since this process is the whole container,
+// that means every user's session dies too, not just the one request that went wrong.
+// Confirmed live cause of a real "container exited with code 132" crash: /api/bookorbit's
+// import-sse route (server/routes/bookorbit.js) writing an SSE progress event to a response
+// whose client had already disconnected, with nothing listening for the resulting error.
+// That specific case is now also fixed at the source (req.on('close') there), but this stays
+// as the backstop for the next unforeseen one — log loudly and keep serving everyone else,
+// rather than let one bad request take the whole app down.
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] uncaughtException (process kept alive):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] unhandledRejection (process kept alive):', reason);
+});
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const { version } = require('../package.json');
 
 const DIST_DIR   = path.join(__dirname, '../dist');
@@ -51,13 +71,41 @@ app.set('trust proxy', 1);
 // Placed before static/route handlers so it wraps all of them; a reverse proxy in front (see
 // README's "Self-Hosting Behind a Reverse Proxy") may also compress, which is harmless — this
 // just guarantees it happens even for users running Codexa directly with no proxy at all.
-app.use(compression());
+//
+// EXCEPT text/event-stream: the `compressible` mime lookup this package uses under the hood
+// actually says SSE is compressible, so without this override every SSE route (BookOrbit/OPDS
+// sync progress, the "Add to Codexa" download-progress bar) gets silently wrapped in a gzip
+// Transform stream that buffers output until enough has accumulated — the client saw nothing
+// but 0% for the whole download, then got the final result all at once. Worse, on a long enough
+// gap with zero bytes actually reaching the browser, EventSource's own auto-reconnect kicked in
+// and re-ran the entire import from scratch, downloading (and re-inserting) the same book twice.
+// compression()'s own default filter is otherwise fine — only override the one content-type.
+app.use(compression({
+  filter: (req, res) => {
+    // Express's res.set('Content-Type', 'text/event-stream') auto-appends "; charset=utf-8",
+    // so this has to be a prefix check, not strict equality (confirmed live — a strict === here
+    // silently never matched and gzip kept right on buffering the SSE stream).
+    if (String(res.getHeader('Content-Type') || '').startsWith('text/event-stream')) return false;
+    return compression.filter(req, res);
+  },
+}));
 
 if (process.env.CORS_ORIGIN) {
   app.use(cors({ origin: process.env.CORS_ORIGIN, credentials: true }));
 }
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
+
+// ── Baseline security headers (every response) ─────────────────────────────────
+// The heavier, nonce-bearing Content-Security-Policy is set per-HTML-page below (it needs a
+// fresh nonce per request); these three are cheap, meaningful on every response type (not just
+// HTML), and never need per-request state.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');           // blocks MIME-sniffing a served file into something executable
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');                // legacy clickjacking guard, belt-and-suspenders with frame-ancestors below
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
 
 // ── Browser-friendly module fallback for vendored Flow imports
 app.use((req, res, next) => {
@@ -100,22 +148,69 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Debug flag injection ──────────────────────────────────────────────────────
+// ── Debug flag injection + per-page Content-Security-Policy ────────────────────
 // Injects the DEBUG flag into HTML files (window.__DEBUG) and sw.js (__DEBUG).
 // Set DEBUG=true in .env to enable verbose frontend console logging.
 const CLIENT_DEBUG = process.env.DEBUG === 'true';
-const _htmlSnippet = `<script>window.__DEBUG=${CLIENT_DEBUG};</script>`;
 const _swSnippet   = `const __DEBUG=${CLIENT_DEBUG};\n`;
 
+// Matches every <script> tag that has no src= attribute — i.e. every inline script block in
+// our own HTML shells (a handful of small first-party snippets per page: the anti-FOUC
+// visibility toggle, feature detection, the debug flag, etc.) so each can be tagged with the
+// per-request nonce below. <script src="..."> tags are left alone — same-origin script FILES
+// are already covered by script-src 'self', nonce or not.
+const INLINE_SCRIPT_RE = /<script(?![^>]*\bsrc=)([^>]*)>/gi;
+
+// Every external origin this app's own pages legitimately talk to. Everything else (including
+// book content, rendered separately into a sandboxed iframe — see cxreader/renderer.js's
+// _sanitizeDoc for that side of the defense) has no reason to run script, load a stylesheet
+// from, or connect out to anywhere but this server itself.
+const GITHUB_API = 'https://api.github.com';
+
+function buildCsp(nonce) {
+  return [
+    `default-src 'self'`,
+    `script-src 'self' 'nonce-${nonce}'`,
+    // Inline STYLE is left permissive: reader themes/fonts are applied via JS-created <style>
+    // elements with no server-issued nonce to give them, and CSS-only injection is a far
+    // narrower, lower-value attack surface than script — not worth the functional risk here.
+    `style-src 'self' 'unsafe-inline'`,
+    `img-src 'self' data: blob:`,
+    `font-src 'self' data: blob:`,
+    `media-src 'self' blob:`,   // some EPUBs embed <audio>/<video>, rewritten to blob: URLs too
+    // blob: is required here (not just in frame-src below): the EPUB/CBZ parser fetch()es
+    // each resource — chapter HTML, images, stylesheets — from blob: URLs it created via
+    // URL.createObjectURL, from the top-level page's own JS, not from inside the book iframe.
+    `connect-src 'self' blob: ${GITHUB_API}`,
+    `frame-src 'self' blob:`,   // book content renders into a blob: iframe (cxreader/renderer.js)
+    `worker-src 'self'`,        // pdf.js's worker is a same-origin vendored file
+    `object-src 'none'`,
+    `base-uri 'self'`,
+    `form-action 'self'`,
+    `frame-ancestors 'self'`,
+  ].join('; ');
+}
+
 app.use((req, res, next) => {
-  const filePath = path.resolve(SERVE_DIR, '.' + req.path);
+  // express.static resolves a bare directory request ("/") to its index.html itself, which
+  // would otherwise skip this middleware entirely (req.path stays "/", which is neither
+  // *.html nor /sw.js below) — meaning the app's actual entry page would ship with no CSP
+  // and no debug-flag injection. Map it to the real file explicitly instead.
+  const reqPath  = req.path.endsWith('/') ? req.path + 'index.html' : req.path;
+  const filePath = path.resolve(SERVE_DIR, '.' + reqPath);
   if (!filePath.startsWith(SERVE_DIR) || !fs.existsSync(filePath)) return next();
 
-  if (req.path.endsWith('.html')) {
-    const html = fs.readFileSync(filePath, 'utf8').replace('<head>', '<head>\n  ' + _htmlSnippet);
+  if (reqPath.endsWith('.html')) {
+    const nonce = crypto.randomBytes(16).toString('base64');
+    // Insert the debug snippet plain (no nonce of its own) — the blanket replace just below
+    // tags EVERY inline script, this one included, exactly once, from one code path.
+    let html = fs.readFileSync(filePath, 'utf8')
+      .replace('<head>', `<head>\n  <script>window.__DEBUG=${CLIENT_DEBUG};</script>`);
+    html = html.replace(INLINE_SCRIPT_RE, (_m, attrs) => `<script nonce="${nonce}"${attrs}>`);
+    res.setHeader('Content-Security-Policy', buildCsp(nonce));
     return res.type('html').send(html);
   }
-  if (req.path === '/sw.js') {
+  if (reqPath === '/sw.js') {
     const js = fs.readFileSync(filePath, 'utf8');
     return res.type('js').send(_swSnippet + js);
   }
@@ -130,6 +225,7 @@ app.use('/user-fonts', express.static(path.join(DATA_DIR, 'fonts')));
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.use('/api/auth',     authRoutes);
+app.use('/api/auth/oidc', oidcRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/books',    booksRoutes);
 app.use('/api/shelves',  shelvesRoutes);
@@ -160,9 +256,38 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`[server] Codexa running on http://localhost:${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  console.log(`[server] Codexa running on http://${HOST}:${PORT}`);
 });
+
+// ── Graceful shutdown ──────────────────────────────────────────────────────────
+// Without this, SIGTERM (every `docker stop`/restart) kills the process immediately —
+// better-sqlite3 never gets to checkpoint its WAL file, which has been implicated in
+// native-addon crashes (Assertion failed in RemoveEnvironmentCleanupHook) on the next start.
+// server.close() alone isn't enough to bound the wait: opds.js and bookorbit.js hold
+// long-lived SSE connections open that it would otherwise wait on indefinitely, so a
+// force-exit timer backs it up — either way, closeDb() runs before the process actually exits.
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] ${signal} received, shutting down...`);
+
+  const forceExitTimer = setTimeout(() => {
+    console.warn('[server] shutdown timed out waiting for connections to drain, forcing exit');
+    closeDb();
+    process.exit(1);
+  }, 5000);
+
+  server.close(() => {
+    clearTimeout(forceExitTimer);
+    closeDb();
+    console.log('[server] shutdown complete');
+    process.exit(0);
+  });
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 // ── BookOrbit extended sync — periodic background reconcile ───────────────────
 // Event-driven triggers (on highlight/session/status change) sync just the
